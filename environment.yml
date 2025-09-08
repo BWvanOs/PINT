@@ -1,0 +1,19 @@
+name: pint
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - tifffile
+  - ome-types
+  - aicsimageio
+  - openpyxl        ##for Excel interaction
+  - lxml            ##XML pparsing of the ome.tiff headers
+  - libxml2         ##system dependency for tiff reader
+  - libxslt         ##system dependency for tiffr edaer
+  - pip             ##allow installing pip-only packages
+  - scipy
+  - pip:
+      - shiny       ##Shiny for Python (for interactive app)
