@@ -19,7 +19,7 @@ app_ui = ui.page_sidebar(
         open="closed",          # collapsed by default
         id="sidebar",
         class_="sidebar-col",
-        width="520px",          # tweak as needed
+        width="750px",          # tweak as needed
     ),
 
     # ---- HEAD/CSS (positional arg #2) ----
@@ -57,7 +57,15 @@ app_ui = ui.page_sidebar(
             .viewer-fill { flex: 1 1 auto; min-height:0; display:flex; flex-direction:column; }
 
             .sidebar-col      { display:flex; flex-direction:column; height:100%; }
-            .param-table-wrap { flex:1 1 auto; min-height:0; overflow:auto; }
+            .param-table-wrap table {
+                width: 100% !important;
+                table-layout: auto;
+            }
+            .param-table-wrap td, .param-table-wrap th {
+                white-space: nowrap;      /* keep short values on one line */
+                text-overflow: ellipsis;  /* add … if too long */
+                overflow: hidden;
+            }
 
             /* Make sure the sidebar overlays other content when open */
             .bslib-sidebar-layout > .bslib-sidebar { z-index: 1050; }
@@ -136,7 +144,41 @@ app_ui = ui.page_sidebar(
                                 ),
                             ),
                         ),
-                        ui.column(4, ui.card(ui.card_header("Feature 2 (coming soon)"), ui.tags.div("…"))),
+
+
+                        ui.column(4,
+                            ui.card(
+                                ui.card_header("Global Threshold"),
+                                ui.row(
+                                    ui.column(
+                                        12,
+                                        ui.input_slider(
+                                            "threshold_val", 
+                                            "Threshold (0–1)", 
+                                            min=0.0, max=1.0, value=0.1, step=0.01
+                                        ),
+                                    ),
+                                ),
+                                ui.row(
+                                    ui.column(
+                                        4,
+                                        ui.tags.div(
+                                            ui.input_checkbox("doThreshold", "Apply threshold", value=True),
+                                            class_="mt-2"
+                                        ),
+                                    ),
+                                    ui.column(
+                                        6,
+                                        ui.input_action_button(
+                                            "apply_threshold", "Update channel", 
+                                            class_="btn btn-primary w-100 mt-2"
+                                        ),
+                                    ),
+                                    ui.column(2),
+                                ),
+                            ),
+                        ),
+
                         ui.column(4, ui.card(ui.card_header("Feature 3 (coming soon)"), ui.tags.div("…"))),
                         class_="controls-panels",
                     ),
@@ -146,7 +188,7 @@ app_ui = ui.page_sidebar(
                 # ===== Plot area =====
                 ui.tags.div(
                     ui.output_plot("img_viewer", fill=True, height="100%"),
-                    ui.output_text_verbatim("dbg"),
+                    #ui.output_text_verbatim("dbg"),
                     class_="viewer-fill",
                 ),
                 class_="flex-col",
@@ -168,7 +210,7 @@ def server(input, output, session):
 
     # Parameter table (per CHANNEL, not per sample)
     params_df = reactive.Value(
-        pd.DataFrame(columns=["Channel", "DoWinsor", "WinsorLow", "WinsorHigh"])
+        pd.DataFrame(columns=["Channel", "DoWinsor", "WinsorLow", "WinsorHigh", "DoThreshold", "ThresholdVal"])
     )
 
     # Guards
@@ -183,8 +225,10 @@ def server(input, output, session):
             "DoWinsor": bool(input.doWinsor()),
             "WinsorLow": float(input.winsor_low()),
             "WinsorHigh": float(input.winsor_high()),
+            "DoThreshold": bool(input.doThreshold()),
+            "ThresholdVal": float(input.threshold_val()),
         } for ch in first_chlist]
-        df = pd.DataFrame(rows, columns=["Channel", "DoWinsor", "WinsorLow", "WinsorHigh"])
+        df = pd.DataFrame(rows, columns=params_df.get().columns)
         params_df.set(df.reset_index(drop=True))
 
     def _sync_controls_from_table(channel: str) -> None:
@@ -199,9 +243,11 @@ def server(input, output, session):
         row = df.loc[m].iloc[0]
         syncing_controls.set(True)
         try:
-            session.send_input_message("doWinsor",    {"value": bool(row["DoWinsor"])})
-            session.send_input_message("winsor_low",  {"value": float(row["WinsorLow"])})
+            session.send_input_message("doWinsor", {"value": bool(row["DoWinsor"])})
+            session.send_input_message("winsor_low", {"value": float(row["WinsorLow"])})
             session.send_input_message("winsor_high", {"value": float(row["WinsorHigh"])})
+            session.send_input_message("doThreshold", {"value": bool(row["DoThreshold"])})
+            session.send_input_message("threshold_val", {"value": float(row["ThresholdVal"])})
         finally:
             syncing_controls.set(False)
 
@@ -422,6 +468,12 @@ def server(input, output, session):
                 if hi > lo:
                     img = _apply_winsor(img, lo, hi)
 
+            if input.doThreshold():
+                thr = float(input.threshold_val())
+                if thr > 0.0:
+                    cutoff = thr * (np.nanmax(img) if np.nanmax(img) > 0 else 1.0)
+                    img = np.where(img >= cutoff, img, 0.0)
+
             mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
             if mx > mn:
                 img = (img - mn) / (mx - mn)
@@ -443,9 +495,9 @@ def server(input, output, session):
             return pd.DataFrame({"Info": ["No parameters yet"]})
         return df.reset_index(drop=True)
 
-    @output
-    @render.text
-    def dbg():
+    #@output
+    #@render.text
+    #def dbg():
         return (
             f"sample={input.sample()!r} | "
             f"channel={input.channel()!r} | "
@@ -453,6 +505,27 @@ def server(input, output, session):
             f"low={input.winsor_low()} | "
             f"high={input.winsor_high()}"
         )
+    
+    @reactive.Effect
+    @reactive.event(input.apply_threshold)
+    def _apply_threshold_channel():
+        if syncing_controls.get():
+            return
+        c = input.channel()
+        if not c:
+            return
+        df = params_df.get()
+        if df.empty:
+            return
+        idx = df.index[df["Channel"] == c].tolist()
+        if not idx:
+            return
+        i = idx[0]
+        new_df = df.copy()
+        new_df.at[i, "DoThreshold"]  = bool(input.doThreshold())
+        new_df.at[i, "ThresholdVal"] = float(input.threshold_val())
+        params_df.set(new_df.reset_index(drop=True))
+
 
 from shiny import App  # (you already have this at the top)
 
