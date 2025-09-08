@@ -1,15 +1,15 @@
 name: pint
 channels:
   - conda-forge
+  - defaults
 dependencies:
   - python=3.11
+  - numpy>=1.26
+  - pandas>=2.1
+  - scipy>=1.11
+  - matplotlib>=3.8
+  - tifffile>=2024.5.22
+  - openpyxl>=3.1         # for writing .xlsx
   - pip
-  - numpy>=1.24
-  - pandas>=2.0
-  - matplotlib>=3.7
-  - uvicorn>=0.23
-  - pillow>=10
-  - tifffile>=2023.8   # for OME-TIFF loading
-  - scikit-image>=0.22 # handy for image ops (optional but useful)
   - pip:
-      - shiny==1.4.0   # Shiny for Python (pin to match your logs)
+      - shiny>=0.8.0      # Shiny for Python (includes uvicorn deps)

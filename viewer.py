@@ -7,6 +7,8 @@ import pandas as pd
 from shiny import App, ui, render, reactive
 from load_tiffs import load_tiffs_raw
 from scipy.ndimage import percentile_filter
+import os, sys, subprocess
+
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
@@ -190,7 +192,7 @@ app_ui = ui.page_sidebar(
                             ui.card(
                                 ui.card_header("Sliding Window Noise Removal"),
                                 ui.row(
-                                    ui.column(6, ui.input_slider("noise_strength", "Strength (0-1)", min=0.0, max=1.0, value=0.1, step=0.01)),
+                                    ui.column(6, ui.input_slider("noise_strength", "Strength (0-1)", min=0.0, max=1.0, value=1, step=0.01)),
                                     ui.column(6, ui.input_numeric("window_size", "Window size", value=3, min=1, step=2)),
                                 ),
                                 ui.row(
@@ -203,7 +205,27 @@ app_ui = ui.page_sidebar(
                         ##PANEL4
                         ui.column(3,   # narrow column as you requested
                             ui.card(
-                                ui.card_header("Options"),
+                                ui.card_header("Normalization and Transformation"),
+                                ui.row(
+                                    ui.column(
+                                        8,
+                                        ui.tags.div(
+                                            ui.input_checkbox("doAsinh", "Arcsinh transform data", value=False),
+                                            class_="d-flex align-items-center"
+                                        ),
+                                    ),
+                                    ui.column(
+                                        4,
+                                        ui.input_select(
+                                            "asinh_cofactor",
+                                            "Cofactor",
+                                            choices=[str(i) for i in range(2, 11)],
+                                            selected="5",
+                                            width="100%"
+                                        ),
+                                    ),
+                                    class_="align-items-center",
+                                ),
                                 ui.row(
                                     ui.column(
                                         6,
@@ -214,7 +236,7 @@ app_ui = ui.page_sidebar(
                                     ),
                                     ui.column(
                                         6,
-                                        ui.input_action_button("apply_norm", "Apply", class_="btn btn-primary w-100"),
+                                        ui.input_action_button("apply_norm", "Apply norm/transform", class_="btn btn-primary w-100"),
                                     ),
                                     class_="align-items-center",
                                 ),
@@ -256,6 +278,7 @@ def server(input, output, session):
             "DoThr", "ThrVal",
             "Noise", "NStr", "WinSz",
             "DoNorm",
+            "DoAsinh", "Cofac",
         ])
     )
 
@@ -273,7 +296,7 @@ def server(input, output, session):
             "Channel": "",
             "DoWinsor": False, "Low": 0.0, "High": 1.0,
             "DoThr": False, "ThrVal": 0.0,
-            "Noise": False, "NStr": 0.0, "WinSz": 3,
+            "Noise": False, "NStr": 1.0, "WinSz": 3,
             "DoNorm": True,
         }
         df = params_df.get()
@@ -298,6 +321,8 @@ def server(input, output, session):
             "NStr": float(input.noise_strength()),
             "WinSz": int(input.window_size()),
             "DoNorm": bool(input.doNorm()),
+            "DoAsinh": bool(input.doAsinh()),
+            "Cofac": int(float(input.asinh_cofactor() or 5)),
         } for ch in first_chlist]
         df = pd.DataFrame(rows)
         params_df.set(df.reindex(columns=params_df.get().columns).reset_index(drop=True))
@@ -323,11 +348,15 @@ def server(input, output, session):
 
             session.send_input_message("doNoise", {"value": bool(row.get("Noise", False))})
             winsz = int(row.get("WinSz", int(input.window_size())))
-            session.send_input_message("noise_strength", {"value": float(row.get("NStr", 0.0))})
+            session.send_input_message("noise_strength", {"value": float(row.get("NStr", 1.0))})
             session.send_input_message("window_size", {"value": winsz})
 
             # Normalize checkbox (if present)
             session.send_input_message("doNorm", {"value": bool(row.get("DoNorm", True))})
+
+            ##arcsinh controls
+            session.send_input_message("doAsinh", {"value": bool(row.get("DoAsinh", False))})
+            session.send_input_message("asinh_cofactor", {"value": str(int(row.get("Cofac", 5)))})
         finally:
             syncing_controls.set(False)
 
@@ -335,30 +364,31 @@ def server(input, output, session):
         q_low, q_high = np.quantile(cur, [lo_q, hi_q])
         return np.clip(cur, q_low, q_high)
 
-    def _apply_sliding_window(img: np.ndarray, size: int, perc: float) -> np.ndarray:
+    def _apply_sliding_window(img: np.ndarray, size: int, perc: float, remove: str = "bright") -> np.ndarray:
         """
-        Zero-out pixels that are below the local percentile threshold.
-        
+        Remove speckles using a local percentile threshold.
+
         Parameters
         ----------
-        img : np.ndarray
-            2D array of image intensities (after winsorization + thresholding).
-        size : int
-            Window size (odd integer, e.g. 3, 5, 7).
-        perc : float
-            Percentile threshold (0–1). Example: 0.5 means 50th percentile.
+        img : 2D array
+        size : odd int (e.g., 3,5,7)
+        perc : 0..1 (e.g., 0.9 = 90th percentile)
+        remove : "bright" (zero pixels > local pct) or "dark" (zero pixels < local pct)
         """
         if size <= 1 or perc <= 0:
             return img
-
         if size % 2 == 0:
-            size += 1  # enforce odd window size
+            size += 1
 
-        # Compute local percentile per neighborhood (scipy expects 0–100)
         local_thresh = percentile_filter(img, percentile=perc * 100, size=size)
 
-        # Keep pixels above local percentile, zero out the rest
-        return np.where(img >= local_thresh, img, 0.0)
+        if remove == "bright":
+            # keep pixels <= local pct; zero brighter-than-local outliers
+            return np.where(img <= local_thresh, img, 0.0)
+        else:
+            # keep pixels >= local pct; zero darker-than-local outliers
+            return np.where(img >= local_thresh, img, 0.0)
+
     
     # ---------- load images ----------
     @reactive.Effect
@@ -525,9 +555,19 @@ def server(input, output, session):
                 wsize = max(1, int(input.window_size()))
                 if wsize % 2 == 0:
                     wsize += 1
-                perc = float(input.noise_strength())  # e.g. 0.5 = 50th percentile
-                img = _apply_sliding_window(img, wsize, perc)
+                perc = float(input.noise_strength())  # 0..1
+                img = _apply_sliding_window(img, wsize, perc, remove="bright")
 
+            # Step 4: Arcsinh transform (after denoising, before normalization)
+            if input.doAsinh():
+                try:
+                    cofac = int(float(input.asinh_cofactor()))
+                except Exception:
+                    cofac = 5
+                cofac = max(2, min(10, cofac))
+                # standard asinh transform for CyTOF/IMC: asinh(x / cofactor)
+                img = np.arcsinh(img / float(cofac))
+            
             # Final normalization for display
             mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
             if mx > mn:
@@ -581,8 +621,71 @@ def server(input, output, session):
             "NStr": "NStr",
             "WinSz": "WinSz",
             "DoNorm": "Norm?",
+            "DoAsinh": "Asinh?",
+            "Cofac": "Cofac",
         }
         return df.rename(columns=rename_map).reset_index(drop=True)
+    
+    @reactive.Effect
+    @reactive.event(input.apply_norm)
+    def _apply_options_channel():
+        if syncing_controls.get():
+            return
+        c = input.channel()
+        if not c:
+            return
+        df = params_df.get()
+        if df.empty:
+            return
+        idx = df.index[df["Channel"] == c].tolist()
+        if not idx:
+            return
+        i = idx[0]
+        new_df = df.copy()
+        new_df.at[i, "DoNorm"]  = bool(input.doNorm())
+        new_df.at[i, "DoAsinh"] = bool(input.doAsinh())
+        # input_select returns strings, guard and clamp 2..10
+        try:
+            cofac = int(float(input.asinh_cofactor()))
+        except Exception:
+            cofac = 5
+        cofac = max(2, min(10, cofac))
+        new_df.at[i, "Cofac"] = cofac
+        params_df.set(new_df.reset_index(drop=True))
+
+    @reactive.Effect
+    @reactive.event(input.perform_analysis)
+    def _run_batch_analysis():
+        folder = (input.path() or "").strip()
+        if not folder or not os.path.isdir(folder):
+            print(f"⚠️ Invalid folder: {folder!r}")
+            return
+
+        out_dir = os.path.join(folder, "normalized images")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Save current parameter table to the output folder
+        params_path = os.path.join(out_dir, "parameter_table.csv")
+        df = params_df.get().copy()
+        if df.empty:
+            print("⚠️ Parameter table is empty — nothing to analyze.")
+            return
+        df.to_csv(params_path, index=False)
+        print(f"✅ Saved parameter table → {params_path}")
+
+        # Call the external analysis script with input dir, params csv and output dir
+        script = Path(__file__).with_name("analysis.py")
+        cmd = [sys.executable, str(script),
+            "--input-dir", folder,
+            "--params-csv", params_path,
+            "--output-dir", out_dir]
+        print("▶️ Running analysis:", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+            print("✅ Analysis finished.")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Analysis script failed: {e}")
+
 
 from shiny import App  # (you already have this at the top)
 
