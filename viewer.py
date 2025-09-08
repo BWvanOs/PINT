@@ -95,8 +95,7 @@ app_ui = ui.page_sidebar(
                         ui.column(5, ui.input_text("path", "Folder path", value="", width="100%")),
                         ui.column(1, ui.input_action_button("load", "Load images", class_="w-100")),
                         ui.column(1),  # spacer
-                        ui.column(
-                            2,
+                        ui.column(2,
                             ui.tags.div(
                                 ui.tags.label("Sample", class_="form-label mb-0 me-2"),
                                 ui.input_select("sample", None, choices=[], selected=None, width="100%"),
@@ -105,8 +104,7 @@ app_ui = ui.page_sidebar(
                                 class_="d-flex align-items-center gap-2",
                             ),
                         ),
-                        ui.column(
-                            2,
+                        ui.column(2,
                             ui.tags.div(
                                 ui.tags.label("Channel", class_="form-label mb-0 me-2"),
                                 ui.input_select("channel", None, choices=[], selected=None, width="100%"),
@@ -120,121 +118,60 @@ app_ui = ui.page_sidebar(
 
                     ui.hr(),
 
-                    # --- Second controls row: three vertical panels ---
                     ui.row(
-                        ui.column(
-                            4,
+                        # --- PANEL 1: Winsorization ---
+                        ui.column(4,
                             ui.card(
                                 ui.card_header("Winsorization"),
+                                # Sliders stacked
                                 ui.row(
-                                    ui.column(
-                                        12,
-                                        ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01),
-                                    ),
+                                    ui.column(6, ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01),),
+                                    ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.0, max=1.0, value=0.99, step=0.01),),
                                 ),
+                                # Checkbox + button side-by-side
                                 ui.row(
-                                    ui.column(
-                                        12,
-                                        ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.0, max=1.0, value=0.99, step=0.01),
-                                    ),
-                                ),
-                                ui.row(
-                                    ui.column(
-                                        4,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doWinsor", "doWinsorize", value=True),
-                                            class_="mt-2"
-                                        ),
-                                    ),
-                                    ui.column(
-                                        6,
-                                        ui.input_action_button("apply_one", "Update channel", class_="btn btn-primary w-100 mt-2"),
-                                    ),
-                                    ui.column(2),
+                                    ui.column(4, ui.input_checkbox("doWinsor", "doWinsorize", value=True)),
+                                    ui.column(6, ui.input_action_button("apply_one", "Update channel", class_="btn btn-primary w-100")),
+                                    ui.column(2),  # spacer
                                 ),
                             ),
                         ),
 
-
+                        # --- PANEL 2: Global Threshold ---
                         ui.column(4,
                             ui.card(
                                 ui.card_header("Global Threshold"),
                                 ui.row(
-                                    ui.column(
-                                        12,
-                                        ui.input_slider(
-                                            "threshold_val", 
-                                            "Threshold (0–1)", 
-                                            min=0.0, max=1.0, value=0.1, step=0.01
-                                        ),
-                                    ),
+                                    ui.input_slider("threshold_val", "Threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01),
                                 ),
                                 ui.row(
-                                    ui.column(
-                                        4,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doThreshold", "Apply threshold", value=True),
-                                            class_="mt-2"
-                                        ),
-                                    ),
-                                    ui.column(
-                                        6,
-                                        ui.input_action_button(
-                                            "apply_threshold", "Update channel", 
-                                            class_="btn btn-primary w-100 mt-2"
-                                        ),
-                                    ),
+                                    ui.column(4, ui.input_checkbox("doThreshold", "Apply threshold", value=True)),
+                                    ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
                                     ui.column(2),
                                 ),
                             ),
                         ),
-                        ##PANEL 3 LAYOUT
-                        ui.column(
-                            4,
+
+                        # --- PANEL 3: Noise Removal ---
+                        ui.column(4,
                             ui.card(
                                 ui.card_header("Sliding Window Noise Removal"),
                                 ui.row(
-                                    ui.column(
-                                        12,
-                                        ui.input_slider(
-                                            "noise_strength",
-                                            "Strength (0–1)",
-                                            min=0.0, max=1.0, value=0.5, step=0.01,
-                                        ),
-                                    ),
+                                    ui.column(6, ui.input_slider("noise_strength", "Strength (0-1)", min=0.0, max=1.0, value=0.5, step=0.01)),
+                                    ui.column(6, ui.input_numeric("window_size", "Window size", value=3, min=1, step=1)),
                                 ),
                                 ui.row(
-                                    ui.column(
-                                        12,
-                                        ui.input_numeric(
-                                            "window_size", "Window size", value=3, min=1, step=1
-                                        ),
-                                    ),
-                                ),
-                                ui.row(
-                                    ui.column(
-                                        4,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doNoise", "Apply noise removal", value=False),
-                                            class_="mt-2",
-                                        ),
-                                    ),
-                                    ui.column(
-                                        6,
-                                        ui.input_action_button(
-                                            "apply_noise",
-                                            "Update channel",
-                                            class_="btn btn-primary w-100 mt-2",
-                                        ),
-                                    ),
+                                    ui.column(4, ui.input_checkbox("doNoise", "Apply noise removal", value=False)),
+                                    ui.column(6, ui.input_action_button("apply_noise", "Update channel", class_="btn btn-primary w-100")),
                                     ui.column(2),
                                 ),
                             ),
                         ),
+
                         class_="controls-panels",
                     ),
-                    class_="controls-fixed",
                 ),
+
 
                 # ===== Plot area =====
                 ui.tags.div(
