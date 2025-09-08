@@ -20,7 +20,7 @@ app_ui = ui.page_sidebar(
         open="closed",          # collapsed by default
         id="sidebar",
         class_="sidebar-col",
-        width="600px",          # tweak as needed
+        width="650px",          # tweak as needed
     ),
 
     # ---- HEAD/CSS (positional arg #2) ----
@@ -41,6 +41,13 @@ app_ui = ui.page_sidebar(
                 gap: var(--controls-gap);
                 overflow:hidden;
             }
+                      
+                        /* Make the panels row and its columns fill the fixed area height */
+            .controls-panels > .row { height: 100%; }
+            .controls-panels > .row > [class^="col"],
+            .controls-panels > .row > [class*=" col"] { display: flex; }
+            .controls-panels .card { flex: 1 1 auto; margin-bottom: 0; }
+
             .controls-top    { flex: 0 0 var(--controls-top-h); overflow:hidden; }
             .controls-panels { flex: 1 1 auto; min-height:0; overflow:hidden; }
 
@@ -55,7 +62,7 @@ app_ui = ui.page_sidebar(
             .controls-panels .row { margin-left: 0; margin-right: 0; }
             .controls-panels .col { padding-left: 0; padding-right: 0; }
 
-            .viewer-fill { flex: 1 1 auto; min-height:0; display:flex; flex-direction:column; }
+            .viewer-fill { flex: 1 1 auto; min-height:0; display:flex; flex-direction:column; }.controls-fixed
 
             .sidebar-col      { display:flex; flex-direction:column; height:100%; }
             .param-table-wrap table {
@@ -69,7 +76,7 @@ app_ui = ui.page_sidebar(
                 white-space: nowrap;      /* keep short values on one line */
                 text-overflow: ellipsis;  /* add … if too long */
                 overflow: hidden;
-                text-alighn: left;
+                text-align: left;
             }
             
             .param-table-wrap th {
@@ -92,35 +99,60 @@ app_ui = ui.page_sidebar(
                 ui.tags.div(
                     # --- Top control bar: path + load + sample + channel ---
                     ui.row(
-                        ui.column(5, ui.input_text("path", "Folder path", value="", width="100%")),
-                        ui.column(1, ui.input_action_button("load", "Load images", class_="w-100")),
-                        ui.column(1),  # spacer
+                    # Folder path
+                        ui.column(5,
+                            ui.input_text("path", "Folder path", value="", width="100%"),
+                        ),
+
+                        # Load button
+                        ui.column(1,
+                            ui.input_action_button("load", "Load images", class_="w-100"),
+                        ),
+
+                        ui.column(1), ##spacer
+
+                        # Sample + Channel stacked
                         ui.column(2,
-                            ui.tags.div(
-                                ui.tags.label("Sample", class_="form-label mb-0 me-2"),
-                                ui.input_select("sample", None, choices=[], selected=None, width="100%"),
-                                ui.input_action_button("prev_sample", "←", class_="btn-sm"),
-                                ui.input_action_button("next_sample", "→", class_="btn-sm"),
-                                class_="d-flex align-items-center gap-2",
+                            ui.row(
+                                ui.column(8, ui.input_select("sample", "Sample", choices=[], selected=None, width="100%"),),
+                                ui.column(2, ui.input_action_button("prev_sample", "←", class_="btn-sm"),),
+                                ui.column(2, ui.input_action_button("next_sample", "→", class_="btn-sm"),),
+                                class_="align-items-center"
+                            ),
+                            ui.row(
+                                ui.column(8, ui.input_select("channel", "Channel", choices=[], selected=None, width="100%"),),
+                                ui.column(2, ui.input_action_button("prev_channel", "←", class_="btn-sm"),),
+                                ui.column(2, ui.input_action_button("next_channel", "→", class_="btn-sm"),),
+                                class_="align-items-center"
                             ),
                         ),
-                        ui.column(2,
-                            ui.tags.div(
-                                ui.tags.label("Channel", class_="form-label mb-0 me-2"),
-                                ui.input_select("channel", None, choices=[], selected=None, width="100%"),
-                                ui.input_action_button("prev_channel", "←", class_="btn-sm"),
-                                ui.input_action_button("next_channel", "→", class_="btn-sm"),
-                                class_="d-flex align-items-center gap-2",
+
+                        ui.column(1), ##spacer
+
+                        # Perform analysis button
+                        ui.column(1,
+                            ui.row(
+                                ui.div(
+                                    ui.input_action_button(
+                                        "perform_analysis",
+                                        "Perform analysis",
+                                        class_="btn btn-primary text-white w-100 h-100"
+                                    ),
+                                    class_="d-flex h-100 align-items-stretch"  # make the container stretch full height, only it doesn't work. What the...
+                                ),
                             ),
                         ),
-                        class_="controls-top",
+
+                        ui.column(1), ##spacer
+
+                        class_="controls-top align-items-center",  # center contents vertically
                     ),
 
                     ui.hr(),
 
                     ui.row(
                         # --- PANEL 1: Winsorization ---
-                        ui.column(4,
+                        ui.column(3,
                             ui.card(
                                 ui.card_header("Winsorization"),
                                 # Sliders stacked
@@ -138,55 +170,76 @@ app_ui = ui.page_sidebar(
                         ),
 
                         # --- PANEL 2: Global Threshold ---
-                        ui.column(4,
+                        ui.column(3,
                             ui.card(
                                 ui.card_header("Global Threshold"),
                                 ui.row(
-                                    ui.input_slider("threshold_val", "Threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01),
+                                    ui.column(12, ui.input_slider("threshold_val", "Threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01),),
                                 ),
                                 ui.row(
                                     ui.column(4, ui.input_checkbox("doThreshold", "Apply threshold", value=True)),
                                     ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
-                                    ui.column(2),
+                                    ui.column(2
+                                    ),
                                 ),
                             ),
                         ),
 
                         # --- PANEL 3: Noise Removal ---
-                        ui.column(4,
+                        ui.column(3,
                             ui.card(
                                 ui.card_header("Sliding Window Noise Removal"),
                                 ui.row(
-                                    ui.column(6, ui.input_slider("noise_strength", "Strength (0-1)", min=0.0, max=1.0, value=0.5, step=0.01)),
-                                    ui.column(6, ui.input_numeric("window_size", "Window size", value=3, min=1, step=1)),
+                                    ui.column(6, ui.input_slider("noise_strength", "Strength (0-1)", min=0.0, max=1.0, value=0.1, step=0.01)),
+                                    ui.column(6, ui.input_numeric("window_size", "Window size", value=3, min=1, step=2)),
                                 ),
                                 ui.row(
-                                    ui.column(4, ui.input_checkbox("doNoise", "Apply noise removal", value=False)),
+                                    ui.column(4, ui.input_checkbox("doNoise", "Apply noise removal", value=True)),
                                     ui.column(6, ui.input_action_button("apply_noise", "Update channel", class_="btn btn-primary w-100")),
                                     ui.column(2),
                                 ),
                             ),
                         ),
+                        ##PANEL4
+                        ui.column(3,   # narrow column as you requested
+                            ui.card(
+                                ui.card_header("Options"),
+                                ui.row(
+                                    ui.column(
+                                        6,
+                                        ui.tags.div(
+                                            ui.input_checkbox("doNorm", "Normalize the channel?", value=True),
+                                            class_="d-flex align-items-center"
+                                        ),
+                                    ),
+                                    ui.column(
+                                        6,
+                                        ui.input_action_button("apply_norm", "Apply", class_="btn btn-primary w-100"),
+                                    ),
+                                    class_="align-items-center",
+                                ),
+                            ),
+                        ),
 
                         class_="controls-panels",
+                        ),
                     ),
+                    
+                    # ===== Plot area =====
+                    ui.tags.div(
+                        ui.output_plot("img_viewer", fill=True, height="100%"),
+                        #ui.output_text_verbatim("dbg"),
+                        class_="viewer-fill",
+                    ),
+                    class_="flex-col",
                 ),
-
-
-                # ===== Plot area =====
-                ui.tags.div(
-                    ui.output_plot("img_viewer", fill=True, height="100%"),
-                    #ui.output_text_verbatim("dbg"),
-                    class_="viewer-fill",
-                ),
-                class_="flex-col",
             ),
         ),
-    ),
 
-    # ---- KEYWORD ARGS (must be last) ----
-    position="right",
+        # ---- KEYWORD ARGS (must be last) ----
+        position="right",
 )
+
 
 
 # --------------- Server ---------------
@@ -201,7 +254,8 @@ def server(input, output, session):
         pd.DataFrame(columns=[
             "Channel", "DoWinsor", "Low", "High",
             "DoThr", "ThrVal",
-            "Noise", "NStr", "WinSz"
+            "Noise", "NStr", "WinSz",
+            "DoNorm",
         ])
     )
 
@@ -210,6 +264,28 @@ def server(input, output, session):
     syncing_controls = reactive.Value(False)
 
     # ---------- helpers ----------
+    def _ensure_param_columns():
+        required = ["Channel","DoWinsor","Low","High",
+                    "DoThr","ThrVal",
+                    "Noise","NStr","WinSz",
+                    "DoNorm"]  # if you're adding Normalize
+        defaults = {
+            "Channel": "",
+            "DoWinsor": False, "Low": 0.0, "High": 1.0,
+            "DoThr": False, "ThrVal": 0.0,
+            "Noise": False, "NStr": 0.0, "WinSz": 3,
+            "DoNorm": True,
+        }
+        df = params_df.get()
+        if df.empty:
+            params_df.set(pd.DataFrame(columns=required))
+            return
+        for col in required:
+            if col not in df.columns:
+                df[col] = defaults[col]
+        # enforce column order
+        params_df.set(df[required].reset_index(drop=True))
+
     def _prefill_params(first_chlist: list[str]) -> None:
         rows = [{
             "Channel": ch,
@@ -221,9 +297,10 @@ def server(input, output, session):
             "Noise": bool(input.doNoise()),
             "NStr": float(input.noise_strength()),
             "WinSz": int(input.window_size()),
+            "DoNorm": bool(input.doNorm()),
         } for ch in first_chlist]
-        df = pd.DataFrame(rows, columns=params_df.get().columns)
-        params_df.set(df.reset_index(drop=True))
+        df = pd.DataFrame(rows)
+        params_df.set(df.reindex(columns=params_df.get().columns).reset_index(drop=True))
 
     def _sync_controls_from_table(channel: str) -> None:
         if not channel:
@@ -237,14 +314,20 @@ def server(input, output, session):
         row = df.loc[m].iloc[0]
         syncing_controls.set(True)
         try:
-            session.send_input_message("doWinsor", {"value": bool(row["DoWinsor"])})
-            session.send_input_message("winsor_low", {"value": float(row["Low"])})
-            session.send_input_message("winsor_high", {"value": float(row["High"])})
-            session.send_input_message("doThreshold", {"value": bool(row["DoThr"])})
-            session.send_input_message("threshold_val", {"value": float(row["ThrVal"])})
-            session.send_input_message("doNoise", {"value": bool(row["Noise"])})
-            session.send_input_message("noise_strength", {"value": float(row["NStr"])})
-            session.send_input_message("window_size", {"value": int(row["WinSz"])})
+            session.send_input_message("doWinsor", {"value": bool(row.get("DoWinsor", False))})
+            session.send_input_message("winsor_low", {"value": float(row.get("Low", 0.0))})
+            session.send_input_message("winsor_high", {"value": float(row.get("High", 1.0))})
+
+            session.send_input_message("doThreshold", {"value": bool(row.get("DoThr", False))})
+            session.send_input_message("threshold_val", {"value": float(row.get("ThrVal", 0.0))})
+
+            session.send_input_message("doNoise", {"value": bool(row.get("Noise", False))})
+            winsz = int(row.get("WinSz", int(input.window_size())))
+            session.send_input_message("noise_strength", {"value": float(row.get("NStr", 0.0))})
+            session.send_input_message("window_size", {"value": winsz})
+
+            # Normalize checkbox (if present)
+            session.send_input_message("doNorm", {"value": bool(row.get("DoNorm", True))})
         finally:
             syncing_controls.set(False)
 
@@ -461,6 +544,26 @@ def server(input, output, session):
             ax.set_axis_off()
             return fig
 
+    @reactive.Effect
+    @reactive.event(input.apply_norm)
+    def _apply_norm_channel():
+        if syncing_controls.get():
+            return
+        c = input.channel()
+        if not c:
+            return
+        df = params_df.get()
+        if df.empty:
+            return
+        idx = df.index[df["Channel"] == c].tolist()
+        if not idx:
+            return
+        i = idx[0]
+        new_df = df.copy()
+        new_df.at[i, "DoNorm"] = bool(input.doNorm())
+        params_df.set(new_df.reset_index(drop=True))
+
+
     @output
     @render.table
     def param_table():
@@ -477,6 +580,7 @@ def server(input, output, session):
             "Noise": "Noise",
             "NStr": "NStr",
             "WinSz": "WinSz",
+            "DoNorm": "Norm?",
         }
         return df.rename(columns=rename_map).reset_index(drop=True)
 
