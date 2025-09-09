@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pint-app"
+version = "0.1.0"
+description = "PINT: IMC/ CyTOF normalization viewer + batch analysis"
+requires-python = ">=3.11"
+dependencies = [
+  "shiny>=0.8.0",
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "scipy>=1.11",
+  "matplotlib>=3.8",
+  "tifffile>=2024.5.22",
+  "openpyxl>=3.1",
+]
+
+[project.scripts]
+pint = "pint_app.cli:main"
+pint-viewer = "pint_app.cli:viewer"
+pint-analysis = "pint_app.cli:analysis"

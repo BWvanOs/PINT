@@ -9,7 +9,8 @@ dependencies:
   - scipy>=1.11
   - matplotlib>=3.8
   - tifffile>=2024.5.22
-  - openpyxl>=3.1         # for writing .xlsx
+  - openpyxl>=3.1
   - pip
   - pip:
-      - shiny>=0.8.0      # Shiny for Python (includes uvicorn deps)
+      - -e .        # <— installs this repo, creates the 'pint' commands
+      - shiny>=0.8.0
