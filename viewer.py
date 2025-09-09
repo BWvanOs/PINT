@@ -9,9 +9,8 @@ from load_tiffs import load_tiffs_raw
 from scipy.ndimage import percentile_filter
 import os, sys, subprocess
 import shutil
-import subprocess
-
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
 
 
@@ -30,44 +29,30 @@ app_ui = ui.page_sidebar(
     ui.head_content(
         ui.tags.style("""
             :root{
-                /* Tweak these to taste */
-                --controls-h: 450px;    /* total height of the top controls area */
-                --controls-top-h: 75px; /* height of the toolbar row */
-                --controls-gap: 3px;
+                /* You can tweak these two and nothing else */
+                --controls-h: 450px;     /* total height of the top area (toolbar + panels) */
+                --controls-top-h: 170px; /* height of the toolbar row */
             }
 
+            /* Page skeleton: fixed top area + growing viewer */
             .flex-col { display:flex; flex-direction:column; height:100vh; }
 
             .controls-fixed {
                 flex: 0 0 var(--controls-h);
-                display:flex; flex-direction:column;
-                gap: var(--controls-gap);
-                overflow:hidden;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
             }
-                      
-                        /* Make the panels row and its columns fill the fixed area height */
-            .controls-panels > .row { height: 100%; }
-            .controls-panels > .row > [class^="col"],
-            .controls-panels > .row > [class*=" col"] { display: flex; }
-            .controls-panels .card { flex: 1 1 auto; margin-bottom: 0; }
+            .controls-top  { flex: 0 0 var(--controls-top-h); overflow: visible; }
 
-            .controls-top    { flex: 0 0 var(--controls-top-h); overflow:hidden; }
-            .controls-panels { flex: 1 1 auto; min-height:0; overflow:hidden; }
+            /* No CSS layout for the second row (panels) —
+                sizes/spacing come only from your Python row/column props. */
 
-            .controls-panels .card { height:100%; }
-            .controls-panels .card-body {
-                padding: 8px;
-                display:flex;
-                flex-direction:column;
-                gap: 6px;
-                overflow-x: hidden;
-            }
-            .controls-panels .row { margin-left: 0; margin-right: 0; }
-            .controls-panels .col { padding-left: 0; padding-right: 0; }
+            /* Viewer grows to fill remaining space */
+            .viewer-fill { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 
-            .viewer-fill { flex: 1 1 auto; min-height:0; display:flex; flex-direction:column; }.controls-fixed
-
-            .sidebar-col      { display:flex; flex-direction:column; height:100%; }
+            /* Sidebar & parameter table (unchanged, lightweight) */
+            .sidebar-col { display:flex; flex-direction:column; height:100%; }
             .param-table-wrap table {
                 font-size: 12px;
                 width: 100% !important;
@@ -76,22 +61,24 @@ app_ui = ui.page_sidebar(
             }
             .param-table-wrap td, .param-table-wrap th {
                 padding: 2px 4px;
-                white-space: nowrap;      /* keep short values on one line */
-                text-overflow: ellipsis;  /* add … if too long */
+                white-space: nowrap;
+                text-overflow: ellipsis;
                 overflow: hidden;
                 text-align: left;
             }
-            
-            .param-table-wrap th {
-                font-weight: 600;     /* keep headers readable */
-                text-align: left;
-            }        
+            .param-table-wrap th { font-weight: 600; text-align: left; }
 
             /* Make sure the sidebar overlays other content when open */
             .bslib-sidebar-layout > .bslib-sidebar { z-index: 1050; }
             .bslib-sidebar-layout .bslib-sidebar-toggle { z-index: 1060; }
-        """),
-    ),
+
+            /* Tighten the toolbar only (kills the “ghost row”) */
+            .controls-top .shiny-input-container { margin-bottom: 0 !important; }
+            .controls-top .row { --bs-gutter-y: 0; margin-bottom: 0; }
+            .controls-top .col { padding-left: 0; padding-right: 0; }
+            .controls-fixed hr { margin: 6px 0; }"""
+        )
+    ), 
 
     # ---- MAIN CONTENT (positional arg #3) ----
     ui.row(
@@ -101,119 +88,99 @@ app_ui = ui.page_sidebar(
                 # ===== Fixed-height controls (toolbar + panels) =====
                 ui.tags.div(
                     # --- Top control bar: path + load + sample + channel ---
+                    # --- Top control bar: path + load + sample + channel ---
                     ui.row(
-                    # Folder path
-                        ui.column(5,
-                            ui.input_text("path", "Folder path", value="", width="100%"),
-                        ),
-
-                        # Load button
-                        ui.column(1,
-                            ui.input_action_button("load", "Load images", class_="w-100"),
-                        ),
-
-                        ui.column(1), ##spacer
+                        ui.column(5, ui.input_text("path", "Folder path", value="", width="100%")),
+                        ui.column(1, ui.input_action_button("load", "Load images", class_="w-100")),
+                        ui.column(1),  # spacer
 
                         # Sample + Channel stacked
-                        ui.column(2,
+                        ui.column(
+                            2,
                             ui.row(
-                                ui.column(8, ui.input_select("sample", "Sample", choices=[], selected=None, width="100%"),),
-                                ui.column(2, ui.input_action_button("prev_sample", "←", class_="btn-sm"),),
-                                ui.column(2, ui.input_action_button("next_sample", "→", class_="btn-sm"),),
-                                class_="align-items-center"
+                                ui.column(8, ui.input_select("sample", "Sample", choices=[], selected=None, width="100%")),
+                                ui.column(2, ui.input_action_button("prev_sample", "←", class_="btn-sm")),
+                                ui.column(2, ui.input_action_button("next_sample", "→", class_="btn-sm")),
+                                class_="align-items-center gy-0",
                             ),
                             ui.row(
-                                ui.column(8, ui.input_select("channel", "Channel", choices=[], selected=None, width="100%"),),
-                                ui.column(2, ui.input_action_button("prev_channel", "←", class_="btn-sm"),),
-                                ui.column(2, ui.input_action_button("next_channel", "→", class_="btn-sm"),),
-                                class_="align-items-center"
+                                ui.column(8, ui.input_select("channel", "Channel", choices=[], selected=None, width="100%")),
+                                ui.column(2, ui.input_action_button("prev_channel", "←", class_="btn-sm")),
+                                ui.column(2, ui.input_action_button("next_channel", "→", class_="btn-sm")),
+                                class_="align-items-center gy-0",
                             ),
                         ),
 
-                        ui.column(1), ##spacer
+                        ui.column(1),  # spacer
 
-                        # Perform analysis, import and export button
+                        # Export / Import / Process
                         ui.column(
                             1,
-                            # TOP: Export CSV
                             ui.row(
                                 ui.div(
-                                    ui.input_action_button(
-                                        "export_params",
-                                        "Export CSV",
-                                        class_="btn btn-secondary w-100"
-                                    ),
-                                    class_="mb-1"
+                                    ui.input_action_button("export_params", "Export CSV", class_="btn btn-secondary w-100"),
+                                    class_="mb-1",
                                 ),
                             ),
-                            # MIDDLE: Import CSV
                             ui.row(
                                 ui.div(
-                                    ui.input_action_button(
-                                        "import_params",
-                                        "Import CSV",
-                                        class_="btn btn-secondary w-100"
-                                    ),
-                                    class_="mb-1"
+                                    ui.input_action_button("import_params", "Import CSV", class_="btn btn-secondary w-100"),
+                                    class_="mb-1",
                                 ),
                             ),
-                            # BOTTOM: Process Images (unchanged)
                             ui.row(
                                 ui.div(
                                     ui.input_action_button(
                                         "perform_analysis",
                                         "Process Images",
-                                        class_="btn btn-primary text-white w-100 h-100"
+                                        class_="btn btn-primary text-white w-100 h-100",
                                     ),
-                                    class_="d-flex h-100 align-items-stretch"
+                                    class_="d-flex h-100 align-items-stretch",
                                 ),
                             ),
                         ),
 
-                        ui.column(1), ##spacer
+                        ui.column(1),  # spacer
 
-                        class_="controls-top align-items-center",  # center contents vertically
+                        # IMPORTANT: this is part of the SAME ui.row(...) call; note the comma above.
+                        class_="controls-top align-items-center gy-0",
                     ),
 
                     ui.hr(),
 
                     ui.row(
                         # --- PANEL 1: Winsorization ---
-                        ui.column(3,
+                        ui.column(
+                            3,
                             ui.card(
                                 ui.card_header("Winsorization"),
-                                # Sliders stacked
                                 ui.row(
-                                    ui.column(6, ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01),),
-                                    ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.0, max=1.0, value=0.99, step=0.01),),
+                                    ui.column(6, ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01)),
+                                    ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.0, max=1.0, value=0.99, step=0.01)),
                                 ),
-                                # Checkbox + button side-by-side
                                 ui.row(
-                                    ui.column(4, ui.input_checkbox("doWinsor", "doWinsorize", value=True)),
+                                    ui.column(6, ui.input_checkbox("doWinsor", "doWinsorize", value=True)),
                                     ui.column(6, ui.input_action_button("apply_one", "Update channel", class_="btn btn-primary w-100")),
-                                    ui.column(2),  # spacer
                                 ),
                             ),
                         ),
 
                         # --- PANEL 2: Global Threshold ---
-                        ui.column(3,
+                        ui.column(
+                            3,
                             ui.card(
                                 ui.card_header("Global Threshold"),
+                                ui.row(ui.column(12, ui.input_slider("threshold_val", "Threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01))),
                                 ui.row(
-                                    ui.column(12, ui.input_slider("threshold_val", "Threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01),),
-                                ),
-                                ui.row(
-                                    ui.column(4, ui.input_checkbox("doThreshold", "Apply threshold", value=True)),
+                                    ui.column(6, ui.input_checkbox("doThreshold", "Apply threshold", value=True)),
                                     ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
-                                    ui.column(2
-                                    ),
                                 ),
                             ),
                         ),
 
                         # --- PANEL 3: Noise Removal ---
-                        ui.column(3,
+                        ui.column(
+                            3,
                             ui.card(
                                 ui.card_header("Sliding Window Noise Removal"),
                                 ui.row(
@@ -221,14 +188,15 @@ app_ui = ui.page_sidebar(
                                     ui.column(6, ui.input_numeric("window_size", "Window size", value=3, min=1, step=2)),
                                 ),
                                 ui.row(
-                                    ui.column(4, ui.input_checkbox("doNoise", "Apply noise removal", value=True)),
+                                    ui.column(6, ui.input_checkbox("doNoise", "Apply noise removal", value=True)),
                                     ui.column(6, ui.input_action_button("apply_noise", "Update channel", class_="btn btn-primary w-100")),
-                                    ui.column(2),
                                 ),
                             ),
                         ),
-                        ##PANEL4
-                        ui.column(3,   # narrow column as you requested
+
+                        # --- PANEL 4: Normalization & Transform ---
+                        ui.column(
+                            3,
                             ui.card(
                                 ui.card_header("Normalization and Transformation"),
                                 ui.row(
@@ -236,7 +204,7 @@ app_ui = ui.page_sidebar(
                                         8,
                                         ui.tags.div(
                                             ui.input_checkbox("doAsinh", "Arcsinh transform data", value=False),
-                                            class_="d-flex align-items-center"
+                                            class_="d-flex align-items-center",
                                         ),
                                     ),
                                     ui.column(
@@ -246,45 +214,35 @@ app_ui = ui.page_sidebar(
                                             "Cofactor",
                                             choices=[str(i) for i in range(2, 11)],
                                             selected="5",
-                                            width="100%"
+                                            width="100%",
                                         ),
                                     ),
                                     class_="align-items-center",
                                 ),
                                 ui.row(
-                                    ui.column(
-                                        6,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doNorm", "Normalize the channel?", value=True),
-                                            class_="d-flex align-items-center"
-                                        ),
-                                    ),
-                                    ui.column(
-                                        6,
-                                        ui.input_action_button("apply_norm", "Apply norm/transform", class_="btn btn-primary w-100"),
-                                    ),
+                                    ui.column(6, ui.tags.div(ui.input_checkbox("doNorm", "Normalize the channel?", value=True), class_="d-flex align-items-center")),
+                                    ui.column(6, ui.input_action_button("apply_norm", "Apply norm/transform", class_="btn btn-primary w-100")),
                                     class_="align-items-center",
                                 ),
                             ),
                         ),
-
                         class_="controls-panels",
-                        ),
                     ),
-                    
-                    # ===== Plot area =====
-                    ui.tags.div(
-                        ui.output_plot("img_viewer", fill=True, height="100%"),
-                        #ui.output_text_verbatim("dbg"),
-                        class_="viewer-fill",
-                    ),
-                    class_="flex-col",
+                    class_="controls-fixed",
                 ),
+
+                # ===== Plot area =====
+                ui.tags.div(
+                    ui.output_plot("img_viewer", fill=True, height="100%"),
+                    class_="viewer-fill",
+                ),
+                class_="flex-col",
             ),
         ),
+    ),
 
-        # ---- KEYWORD ARGS (must be last) ----
-        position="right",
+    # ---- KEYWORD ARGS (must be last) ----
+    position="right",
 )
 
 
@@ -460,6 +418,16 @@ def server(input, output, session):
             session.send_input_message("asinh_cofactor", {"value": str(int(row.get("Cofac", 5)))})
         finally:
             syncing_controls.set(False)
+    
+    def _cycle(lst, current, step):
+        if not lst:
+            return None
+        try:
+            i = lst.index(current)
+        except ValueError:
+            i = -1
+        return lst[(i + step) % len(lst)]
+
 
     def _apply_winsor(cur: np.ndarray, lo_q: float, hi_q: float) -> np.ndarray:
         q_low, q_high = np.quantile(cur, [lo_q, hi_q])
@@ -553,48 +521,31 @@ def server(input, output, session):
         finally:
             loading.set(False)
 
-    @reactive.Effect
-    @reactive.event(input.load)
-    def _do_load():
-        if loading.get():
-            return
-        loading.set(True)
-        try:
-            folder = input.path().strip()
-            print(">>> Load triggered with folder:", folder)
-
-            imgs, chs = load_tiffs_raw(folder)
-            images.set(imgs)
-            channels.set(chs)
-
-            samples = list(imgs.keys())
-            if not samples:
-                return
-            first_sample = samples[0]
-            first_chlist = chs[first_sample]
-            first_channel = first_chlist[0]
-
-            # set canonical + prefill table
-            canonical_channels.set(list(first_chlist))
-            _prefill_params(first_chlist)
-
-            # update selects under guard
-            setting_selects.set(True)
-            try:
-                ui.update_select("sample",  choices=samples,      selected=first_sample,  session=session)
-                ui.update_select("channel", choices=first_chlist, selected=first_channel, session=session)
-            finally:
-                setting_selects.set(False)
-
-            # sync knobs from the table row for the first channel
-            _sync_controls_from_table(first_channel)
-
-            print(">>> Post-load selected:", first_sample, first_channel)
-
-        finally:
-            loading.set(False)
-
     # ---------- react to sample change ----------
+    @reactive.Effect
+    @reactive.event(input.next_sample)
+    def _next_sample():
+        if loading.get() or not images.get():
+            return
+        samples = list(images.get().keys())
+        cur = input.sample() or (samples[0] if samples else None)
+        nxt = _cycle(samples, cur, +1)
+        if nxt:
+            # Don’t set setting_selects here; we want _on_sample_change to run
+            ui.update_select("sample", choices=samples, selected=nxt, session=session)
+
+    @reactive.Effect
+    @reactive.event(input.prev_sample)
+    def _prev_sample():
+        if loading.get() or not images.get():
+            return
+        samples = list(images.get().keys())
+        cur = input.sample() or (samples[0] if samples else None)
+        prv = _cycle(samples, cur, -1)
+        if prv:
+            ui.update_select("sample", choices=samples, selected=prv, session=session)
+
+
     @reactive.Effect
     @reactive.event(input.sample)
     def _on_sample_change():
@@ -617,6 +568,44 @@ def server(input, output, session):
         finally:
             setting_selects.set(False)
         _sync_controls_from_table(sel)
+
+    @reactive.Effect
+    @reactive.event(input.next_channel)
+    def _next_channel():
+        if loading.get():
+            return
+        s = input.sample()
+        if not s:
+            return
+        chlist_current = channels.get().get(s, [])
+        if not chlist_current:
+            return
+        canon = canonical_channels.get() or []
+        ordered = [ch for ch in canon if ch in chlist_current] or chlist_current
+        cur = input.channel() or ordered[0]
+        nxt = _cycle(ordered, cur, +1)
+        if nxt:
+            # Let _on_channel_change run; no setting_selects here
+            ui.update_select("channel", choices=ordered, selected=nxt, session=session)
+
+    @reactive.Effect
+    @reactive.event(input.prev_channel)
+    def _prev_channel():
+        if loading.get():
+            return
+        s = input.sample()
+        if not s:
+            return
+        chlist_current = channels.get().get(s, [])
+        if not chlist_current:
+            return
+        canon = canonical_channels.get() or []
+        ordered = [ch for ch in canon if ch in chlist_current] or chlist_current
+        cur = input.channel() or ordered[0]
+        prv = _cycle(ordered, cur, -1)
+        if prv:
+            ui.update_select("channel", choices=ordered, selected=prv, session=session)
+
 
     # ---------- react to channel change ----------
     @reactive.Effect
@@ -676,11 +665,13 @@ def server(input, output, session):
     @output
     @render.plot
     def img_viewer():
+        # one figure only; decent size/dpi so the browser has pixels to work with
+        fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+
         try:
             imgs = images.get()
             s = input.sample()
             c = input.channel()
-            fig, ax = plt.subplots()
 
             if not imgs or not s or not c or s not in imgs:
                 ax.text(0.5, 0.5, "No image", ha="center", va="center")
@@ -697,40 +688,34 @@ def server(input, output, session):
             idx = chlist.index(c)
             img = arr[idx, :, :].astype(np.float32)
 
-            # Winsorize
-            # Step 1: Winsorize
+            # ---- processing (unchanged) ----
             if input.doWinsor():
                 lo = max(0.0, min(1.0, float(input.winsor_low())))
                 hi = max(0.0, min(1.0, float(input.winsor_high())))
                 if hi > lo:
                     img = _apply_winsor(img, lo, hi)
 
-            # Step 2: Threshold
             if input.doThreshold():
                 thr = float(input.threshold_val())
                 if thr > 0.0:
                     cutoff = thr * (np.nanmax(img) if np.nanmax(img) > 0 else 1.0)
                     img = np.where(img >= cutoff, img, 0.0)
 
-            # Step 3: Local percentile noise removal
             if input.doNoise():
                 wsize = max(1, int(input.window_size()))
                 if wsize % 2 == 0:
                     wsize += 1
-                perc = float(input.noise_strength())  # 0..1
+                perc = float(input.noise_strength())
                 img = _apply_sliding_window(img, wsize, perc, remove="bright")
 
-            # Step 4: Arcsinh transform (after denoising, before normalization)
             if input.doAsinh():
                 try:
                     cofac = int(float(input.asinh_cofactor()))
                 except Exception:
                     cofac = 5
                 cofac = max(2, min(10, cofac))
-                # standard asinh transform for CyTOF/IMC: asinh(x / cofactor)
                 img = np.arcsinh(img / float(cofac))
-            
-            # Final normalization for display
+
             mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
             if mx > mn:
                 img = (img - mn) / (mx - mn)
@@ -741,7 +726,6 @@ def server(input, output, session):
             return fig
 
         except Exception as e:
-            fig, ax = plt.subplots()
             ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
             ax.set_axis_off()
             return fig
