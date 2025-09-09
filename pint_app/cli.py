@@ -1,20 +1,18 @@
-# pint_app/cli.py
+cat > pint_app/cli.py <<'PY'
 from __future__ import annotations
-import sys
-import subprocess
+import sys, subprocess
 from pathlib import Path
 
 def _root() -> Path:
-    # repo root is the parent dir of the package directory
+    # repo root = parent of the package directory
     return Path(__file__).resolve().parents[1]
 
 def main():
-    """Launch the main app script PINT.py"""
+    """Launch your main app script PINT.py."""
     script = _root() / "PINT.py"
     if not script.exists():
         print(f"[pint] Could not find {script}", file=sys.stderr)
         sys.exit(2)
-    # forward any extra CLI args to PINT.py
     sys.exit(subprocess.call([sys.executable, str(script), *sys.argv[1:]]))
 
 def viewer():
@@ -23,9 +21,7 @@ def viewer():
     if not viewer_py.exists():
         print(f"[pint-viewer] Could not find {viewer_py}", file=sys.stderr)
         sys.exit(2)
-    sys.exit(subprocess.call([
-        sys.executable, "-m", "shiny", "run", "--port", "8000", str(viewer_py), *sys.argv[1:]
-    ]))
+    sys.exit(subprocess.call([sys.executable, "-m", "shiny", "run", "--port", "8000", str(viewer_py), *sys.argv[1:]]))
 
 def analysis():
     """Run the batch analysis script directly."""
@@ -34,3 +30,4 @@ def analysis():
         print(f"[pint-analysis] Could not find {analysis_py}", file=sys.stderr)
         sys.exit(2)
     sys.exit(subprocess.call([sys.executable, str(analysis_py), *sys.argv[1:]]))
+PY
