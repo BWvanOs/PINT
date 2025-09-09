@@ -10,7 +10,10 @@ dependencies:
   - matplotlib>=3.8
   - tifffile>=2024.5.22
   - openpyxl>=3.1
+  - jinja2>=3.1
   - pip
   - pip:
-      - -e .        # <— installs this repo, creates the 'pint' commands
+      - -e .
       - shiny>=0.8.0
+      - ome-types>=0.5.0
+
