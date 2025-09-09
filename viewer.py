@@ -8,7 +8,8 @@ from shiny import App, ui, render, reactive
 from load_tiffs import load_tiffs_raw
 from scipy.ndimage import percentile_filter
 import os, sys, subprocess
-
+import shutil
+import subprocess
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
@@ -22,7 +23,7 @@ app_ui = ui.page_sidebar(
         open="closed",          # collapsed by default
         id="sidebar",
         class_="sidebar-col",
-        width="650px",          # tweak as needed
+        width="800px",          # tweak as needed
     ),
 
     # ---- HEAD/CSS (positional arg #2) ----
@@ -131,16 +132,40 @@ app_ui = ui.page_sidebar(
 
                         ui.column(1), ##spacer
 
-                        # Perform analysis button
-                        ui.column(1,
+                        # Perform analysis, import and export button
+                        ui.column(
+                            1,
+                            # TOP: Export CSV
+                            ui.row(
+                                ui.div(
+                                    ui.input_action_button(
+                                        "export_params",
+                                        "Export CSV",
+                                        class_="btn btn-secondary w-100"
+                                    ),
+                                    class_="mb-1"
+                                ),
+                            ),
+                            # MIDDLE: Import CSV
+                            ui.row(
+                                ui.div(
+                                    ui.input_action_button(
+                                        "import_params",
+                                        "Import CSV",
+                                        class_="btn btn-secondary w-100"
+                                    ),
+                                    class_="mb-1"
+                                ),
+                            ),
+                            # BOTTOM: Process Images (unchanged)
                             ui.row(
                                 ui.div(
                                     ui.input_action_button(
                                         "perform_analysis",
-                                        "Perform analysis",
+                                        "Process Images",
                                         class_="btn btn-primary text-white w-100 h-100"
                                     ),
-                                    class_="d-flex h-100 align-items-stretch"  # make the container stretch full height, only it doesn't work. What the...
+                                    class_="d-flex h-100 align-items-stretch"
                                 ),
                             ),
                         ),
@@ -281,12 +306,88 @@ def server(input, output, session):
             "DoAsinh", "Cofac",
         ])
     )
-
     loading = reactive.Value(False)
     setting_selects = reactive.Value(False)
     syncing_controls = reactive.Value(False)
+    data_loaded = reactive.Value(False)
+    last_loaded_folder = reactive.Value("") 
+    
+    # =============> helper funtions go here! <============
+    def _pick_open_csv_dialog(title="Select parameter CSV", initialdir=None) -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            import os as _os
+            root = tk.Tk(); root.withdraw()
+            try: root.wm_attributes("-topmost", 1)
+            except Exception: pass
+            path = filedialog.askopenfilename(
+                title=title,
+                initialdir=initialdir or _os.getcwd(),
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            )
+            root.destroy()
+            return path or ""
+        except Exception:
+            try:
+                import shutil, subprocess
+                if shutil.which("zenity"):
+                    res = subprocess.run(
+                        ["zenity", "--file-selection", "--title", title, "--file-filter=*.csv"],
+                        capture_output=True, text=True
+                    )
+                    return res.stdout.strip() if res.returncode == 0 else ""
+            except Exception:
+                pass
+            return ""
 
-    # ---------- helpers ----------
+    def _pick_save_csv_dialog(title="Save parameters CSV", initialdir=None, initialfile="parameter_table.csv") -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            import os as _os
+            root = tk.Tk(); root.withdraw()
+            try: root.wm_attributes("-topmost", 1)
+            except Exception: pass
+            path = filedialog.asksaveasfilename(
+                title=title,
+                initialdir=initialdir or _os.getcwd(),
+                initialfile=initialfile,
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            )
+            root.destroy()
+            return path or ""
+        except Exception:
+            return ""
+
+    def pick_folder_dialog(title="Select folder with OME-TIFFs") -> str:
+        # Prefer Tk (works on Win/macOS/Linux if tkinter is installed)
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                # bring dialog to front on some WMs
+                root.wm_attributes("-topmost", 1)
+            except Exception:
+                pass
+            path = filedialog.askdirectory(title=title)
+            root.destroy()
+            return path or ""
+        except Exception:
+            # Linux fallback if Tk isn't available
+            if shutil.which("zenity"):
+                res = subprocess.run(
+                    ["zenity", "--file-selection", "--directory", "--title", title],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode == 0:
+                    return res.stdout.strip()
+            return ""
+
     def _ensure_param_columns():
         required = ["Channel","DoWinsor","Low","High",
                     "DoThr","ThrVal",
@@ -391,6 +492,67 @@ def server(input, output, session):
 
     
     # ---------- load images ----------
+    @reactive.Effect
+    @reactive.event(input.load)
+    def _do_load():
+        if loading.get():
+            return
+        loading.set(True)
+        try:
+            # Try the text box first; if empty, open the dialog.
+            folder = (input.path() or "").strip()
+            if not folder:
+                # If you added pick_folder_dialog(), use it here:
+                try:
+                    folder = pick_folder_dialog()
+                except Exception:
+                    folder = ""
+            if not folder:
+                print("🛑 Load canceled (no folder selected).")
+                return
+
+            # Reflect the path in the UI text box
+            session.send_input_message("path", {"value": folder})
+            print(">>> Load triggered with folder:", folder)
+
+            imgs, chs = load_tiffs_raw(folder)
+            if not imgs:
+                print("⚠️ No images found in selected folder.")
+                return
+
+            images.set(imgs)
+            channels.set(chs)
+
+            samples = list(imgs.keys())
+            first_sample = samples[0]
+            first_chlist = chs[first_sample]
+            first_channel = first_chlist[0] if first_chlist else None
+
+            # set canonical + prefill table
+            canonical_channels.set(list(first_chlist))
+            _prefill_params(first_chlist)
+
+            # update selects under guard
+            setting_selects.set(True)
+            try:
+                ui.update_select("sample",  choices=samples,      selected=first_sample,  session=session)
+                if first_channel:
+                    ui.update_select("channel", choices=first_chlist, selected=first_channel, session=session)
+            finally:
+                setting_selects.set(False)
+
+            if first_channel:
+                _sync_controls_from_table(first_channel)
+
+            # ✅ mark as loaded and remember folder
+            data_loaded.set(True)
+            last_loaded_folder.set(folder)
+
+            print(">>> Post-load selected:", first_sample, first_channel)
+
+        finally:
+            loading.set(False)
+
     @reactive.Effect
     @reactive.event(input.load)
     def _do_load():
@@ -654,8 +816,11 @@ def server(input, output, session):
         params_df.set(new_df.reset_index(drop=True))
 
     @reactive.Effect
-    @reactive.event(input.perform_analysis)
+    @reactive.event(input.confirm_start)
     def _run_batch_analysis():
+        # Close the modal
+        ui.modal_remove(session=session)
+
         folder = (input.path() or "").strip()
         if not folder or not os.path.isdir(folder):
             print(f"⚠️ Invalid folder: {folder!r}")
@@ -664,7 +829,6 @@ def server(input, output, session):
         out_dir = os.path.join(folder, "normalized images")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Save current parameter table to the output folder
         params_path = os.path.join(out_dir, "parameter_table.csv")
         df = params_df.get().copy()
         if df.empty:
@@ -673,7 +837,6 @@ def server(input, output, session):
         df.to_csv(params_path, index=False)
         print(f"✅ Saved parameter table → {params_path}")
 
-        # Call the external analysis script with input dir, params csv and output dir
         script = Path(__file__).with_name("analysis.py")
         cmd = [sys.executable, str(script),
             "--input-dir", folder,
@@ -685,6 +848,137 @@ def server(input, output, session):
             print("✅ Analysis finished.")
         except subprocess.CalledProcessError as e:
             print(f"❌ Analysis script failed: {e}")
+
+
+    @reactive.Effect
+    @reactive.event(input.perform_analysis)
+    def _confirm_start_modal():
+        folder = (input.path() or "").strip()
+        msg = ui.div(
+            ui.p("Start image processing?"),
+            ui.tags.small(f"Folder: {folder or '— (no folder chosen)'}")
+        )
+        m = ui.modal(
+            msg,
+            title="Confirm",
+            easy_close=True,  # clicking outside = Cancel
+            footer=ui.div(
+                ui.modal_button("Cancel", class_="btn btn-secondary"),
+                ui.input_action_button("confirm_start", "Start", class_="btn btn-primary ms-2"),
+            ),
+            size="m",
+        )
+        ui.modal_show(m, session=session)
+
+    @reactive.Effect
+    @reactive.event(input.export_params)
+    def _export_params():
+        df = params_df.get().copy()
+        if df.empty:
+            print("⚠️ No parameters to export.")
+            return
+
+        folder = (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+        save_path = _pick_save_csv_dialog(initialdir=initdir, initialfile="parameter_table.csv")
+        if not save_path:
+            print("🛑 Export canceled.")
+            return
+
+        try:
+            df.to_csv(save_path, index=False)
+            print(f"✅ Exported parameters → {save_path}")
+        except Exception as e:
+            print(f"❌ Failed to write CSV: {e}")
+
+
+    @reactive.Effect
+    @reactive.event(input.import_params)
+    def _import_params():
+        # Require a completed load (robust against stray/empty load clicks)
+        if not data_loaded.get():
+            print("⚠️ Load images before importing parameters.")
+            return
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        csv_path = _pick_open_csv_dialog(initialdir=initdir)
+        if not csv_path:
+            print("🛑 Import canceled.")
+            return
+
+        # 3) Read & validate
+        try:
+            df_in = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"❌ Failed to read CSV: {e}")
+            return
+
+        if "Channel" not in df_in.columns:
+            print("❌ CSV missing required 'Channel' column.")
+            return
+
+        canon = list(canonical_channels.get() or [])
+        csv_channels = [str(x) for x in df_in["Channel"].astype(str).tolist()]
+        if set(csv_channels) != set(canon) or len(csv_channels) != len(canon):
+            print("❌ CSV channels do not match current image channels.")
+            print(f"   CSV:     {csv_channels}")
+            print(f"   Expected:{canon}")
+            return
+
+        # 4) Normalize columns, order, and types
+        target_cols = params_df.get().columns.tolist()
+        defaults = {
+            "Channel": "",
+            "DoWinsor": False, "Low": 0.0, "High": 1.0,
+            "DoThr": False, "ThrVal": 0.0,
+            "Noise": False, "NStr": 1.0, "WinSz": 3,
+            "DoNorm": True,
+            "DoAsinh": False, "Cofac": 5,
+        }
+
+        df_in = df_in.set_index("Channel").reindex(canon).reset_index()
+
+        # Add any missing columns with defaults
+        for col in target_cols:
+            if col not in df_in.columns:
+                df_in[col] = defaults.get(col)
+
+        # Keep only target columns, in order
+        df_in = df_in[target_cols].copy()
+
+        # Coerce types
+        bool_cols  = [c for c in target_cols if c in ["DoWinsor","DoThr","Noise","DoNorm","DoAsinh"]]
+        float_cols = [c for c in target_cols if c in ["Low","High","ThrVal","NStr"]]
+        int_cols   = [c for c in target_cols if c in ["WinSz","Cofac"]]
+
+        def _to_bool(v):
+            s = str(v).strip().lower()
+            if s in ("true","1","yes","y","t"): return True
+            if s in ("false","0","no","n","f"): return False
+            try: return bool(int(float(v)))
+            except Exception: return False
+
+        for c in bool_cols:
+            df_in[c] = df_in[c].map(_to_bool)
+
+        for c in float_cols:
+            df_in[c] = pd.to_numeric(df_in[c], errors="coerce").fillna(defaults[c]).astype(float)
+
+        for c in int_cols:
+            df_in[c] = pd.to_numeric(df_in[c], errors="coerce").fillna(defaults[c]).astype(int)
+
+        # 5) Commit and sync UI
+        params_df.set(df_in.reset_index(drop=True))
+        sel = input.channel()
+        if sel:
+            _sync_controls_from_table(sel)
+
+        print(f"✅ Imported parameters from {csv_path}")
+
+
+
 
 
 from shiny import App  # (you already have this at the top)
