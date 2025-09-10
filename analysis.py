@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import os
 import numpy as np
 import pandas as pd
 
-from scipy.ndimage import percentile_filter
+from scipy.ndimage import percentile_filter, convolve
 from tifffile import imwrite
 
 # Reuse your loader
@@ -56,6 +55,41 @@ def to_uint16_stack(stack_f32: np.ndarray) -> np.ndarray:
     return out
 
 
+def strength_to_percentile(s: float, eps: float = 0.005) -> float:
+    """Map Strength s∈[0,1] to percentile p∈(0,1): p = 1 - eps - s*(1 - eps)."""
+    s = float(np.clip(s, 0.0, 1.0))
+    return 1.0 - eps - s * (1.0 - eps)
+
+
+def speckle_suppress_percentile_with_neighbors(
+    img: np.ndarray,
+    p: float,            # percentile in 0..1
+    size: int,           # odd window for local percentile
+    neighbor_limit: int = 2,
+) -> np.ndarray:
+    """
+    Old method + cluster check:
+      - Mark 'bright' if center > local P (computed over size×size)
+      - Remove only if ≤ neighbor_limit of the 8 neighbors are also bright
+      - Treat zeros as background (must be > 0 to be considered bright)
+    """
+    if size % 2 == 0:
+        size += 1
+
+    thr = percentile_filter(img, percentile=p * 100.0, size=size)
+    bright = (img > thr) & (img > 0)
+
+    k = np.ones((3, 3), dtype=np.float32)
+    k[1, 1] = 0.0
+    neighbor_count = convolve(bright.astype(np.float32), k, mode="reflect")
+
+    remove = bright & (neighbor_count <= float(neighbor_limit))
+
+    out = img.copy()
+    out[remove] = 0.0
+    return out
+
+
 # ---------------------- main ----------------------
 def main():
     args = parse_args()
@@ -72,7 +106,7 @@ def main():
     defaults = {
         "DoWinsor": False, "Low": 0.0, "High": 1.0,
         "DoThr": False, "ThrVal": 0.0,
-        "Noise": False, "NStr": 0.0, "WinSz": 3,
+        "Noise": False, "NStr": 0.0, "NPrctl": 0.995, "WinSz": 3,
         "DoNorm": True,
         "DoAsinh": False, "Cofac": 5,
     }
@@ -109,12 +143,19 @@ def main():
             thrN   = float(r.get("ThrVal",   defaults["ThrVal"]))     # 0..1
 
             doNoise = bool(r.get("Noise",    defaults["Noise"]))
-            pVal    = float(r.get("NStr",    defaults["NStr"]))       # 0..1 (percentile)
+            sVal    = float(r.get("NStr",    defaults["NStr"]))       # UI strength 0..1
+            pCsv    = float(r.get("NPrctl",  defaults["NPrctl"]))     # if present in CSV
             winSz   = int(r.get("WinSz",     defaults["WinSz"]))
 
             doNorm  = bool(r.get("DoNorm",   defaults["DoNorm"]))
             doAsinh = bool(r.get("DoAsinh",  defaults["DoAsinh"]))
             cofac   = float(r.get("Cofac",   defaults["Cofac"]))
+
+            # Resolve percentile used: prefer NPrctl if provided; else derive from strength
+            if np.isfinite(pCsv) and 0.0 < pCsv < 1.0:
+                pUsed = pCsv
+            else:
+                pUsed = strength_to_percentile(sVal)
 
             # 1) Winsorization
             if doWin:
@@ -122,7 +163,7 @@ def main():
             else:
                 rawFloor, rawCeil = preMin, preMax
 
-            # 2) Global threshold (mirror viewer: cutoff = thr * max(after winsor))
+            # 2) Global threshold (cutoff = thr * max(after winsor))
             if doThr and thrN > 0.0:
                 mx = float(np.nanmax(frame))
                 if mx > 0.0:
@@ -134,16 +175,15 @@ def main():
             else:
                 thr_used = np.nan
 
-            # 3) Local percentile speckle removal (bright-speckle removal)
-            #    Zero values ABOVE the local percentile threshold
-            if doNoise and pVal > 0.0 and winSz > 1:
-                lp = local_percentile(frame, pVal * 100.0, winSz)
-                frame[frame > lp] = 0.0
-                pct_used = float(pVal)
-            else:
-                pct_used = np.nan
+            # 3) Local percentile speckle removal + neighbor rule (viewer parity)
+            pct_used = np.nan
+            if doNoise and winSz >= 1 and (0.0 < pUsed < 1.0):
+                frame = speckle_suppress_percentile_with_neighbors(
+                    frame, p=pUsed, size=winSz, neighbor_limit=2
+                )
+                pct_used = float(pUsed)
 
-            # 4) Arcsinh (after denoise, before normalization)
+            # 4) Optional arcsinh (after denoise, before normalization)
             asinh_applied = False
             asinh_cofac = np.nan
             if doAsinh:
@@ -153,8 +193,7 @@ def main():
                 asinh_applied = True
                 asinh_cofac = float(cofac)
 
-            # 5) Optional normalization to [0,1] (viewer always normalizes for display;
-            #    here it's controlled by DoNorm, per your design)
+            # 5) Optional normalization to [0,1]
             normalized = False
             if doNorm:
                 mn, mx = float(np.nanmin(frame)), float(np.nanmax(frame))
@@ -175,7 +214,10 @@ def main():
                 "WinsorLower":    float(rawFloor),
                 "WinsorUpper":    float(rawCeil),
                 "Threshold":      thr_used,
+                "Strength":       float(sVal),
                 "Percentile":     pct_used,
+                "WindowSize":     int(winSz),
+                "NeighborsRule":  "remove if ≤2 bright neighbors",
                 "Normalized":     bool(normalized),
                 "AsinhApplied":   bool(asinh_applied),
                 "AsinhCofactor":  asinh_cofac,

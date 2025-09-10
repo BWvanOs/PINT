@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from shiny import App, ui, render, reactive
 from load_tiffs import load_tiffs_raw
-from scipy.ndimage import percentile_filter
+from scipy.ndimage import percentile_filter, convolve, grey_opening, uniform_filter
 import os, sys, subprocess
 import shutil
 import warnings
@@ -184,12 +184,18 @@ app_ui = ui.page_sidebar(
                             ui.card(
                                 ui.card_header("Sliding Window Noise Removal"),
                                 ui.row(
-                                    ui.column(6, ui.input_slider("noise_strength", "Strength (0-1)", min=0.0, max=1.0, value=1, step=0.01)),
-                                    ui.column(6, ui.input_numeric("window_size", "Window size", value=3, min=1, step=2)),
+                                    ui.column(6, ui.input_slider("noise_strength", "Denoise strength (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
+                                    ui.column(6, ui.input_numeric("window_size", "Window size (odd)", value=3, min=1, step=2)),
                                 ),
                                 ui.row(
                                     ui.column(6, ui.input_checkbox("doNoise", "Apply noise removal", value=True)),
                                     ui.column(6, ui.input_action_button("apply_noise", "Update channel", class_="btn btn-primary w-100")),
+                                    ui.row(
+                                        ui.column(
+                                            12,
+                                            ui.output_ui("noise_tooltip"),   # dynamic helper + tooltip
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
@@ -259,7 +265,7 @@ def server(input, output, session):
         pd.DataFrame(columns=[
             "Channel", "DoWinsor", "Low", "High",
             "DoThr", "ThrVal",
-            "Noise", "NStr", "WinSz",
+            "Noise", "NStr", "NPrctl", "WinSz",
             "DoNorm",
             "DoAsinh", "Cofac",
         ])
@@ -349,13 +355,13 @@ def server(input, output, session):
     def _ensure_param_columns():
         required = ["Channel","DoWinsor","Low","High",
                     "DoThr","ThrVal",
-                    "Noise","NStr","WinSz",
+                    "Noise","NStr", "NPrctl", "WinSz",
                     "DoNorm"]  # if you're adding Normalize
         defaults = {
             "Channel": "",
             "DoWinsor": False, "Low": 0.0, "High": 1.0,
             "DoThr": False, "ThrVal": 0.0,
-            "Noise": False, "NStr": 1.0, "WinSz": 3,
+            "Noise": False, "NStr": 1.0, "NPrctl": 0.995, "WinSz": 3,
             "DoNorm": True,
         }
         df = params_df.get()
@@ -369,6 +375,10 @@ def server(input, output, session):
         params_df.set(df[required].reset_index(drop=True))
 
     def _prefill_params(first_chlist: list[str]) -> None:
+        # read the current UI slider once and map to a percentile
+        s = float(input.noise_strength())
+        p = _strength_to_percentile(s)
+
         rows = [{
             "Channel": ch,
             "DoWinsor": bool(input.doWinsor()),
@@ -377,7 +387,8 @@ def server(input, output, session):
             "DoThr": bool(input.doThreshold()),
             "ThrVal": float(input.threshold_val()),
             "Noise": bool(input.doNoise()),
-            "NStr": float(input.noise_strength()),
+            "NStr": s,
+            "NPrctl": p, 
             "WinSz": int(input.window_size()),
             "DoNorm": bool(input.doNorm()),
             "DoAsinh": bool(input.doAsinh()),
@@ -385,6 +396,7 @@ def server(input, output, session):
         } for ch in first_chlist]
         df = pd.DataFrame(rows)
         params_df.set(df.reindex(columns=params_df.get().columns).reset_index(drop=True))
+
 
     def _sync_controls_from_table(channel: str) -> None:
         if not channel:
@@ -432,33 +444,43 @@ def server(input, output, session):
     def _apply_winsor(cur: np.ndarray, lo_q: float, hi_q: float) -> np.ndarray:
         q_low, q_high = np.quantile(cur, [lo_q, hi_q])
         return np.clip(cur, q_low, q_high)
+    
+    def _strength_to_percentile(s: float, eps: float = 0.005) -> float:
+        # s∈[0,1]  ->  p = 1 - eps - s*(1-eps)  (right = stronger = lower percentile)
+        s = float(np.clip(s, 0.0, 1.0))
+        return 1.0 - eps - s * (1.0 - eps)
 
-    def _apply_sliding_window(img: np.ndarray, size: int, perc: float, remove: str = "bright") -> np.ndarray:
-        """
-        Remove speckles using a local percentile threshold.
 
-        Parameters
-        ----------
-        img : 2D array
-        size : odd int (e.g., 3,5,7)
-        perc : 0..1 (e.g., 0.9 = 90th percentile)
-        remove : "bright" (zero pixels > local pct) or "dark" (zero pixels < local pct)
+    def _apply_speckle_suppress(
+        img: np.ndarray,
+        size: int,
+        perc: float,
+        neighbor_limit: int = 2,    # ≤ 2 bright adjacent neighbors ⇒ remove
+    ) -> np.ndarray:
         """
-        if size <= 1 or perc <= 0:
-            return img
+        Old method: center is 'bright' if > local percentile in a (size×size) window.
+        Extra check: remove only if AT MOST `neighbor_limit` of the 8 adjacent pixels
+        (3×3 neighborhood, center excluded) are also bright.
+        """
         if size % 2 == 0:
             size += 1
 
-        local_thresh = percentile_filter(img, percentile=perc * 100, size=size)
+        # 1) local percentile threshold on the raw image
+        thr = percentile_filter(img, percentile=perc * 100.0, size=size)
+        bright = (img > thr) & (img > 0)
 
-        if remove == "bright":
-            # keep pixels <= local pct; zero brighter-than-local outliers
-            return np.where(img <= local_thresh, img, 0.0)
-        else:
-            # keep pixels >= local pct; zero darker-than-local outliers
-            return np.where(img >= local_thresh, img, 0.0)
+        # 2) count bright pixels in the immediate 8-neighborhood (3×3, center=0)
+        k = np.ones((3, 3), dtype=np.float32)
+        k[1, 1] = 0.0
+        neighbor_count = convolve(bright.astype(np.float32), k, mode="reflect")
 
-    
+        # 3) remove if bright and has ≤ neighbor_limit bright neighbors
+        remove = bright & (neighbor_count <= float(neighbor_limit))
+
+        out = img.copy()
+        out[remove] = 0.0
+        return out
+
     # ---------- load images ----------
     @reactive.Effect
     @reactive.event(input.load)
@@ -641,6 +663,36 @@ def server(input, output, session):
         params_df.set(new_df.reset_index(drop=True))
 
     @reactive.Effect
+    @reactive.event(input.apply_threshold)
+    def _apply_threshold_channel():
+        if syncing_controls.get():
+            return
+        c = input.channel()
+        if not c:
+            return
+        df = params_df.get()
+        if df.empty:
+            return
+        idx_list = df.index[df["Channel"] == c].tolist()
+        if not idx_list:
+            return
+
+        i = idx_list[0]
+        new_df = df.copy()
+
+        # clamp and persist to table
+        try:
+            thr_val = float(input.threshold_val())
+        except Exception:
+            thr_val = 0.0
+        thr_val = max(0.0, min(1.0, thr_val))
+
+        new_df.at[i, "DoThr"]  = bool(input.doThreshold())
+        new_df.at[i, "ThrVal"] = thr_val
+
+        params_df.set(new_df.reset_index(drop=True))
+
+    @reactive.Effect
     @reactive.event(input.apply_noise)
     def _apply_noise_channel():
         if syncing_controls.get():
@@ -656,10 +708,18 @@ def server(input, output, session):
             return
         i = idx[0]
         new_df = df.copy()
+
+        s = float(input.noise_strength())
+        p = _strength_to_percentile(s)
+
         new_df.at[i, "Noise"]  = bool(input.doNoise())
-        new_df.at[i, "NStr"]   = float(input.noise_strength())
+        new_df.at[i, "NStr"]   = s         # UI strength (0..1)
+        new_df.at[i, "NPrctl"] = p         # derived percentile actually used
         new_df.at[i, "WinSz"]  = int(input.window_size())
+
         params_df.set(new_df.reset_index(drop=True))
+
+
 
     # ---------- plot ----------
     @output
@@ -667,7 +727,6 @@ def server(input, output, session):
     def img_viewer():
         # one figure only; decent size/dpi so the browser has pixels to work with
         fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
-
         try:
             imgs = images.get()
             s = input.sample()
@@ -688,26 +747,30 @@ def server(input, output, session):
             idx = chlist.index(c)
             img = arr[idx, :, :].astype(np.float32)
 
-            # ---- processing (unchanged) ----
+            # Step 1: Winsorize (actually run this under doWinsor)
             if input.doWinsor():
                 lo = max(0.0, min(1.0, float(input.winsor_low())))
                 hi = max(0.0, min(1.0, float(input.winsor_high())))
                 if hi > lo:
                     img = _apply_winsor(img, lo, hi)
 
+            # Step 2: Global threshold (optional)
             if input.doThreshold():
                 thr = float(input.threshold_val())
                 if thr > 0.0:
                     cutoff = thr * (np.nanmax(img) if np.nanmax(img) > 0 else 1.0)
                     img = np.where(img >= cutoff, img, 0.0)
 
+            # Step 3: Speckle suppression (old percentile rule + 2-neighbor check)
             if input.doNoise():
                 wsize = max(1, int(input.window_size()))
                 if wsize % 2 == 0:
                     wsize += 1
-                perc = float(input.noise_strength())
-                img = _apply_sliding_window(img, wsize, perc, remove="bright")
+                s = float(input.noise_strength())
+                p = _strength_to_percentile(s)
+                img = _apply_speckle_suppress(img, size=wsize, perc=p, neighbor_limit=2)
 
+            # Step 4: OPTIONAL arcsinh (note: now after denoise/threshold in this pipeline)
             if input.doAsinh():
                 try:
                     cofac = int(float(input.asinh_cofactor()))
@@ -716,6 +779,7 @@ def server(input, output, session):
                 cofac = max(2, min(10, cofac))
                 img = np.arcsinh(img / float(cofac))
 
+            # Step 5: Final normalization for display
             mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
             if mx > mn:
                 img = (img - mn) / (mx - mn)
@@ -729,6 +793,29 @@ def server(input, output, session):
             ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
             ax.set_axis_off()
             return fig
+
+    @output
+    @render.ui
+    def noise_tooltip():
+        s = float(input.noise_strength())
+        p = _strength_to_percentile(s)            # p in [0..1]
+        p_txt = f"P{p*100:.1f}"
+
+        long = (
+            f"Pixels above their local {p_txt} are marked ‘bright.’ "
+            "A pixel is removed only if ≤ 2 of its 8 neighbors are also bright. "
+            "Increase sensitivity to flag more pixels as bright (more aggressive denoising). "
+            "Decrease to preserve detail in bright patches."
+        )
+
+        # Small, muted line with a hover tooltip and a compact readout
+        return ui.tags.small(
+            ui.tags.span("ℹ️ ", class_="me-1"),
+            f"Local cutoff ≈ {p_txt}",
+            title=long,
+            class_="text-muted"
+        )
+
 
     @reactive.Effect
     @reactive.event(input.apply_norm)
@@ -765,6 +852,7 @@ def server(input, output, session):
             "ThrVal": "ThrVal",
             "Noise": "Noise",
             "NStr": "NStr",
+            "NPrctl": "NPerc",
             "WinSz": "WinSz",
             "DoNorm": "Norm?",
             "DoAsinh": "Asinh?",
@@ -917,7 +1005,7 @@ def server(input, output, session):
             "Channel": "",
             "DoWinsor": False, "Low": 0.0, "High": 1.0,
             "DoThr": False, "ThrVal": 0.0,
-            "Noise": False, "NStr": 1.0, "WinSz": 3,
+            "Noise": False, "NStr": 1.0, "NPrctl": 0.995, "WinSz": 3,
             "DoNorm": True,
             "DoAsinh": False, "Cofac": 5,
         }
@@ -960,10 +1048,6 @@ def server(input, output, session):
             _sync_controls_from_table(sel)
 
         print(f"✅ Imported parameters from {csv_path}")
-
-
-
-
 
 from shiny import App  # (you already have this at the top)
 
