@@ -31,26 +31,27 @@ def winsorize(arr: np.ndarray, lo_q: float, hi_q: float) -> tuple[np.ndarray, fl
     return np.clip(arr, q_low, q_high), float(q_low), float(q_high)
 
 
-def local_percentile(arr: np.ndarray, p01_100: float, size: int) -> np.ndarray:
-    """Local percentile (p in 0..100) with odd window size."""
-    if size < 1:
-        size = 1
-    if size % 2 == 0:
-        size += 1
-    return percentile_filter(arr, percentile=p01_100, size=size)
+def to_uint16_stack(stack_f32: np.ndarray, is_unit_flags: list[bool] | None = None) -> np.ndarray:
+    """
+    Convert to uint16.
+    - For channels already in [0,1] (is_unit_flags[i] == True), preserve that scale.
+    - For others, scale per-channel to [0,1] before mapping to 0..65535.
+    """
+    C, H, W = stack_f32.shape
+    out = np.zeros((C, H, W), dtype=np.uint16)
+    if is_unit_flags is None:
+        is_unit_flags = [False] * C
 
-
-def to_uint16_stack(stack_f32: np.ndarray) -> np.ndarray:
-    """Scale each channel independently to [0, 65535] and cast to uint16."""
-    c, h, w = stack_f32.shape
-    out = np.zeros((c, h, w), dtype=np.uint16)
-    for i in range(c):
+    for i in range(C):
         img = stack_f32[i]
-        mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
-        if mx > mn:
-            scaled = (img - mn) / (mx - mn)
+        if is_unit_flags[i]:
+            scaled = np.clip(img, 0.0, 1.0)
         else:
-            scaled = np.zeros_like(img, dtype=np.float32)
+            mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+            if mx > mn:
+                scaled = (img - mn) / (mx - mn)
+            else:
+                scaled = np.zeros_like(img, dtype=np.float32)
         out[i] = np.clip(np.round(scaled * 65535.0), 0, 65535).astype(np.uint16)
     return out
 
@@ -90,6 +91,54 @@ def speckle_suppress_percentile_with_neighbors(
     return out
 
 
+def channels_needing_global(params: pd.DataFrame) -> set[str]:
+    """Return channel names that request global normalization."""
+    need = set()
+    if "Channel" not in params.columns:
+        return need
+    norm_scope = params.get("NormScope", pd.Series(["page"] * len(params)))
+    do_norm    = params.get("DoNorm", pd.Series([True] * len(params)))
+    for ch, scope, dn in zip(params["Channel"].astype(str), norm_scope, do_norm):
+        if str(scope).strip().lower() == "global" and bool(dn):
+            need.add(ch)
+    return need
+
+
+def precompute_global_minmax(images: dict[str, np.ndarray],
+                             channels: dict[str, list[str]],
+                             needed: set[str]) -> dict[str, tuple[float, float] | None]:
+    """
+    Compute global (min, max) per channel name across ALL samples on the RAW frames.
+    Returns {channel_name: (gmin, gmax)}; value may be None if not found or degenerate.
+    """
+    out: dict[str, tuple[float, float] | None] = {ch: None for ch in needed}
+    if not needed:
+        return out
+
+    gmins = {ch: np.inf for ch in needed}
+    gmaxs = {ch: -np.inf for ch in needed}
+
+    for sample, arr in images.items():
+        chlist = channels.get(sample, [])
+        for ch in needed:
+            if ch not in chlist:
+                continue
+            idx = chlist.index(ch)
+            raw = arr[idx]  # RAW 2D page
+            mn = float(np.nanmin(raw))
+            mx = float(np.nanmax(raw))
+            if np.isfinite(mn) and np.isfinite(mx):
+                gmins[ch] = min(gmins[ch], mn)
+                gmaxs[ch] = max(gmaxs[ch], mx)
+
+    for ch in needed:
+        if np.isfinite(gmins[ch]) and np.isfinite(gmaxs[ch]) and gmaxs[ch] > gmins[ch]:
+            out[ch] = (float(gmins[ch]), float(gmaxs[ch]))
+        else:
+            out[ch] = None
+    return out
+
+
 # ---------------------- main ----------------------
 def main():
     args = parse_args()
@@ -107,15 +156,23 @@ def main():
         "DoWinsor": False, "Low": 0.0, "High": 1.0,
         "DoThr": False, "ThrVal": 0.0,
         "Noise": False, "NStr": 0.0, "NPrctl": 0.995, "WinSz": 3,
-        "DoNorm": True,
+        "DoNorm": True, "NormScope": "page",
         "DoAsinh": False, "Cofac": 5,
     }
     for col, val in defaults.items():
         if col not in params.columns:
             params[col] = val
 
+    # Make sure columns have reasonable types/values
+    params["Channel"]   = params["Channel"].astype(str)
+    params["NormScope"] = params["NormScope"].astype(str).str.lower().fillna("page")
+
     # Load stacks
     imgs, chs = load_tiffs_raw(str(in_dir))
+
+    # Precompute global min/max where requested (RAW frames, across all samples)
+    need_global = channels_needing_global(params)
+    global_minmax = precompute_global_minmax(imgs, chs, need_global)  # {ch: (gmin,gmax) | None}
 
     # Collect per-frame results (like your R 'results')
     results_rows: list[dict] = []
@@ -124,6 +181,8 @@ def main():
         chlist = chs[img_name]  # channel names
         C, H, W = stack.shape
         processed = np.zeros((C, H, W), dtype=np.float32)
+        # track which channels ended up in [0,1] already (for uint16 writing)
+        ch_is_unit = [False] * C
 
         for j, ch in enumerate(chlist):
             frame = stack[j].astype(np.float32).copy()
@@ -135,21 +194,22 @@ def main():
             row = params.loc[params["Channel"] == ch]
             r = row.iloc[0] if not row.empty else pd.Series(defaults)
 
-            doWin  = bool(r.get("DoWinsor", defaults["DoWinsor"]))
-            lo_q   = float(r.get("Low",      defaults["Low"]))
-            hi_q   = float(r.get("High",     defaults["High"]))
+            doWin   = bool(r.get("DoWinsor", defaults["DoWinsor"]))
+            lo_q    = float(r.get("Low",      defaults["Low"]))
+            hi_q    = float(r.get("High",     defaults["High"]))
 
-            doThr  = bool(r.get("DoThr",     defaults["DoThr"]))
-            thrN   = float(r.get("ThrVal",   defaults["ThrVal"]))     # 0..1
+            doThr   = bool(r.get("DoThr",     defaults["DoThr"]))
+            thrN    = float(r.get("ThrVal",   defaults["ThrVal"]))     # 0..1
 
-            doNoise = bool(r.get("Noise",    defaults["Noise"]))
-            sVal    = float(r.get("NStr",    defaults["NStr"]))       # UI strength 0..1
-            pCsv    = float(r.get("NPrctl",  defaults["NPrctl"]))     # if present in CSV
-            winSz   = int(r.get("WinSz",     defaults["WinSz"]))
+            doNoise = bool(r.get("Noise",     defaults["Noise"]))
+            sVal    = float(r.get("NStr",     defaults["NStr"]))       # UI strength 0..1
+            pCsv    = float(r.get("NPrctl",   defaults["NPrctl"]))     # if present in CSV
+            winSz   = int(r.get("WinSz",      defaults["WinSz"]))
 
-            doNorm  = bool(r.get("DoNorm",   defaults["DoNorm"]))
-            doAsinh = bool(r.get("DoAsinh",  defaults["DoAsinh"]))
-            cofac   = float(r.get("Cofac",   defaults["Cofac"]))
+            doNorm  = bool(r.get("DoNorm",    defaults["DoNorm"]))
+            scope   = str(r.get("NormScope",  defaults["NormScope"])).lower()
+            doAsinh = bool(r.get("DoAsinh",   defaults["DoAsinh"]))
+            cofac   = float(r.get("Cofac",    defaults["Cofac"]))
 
             # Resolve percentile used: prefer NPrctl if provided; else derive from strength
             if np.isfinite(pCsv) and 0.0 < pCsv < 1.0:
@@ -193,24 +253,43 @@ def main():
                 asinh_applied = True
                 asinh_cofac = float(cofac)
 
-            # 5) Optional normalization to [0,1]
+            # 5) Optional normalization
             normalized = False
+            gmin_used = np.nan
+            gmax_used = np.nan
             if doNorm:
-                mn, mx = float(np.nanmin(frame)), float(np.nanmax(frame))
-                if mx > mn:
-                    frame = (frame - mn) / (mx - mn)
+                if scope == "global":
+                    gpair = global_minmax.get(ch, None)
+                    if gpair and gpair[1] > gpair[0]:
+                        gmin, gmax = gpair
+                        frame = (frame - gmin) / (gmax - gmin)
+                        normalized = True
+                        ch_is_unit[j] = True
+                        gmin_used, gmax_used = float(gmin), float(gmax)
+                    else:
+                        # Fallback to per-page if global unavailable/degenerate
+                        mn, mx = float(np.nanmin(frame)), float(np.nanmax(frame))
+                        if mx > mn:
+                            frame = (frame - mn) / (mx - mn)
+                            normalized = True
+                            ch_is_unit[j] = True
                 else:
-                    frame[:] = 0.0
-                normalized = True
+                    # Per-page normalization
+                    mn, mx = float(np.nanmin(frame)), float(np.nanmax(frame))
+                    if mx > mn:
+                        frame = (frame - mn) / (mx - mn)
+                        normalized = True
+                        ch_is_unit[j] = True
 
             processed[j] = frame
 
-            # Record parameters like the R 'results'
+            # Record parameters/results
             results_rows.append({
                 "Image":          img_name,
-                "Page":           j + 1,  # 1-based index
-                "MinValue":       preMin,
-                "MaxValue":       preMax,
+                "Channel":        ch,
+                "Page":           j + 1,  # 1-based
+                "MinValueRaw":    preMin,
+                "MaxValueRaw":    preMax,
                 "WinsorLower":    float(rawFloor),
                 "WinsorUpper":    float(rawCeil),
                 "Threshold":      thr_used,
@@ -219,6 +298,9 @@ def main():
                 "WindowSize":     int(winSz),
                 "NeighborsRule":  "remove if ≤2 bright neighbors",
                 "Normalized":     bool(normalized),
+                "NormScope":      scope,
+                "GlobalMinUsed":  gmin_used,
+                "GlobalMaxUsed":  gmax_used,
                 "AsinhApplied":   bool(asinh_applied),
                 "AsinhCofactor":  asinh_cofac,
             })
@@ -236,8 +318,10 @@ def main():
             metadata={"axes": "CYX"},
         )
 
-        # 16-bit (per-channel min–max scaling)
-        u16 = to_uint16_stack(processed)
+        # 16-bit:
+        # - channels already normalized to [0,1] keep that scale
+        # - others get per-channel stretch (so they're usable)
+        u16 = to_uint16_stack(processed, is_unit_flags=ch_is_unit)
         imwrite(
             out16,
             u16,

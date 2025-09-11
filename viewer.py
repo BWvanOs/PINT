@@ -22,7 +22,7 @@ app_ui = ui.page_sidebar(
         open="closed",          # collapsed by default
         id="sidebar",
         class_="sidebar-col",
-        width="800px",          # tweak as needed
+        width="850px",          # tweak as needed
     ),
 
     # ---- HEAD/CSS (positional arg #2) ----
@@ -206,15 +206,33 @@ app_ui = ui.page_sidebar(
                             ui.card(
                                 ui.card_header("Normalization and Transformation"),
                                 ui.row(
+                                    # LEFT: normalization controls
                                     ui.column(
-                                        8,
+                                        6,
+                                        ui.tags.div(
+                                            ui.input_checkbox("doNorm", "Normalize the channel?", value=True),
+                                            class_="d-flex align-items-center mb-2",
+                                        ),
+                                        ui.input_radio_buttons(
+                                            "norm_scope",
+                                            "Normalize using",
+                                            choices={
+                                                "page":   "Per page (each sample seperate)",
+                                                "global": "Global min/max across channel",
+                                            },
+                                            selected="page",
+                                            inline=True,
+                                        ),
+                                        ui.output_ui("norm_scope_hint"),
+                                    ),
+
+                                    # RIGHT: arcsinh controls stacked, then Apply button
+                                    ui.column(
+                                        6,
                                         ui.tags.div(
                                             ui.input_checkbox("doAsinh", "Arcsinh transform data", value=False),
-                                            class_="d-flex align-items-center",
+                                            class_="d-flex align-items-center mb-2",
                                         ),
-                                    ),
-                                    ui.column(
-                                        4,
                                         ui.input_select(
                                             "asinh_cofactor",
                                             "Cofactor",
@@ -222,17 +240,16 @@ app_ui = ui.page_sidebar(
                                             selected="5",
                                             width="100%",
                                         ),
+                                        ui.input_action_button(
+                                            "apply_norm",
+                                            "Apply norm/transform",
+                                            class_="btn btn-primary w-100 mt-2",
+                                        ),
                                     ),
-                                    class_="align-items-center",
-                                ),
-                                ui.row(
-                                    ui.column(6, ui.tags.div(ui.input_checkbox("doNorm", "Normalize the channel?", value=True), class_="d-flex align-items-center")),
-                                    ui.column(6, ui.input_action_button("apply_norm", "Apply norm/transform", class_="btn btn-primary w-100")),
-                                    class_="align-items-center",
+                                    class_="align-items-start",
                                 ),
                             ),
                         ),
-                        class_="controls-panels",
                     ),
                     class_="controls-fixed",
                 ),
@@ -268,8 +285,10 @@ def server(input, output, session):
             "Noise", "NStr", "NPrctl", "WinSz",
             "DoNorm",
             "DoAsinh", "Cofac",
+            "NormScope",                # <-- NEW
         ])
     )
+
     loading = reactive.Value(False)
     setting_selects = reactive.Value(False)
     syncing_controls = reactive.Value(False)
@@ -388,12 +407,14 @@ def server(input, output, session):
             "ThrVal": float(input.threshold_val()),
             "Noise": bool(input.doNoise()),
             "NStr": s,
-            "NPrctl": p, 
+            "NPrctl": p,
             "WinSz": int(input.window_size()),
             "DoNorm": bool(input.doNorm()),
             "DoAsinh": bool(input.doAsinh()),
             "Cofac": int(float(input.asinh_cofactor() or 5)),
+            "NormScope": (input.norm_scope() or "page"),   # <-- NEW
         } for ch in first_chlist]
+
         df = pd.DataFrame(rows)
         params_df.set(df.reindex(columns=params_df.get().columns).reset_index(drop=True))
 
@@ -424,6 +445,7 @@ def server(input, output, session):
 
             # Normalize checkbox (if present)
             session.send_input_message("doNorm", {"value": bool(row.get("DoNorm", True))})
+            session.send_input_message("norm_scope", {"value": str(row.get("NormScope", "page"))})
 
             ##arcsinh controls
             session.send_input_message("doAsinh", {"value": bool(row.get("DoAsinh", False))})
@@ -481,6 +503,48 @@ def server(input, output, session):
         out[remove] = 0.0
         return out
 
+    # Cache for global min/max per channel (invalidated on load)
+    _global_minmax_cache = reactive.Value({})   # {channel_name: (gmin, gmax)}
+
+    def _invalidate_global_cache():
+        _global_minmax_cache.set({})
+
+    def _global_minmax_for_channel(images_dict: dict, channels_dict: dict, channel_name: str):
+        """Return (gmin, gmax) across all samples for the given channel name.
+        Uses & updates a reactive cache. Skips samples that lack this channel.
+        """
+        cache = _global_minmax_cache.get()
+        if channel_name in cache:
+            return cache[channel_name]
+
+        gmin = np.inf
+        gmax = -np.inf
+        found_any = False
+
+        for sample, arr in images_dict.items():
+            chlist = channels_dict.get(sample, [])
+            if channel_name not in chlist:
+                continue
+            idx = chlist.index(channel_name)
+            ch = arr[idx]  # raw 2D page
+            # robust against NaNs
+            mn = float(np.nanmin(ch))
+            mx = float(np.nanmax(ch))
+            if np.isfinite(mn) and np.isfinite(mx):
+                gmin = min(gmin, mn)
+                gmax = max(gmax, mx)
+                found_any = True
+
+        if not found_any or not np.isfinite(gmin) or not np.isfinite(gmax) or gmax <= gmin:
+            # store sentinel to avoid recomputation loops
+            cache[channel_name] = None
+            _global_minmax_cache.set(cache)
+            return None
+
+        cache[channel_name] = (gmin, gmax)
+        _global_minmax_cache.set(cache)
+        return (gmin, gmax)
+
     # ---------- load images ----------
     @reactive.Effect
     @reactive.event(input.load)
@@ -512,6 +576,8 @@ def server(input, output, session):
 
             images.set(imgs)
             channels.set(chs)
+
+            _invalidate_global_cache()
 
             samples = list(imgs.keys())
             first_sample = samples[0]
@@ -779,11 +845,28 @@ def server(input, output, session):
                 cofac = max(2, min(10, cofac))
                 img = np.arcsinh(img / float(cofac))
 
-            # Step 5: Final normalization for display
-            mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
-            if mx > mn:
-                img = (img - mn) / (mx - mn)
+            #            # Step 5: Final normalization for display
+            if bool(input.doNorm()):
+                scope = (input.norm_scope() or "page")
+                if scope == "global":
+                    gpair = _global_minmax_for_channel(images.get(), channels.get(), c)
+                    if gpair is not None:
+                        gmin, gmax = gpair
+                        if gmax > gmin:
+                            img = (img - gmin) / (gmax - gmin)
+                        else:
+                            mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+                            if mx > mn:
+                                img = (img - mn) / (mx - mn)
+                    else:
+                        mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+                        if mx > mn:
+                            img = (img - mn) / (mx - mn)
+            else:
+                # no normalization: just use processed img as-is
+                pass
 
+            # --- Step 6: Render ---
             ax.imshow(img, cmap="gray")
             ax.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
@@ -794,6 +877,7 @@ def server(input, output, session):
             ax.set_axis_off()
             return fig
 
+            
     @output
     @render.ui
     def noise_tooltip():
@@ -857,6 +941,7 @@ def server(input, output, session):
             "DoNorm": "Norm?",
             "DoAsinh": "Asinh?",
             "Cofac": "Cofac",
+            "NormScope": "Scope",     # <-- NEW
         }
         return df.rename(columns=rename_map).reset_index(drop=True)
     
@@ -878,6 +963,7 @@ def server(input, output, session):
         new_df = df.copy()
         new_df.at[i, "DoNorm"]  = bool(input.doNorm())
         new_df.at[i, "DoAsinh"] = bool(input.doAsinh())
+        new_df.at[i, "NormScope"] = (input.norm_scope() or "page")
         # input_select returns strings, guard and clamp 2..10
         try:
             cofac = int(float(input.asinh_cofactor()))
@@ -963,6 +1049,19 @@ def server(input, output, session):
         except Exception as e:
             print(f"❌ Failed to write CSV: {e}")
 
+    @output
+    @render.ui
+    def norm_scope_hint():
+        if not images.get() or not input.channel():
+            return ui.tags.small(" ")
+        if (input.norm_scope() or "page") != "global":
+            return ui.tags.small(" ")
+
+        gpair = _global_minmax_for_channel(images.get(), channels.get(), input.channel())
+        if not gpair:
+            return ui.tags.small("Global range: —")
+        gmin, gmax = gpair
+        return ui.tags.small(f"Global range for “{input.channel()}”: [{gmin:.3g}, {gmax:.3g}]")
 
     @reactive.Effect
     @reactive.event(input.import_params)
