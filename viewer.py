@@ -30,7 +30,7 @@ app_ui = ui.page_sidebar(
         ui.tags.style("""
             :root{
                 /* You can tweak these two and nothing else */
-                --controls-h: 450px;     /* total height of the top area (toolbar + panels) */
+                --controls-h: 500px;     /* total height of the top area (toolbar + panels) */
                 --controls-top-h: 170px; /* height of the toolbar row */
             }
 
@@ -208,7 +208,7 @@ app_ui = ui.page_sidebar(
                                 ui.row(
                                     # LEFT: normalization controls
                                     ui.column(
-                                        6,
+                                        7,
                                         ui.tags.div(
                                             ui.input_checkbox("doNorm", "Normalize the channel?", value=True),
                                             class_="d-flex align-items-center mb-2",
@@ -228,7 +228,7 @@ app_ui = ui.page_sidebar(
 
                                     # RIGHT: arcsinh controls stacked, then Apply button
                                     ui.column(
-                                        6,
+                                        5,
                                         ui.tags.div(
                                             ui.input_checkbox("doAsinh", "Arcsinh transform data", value=False),
                                             class_="d-flex align-items-center mb-2",
@@ -296,6 +296,91 @@ def server(input, output, session):
     last_loaded_folder = reactive.Value("") 
     
     # =============> helper funtions go here! <============
+    def _fmt1(x: float) -> str:
+        """One decimal, no scientific notation."""
+        try:
+            x = float(x)
+        except Exception:
+            return str(x)
+        if not np.isfinite(x):
+            return str(x)
+        return f"{x:.1f}"
+
+    def _winsor_quantiles(arr: np.ndarray, lo: float, hi: float):
+        """Return (q_lo, q_hi) using NaN-robust quantiles; None if invalid."""
+        try:
+            qlo, qhi = np.nanquantile(arr, [lo, hi])
+            if np.isnan(qlo) or np.isnan(qhi):
+                return None
+            return float(qlo), float(qhi)
+        except Exception:
+            return None
+
+    def _get_winsor_settings():
+        """Read current UI winsor settings, clamped to [0,1]."""
+        do_w = bool(input.doWinsor())
+        lo = max(0.0, min(1.0, float(input.winsor_low())))
+        hi = max(0.0, min(1.0, float(input.winsor_high())))
+        return do_w, lo, hi
+
+    # Separate cache for global ranges that depend on winsor settings
+    _global_range_cache = reactive.Value({})  # key: (channel, kind, lo, hi) -> (gmin,gmax)
+
+    def _global_range_for_channel(images_dict: dict, channels_dict: dict,
+                                channel_name: str, do_winsor: bool, lo: float, hi: float):
+        """
+        If winsor is enabled and hi>lo: global range is min of per-image q_lo, max of per-image q_hi.
+        Otherwise: fallback to raw global min/max.
+        """
+        key = (channel_name, "winsor" if (do_winsor and hi > lo) else "raw",
+            round(lo, 6), round(hi, 6))
+        cache = _global_range_cache.get()
+        if key in cache:
+            return cache[key]
+
+        if do_winsor and hi > lo:
+            gmin, gmax = np.inf, -np.inf
+            found = False
+            for sample, arr in images_dict.items():
+                chlist = channels_dict.get(sample, [])
+                if channel_name not in chlist:
+                    continue
+                idx = chlist.index(channel_name)
+                qpair = _winsor_quantiles(arr[idx], lo, hi)
+                if not qpair:
+                    continue
+                qlo, qhi = qpair
+                gmin = min(gmin, qlo)
+                gmax = max(gmax, qhi)
+                found = True
+            result = (float(gmin), float(gmax)) if (found and np.isfinite(gmin) and np.isfinite(gmax)) else None
+        else:
+            result = _global_minmax_for_channel(images_dict, channels_dict, channel_name)
+
+        cache[key] = result
+        _global_range_cache.set(cache)
+        return result
+
+    def _image_range_for_channel(images_dict: dict, channels_dict: dict,
+                                channel_name: str, sample: str,
+                                do_winsor: bool, lo: float, hi: float):
+        """Per-image range for current sample; winsorized if enabled (and hi>lo), else raw."""
+        if not sample or sample not in images_dict:
+            return None
+        chlist = channels_dict.get(sample, [])
+        if channel_name not in chlist:
+            return None
+        idx = chlist.index(channel_name)
+        arr = images_dict[sample][idx]
+        if do_winsor and hi > lo:
+            return _winsor_quantiles(arr, lo, hi)
+        # raw fallback
+        mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
+        if not (np.isfinite(mn) and np.isfinite(mx)):
+            return None
+        return mn, mx
+
+
     def _pick_open_csv_dialog(title="Select parameter CSV", initialdir=None) -> str:
         try:
             import tkinter as tk
@@ -508,6 +593,8 @@ def server(input, output, session):
 
     def _invalidate_global_cache():
         _global_minmax_cache.set({})
+        _global_range_cache.set({})
+
 
     def _global_minmax_for_channel(images_dict: dict, channels_dict: dict, channel_name: str):
         """Return (gmin, gmax) across all samples for the given channel name.
@@ -1057,11 +1144,34 @@ def server(input, output, session):
         if (input.norm_scope() or "page") != "global":
             return ui.tags.small(" ")
 
-        gpair = _global_minmax_for_channel(images.get(), channels.get(), input.channel())
+        ch = input.channel()
+        do_w = bool(input.doWinsor())
+        lo   = max(0.0, min(1.0, float(input.winsor_low())))
+        hi   = max(0.0, min(1.0, float(input.winsor_high())))
+
+        gpair = _global_range_for_channel(images.get(), channels.get(), ch, do_w, lo, hi)
         if not gpair:
             return ui.tags.small("Global range: —")
         gmin, gmax = gpair
-        return ui.tags.small(f"Global range for “{input.channel()}”: [{gmin:.3g}, {gmax:.3g}]")
+
+        try:
+            s = input.sample()
+        except Exception:
+            s = None
+        ipair = _image_range_for_channel(images.get(), channels.get(), ch, s, do_w, lo, hi)
+
+        parts = [
+            ui.tags.small(
+                f'Global range: “{ch}” (winsor {"on" if (do_w and hi>lo) else "off"}): '
+                f'[{_fmt1(gmin)}, {_fmt1(gmax)}]'
+            )
+        ]
+        if ipair:
+            imin, imax = ipair
+            label = f'Image range: “{s}” range' if s else "Image range"
+            parts += [ui.br(), ui.tags.small(f"{label}: [{_fmt1(imin)}, {_fmt1(imax)}]")]
+        return ui.div(*parts)
+
 
     @reactive.Effect
     @reactive.event(input.import_params)
