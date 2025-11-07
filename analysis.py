@@ -207,7 +207,8 @@ def main():
 
     # Precompute global min/max where requested (RAW frames, across all samples)
     need_global = channels_needing_global(params)
-    global_minmax = precompute_global_minmax(imgs, chs, need_global)  # {ch: (gmin,gmax) | None}
+    global_minmax = precompute_global_minmax(imgs, chs, need_global, params)  # {ch: (gmin,gmax) | None}
+
 
     # Collect per-frame results (like your R 'results')
     results_rows: list[dict] = []

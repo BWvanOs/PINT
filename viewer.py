@@ -282,14 +282,14 @@ def server(input, output, session):
     images = reactive.Value({})                  #Dictionary of images, will be filled by tiffloader
     channels = reactive.Value({})                #Dic of channel names
     canonical_channels = reactive.Value([])      #Reference list fr the tabel
+    ##Below is the table for all the values the user can adjust . This table is loaded into the collapsable side bar
     params_df = reactive.Value(
         pd.DataFrame(columns=[
             "Channel", "DoWinsor", "Low", "High",
             "DoThr", "ThrVal",
             "Noise", "NStr", "NPrctl", "WinSz",
-            "DoNorm",
+            "DoNorm", "NormScope", 
             "DoAsinh", "Cofac",
-            "NormScope", #Norm per image/channel (so local or global)
         ])
     )
 
