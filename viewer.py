@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout 
 
 
 app_ui = ui.page_sidebar(
-    # ---- Right collapsible sidebar (positional arg #1) ----
+    # This is the right side of the window that collapses when opening the sidebar.
     ui.sidebar(
         ui.h4("Current Parameters"),
         ui.tags.div(ui.output_table("param_table"), class_="param-table-wrap"),
@@ -25,11 +25,12 @@ app_ui = ui.page_sidebar(
         width="850px",          # tweak as needed
     ),
 
-    # ---- HEAD/CSS (positional arg #2) ----
+    # This is CSS i had chatgpt4 made to fix the scaling issue I had when loading in images. For some reason shiny massed up the loading of the images
+    #When I made the image load in and dynamically sclae them
     ui.head_content(
         ui.tags.style("""
             :root{
-                /* You can tweak these two and nothing else */
+                /* You can tweak these two and nothing else! */
                 --controls-h: 500px;     /* total height of the top area (toolbar + panels) */
                 --controls-top-h: 170px; /* height of the toolbar row */
             }
@@ -80,21 +81,22 @@ app_ui = ui.page_sidebar(
         )
     ), 
 
-    # ---- MAIN CONTENT (positional arg #3) ----
+    # This is the main content of the image handler and normalization settings tools
     ui.row(
         ui.column(
             12,
             ui.tags.div(
-                # ===== Fixed-height controls (toolbar + panels) =====
+                # Toolbar + panels (so essentially everything but the table)
                 ui.tags.div(
-                    # --- Top control bar: path + load + sample + channel ---
-                    # --- Top control bar: path + load + sample + channel ---
+                    #Top bar with path, load images, sample channel selector and export functions
                     ui.row(
+                        ##Folder path and load images button
                         ui.column(5, ui.input_text("path", "Folder path", value="", width="100%")),
+                        ##load images button
                         ui.column(1, ui.input_action_button("load", "Load images", class_="w-100")),
-                        ui.column(1),  # spacer
-
-                        # Sample + Channel stacked
+                        #Vertical spacer
+                        ui.column(1),
+                        # Sample + Channel selectors (stacked)
                         ui.column(
                             2,
                             ui.row(
@@ -110,10 +112,9 @@ app_ui = ui.page_sidebar(
                                 class_="align-items-center gy-0",
                             ),
                         ),
-
-                        ui.column(1),  # spacer
-
-                        # Export / Import / Process
+                        #Another spacers
+                        ui.column(1),
+                        ##export import and process images buttons
                         ui.column(
                             1,
                             ui.row(
@@ -140,16 +141,18 @@ app_ui = ui.page_sidebar(
                             ),
                         ),
 
-                        ui.column(1),  # spacer
+                        ui.column(1),
 
-                        # IMPORTANT: this is part of the SAME ui.row(...) call; note the comma above.
+                        #IMPORTANT: this is part of the SAME ui.row(...) call; note the comma! If you move this it will break everything
+
                         class_="controls-top align-items-center gy-0",
                     ),
-
+                    ##line to seperate the UI elements
                     ui.hr(),
 
                     ui.row(
-                        # --- PANEL 1: Winsorization ---
+                        #From left to right:
+                        #Panel 1 winsorization
                         ui.column(
                             3,
                             ui.card(
@@ -165,7 +168,7 @@ app_ui = ui.page_sidebar(
                             ),
                         ),
 
-                        # --- PANEL 2: Global Threshold ---
+                        #Panel 2 Global thresholding
                         ui.column(
                             3,
                             ui.card(
@@ -178,7 +181,7 @@ app_ui = ui.page_sidebar(
                             ),
                         ),
 
-                        # --- PANEL 3: Noise Removal ---
+                        #Panel3 Sliding windows noise removal
                         ui.column(
                             3,
                             ui.card(
@@ -200,13 +203,13 @@ app_ui = ui.page_sidebar(
                             ),
                         ),
 
-                        # --- PANEL 4: Normalization & Transform ---
+                        #Panel4: Nomalization and transformation
                         ui.column(
                             3,
                             ui.card(
                                 ui.card_header("Normalization and Transformation"),
                                 ui.row(
-                                    # LEFT: normalization controls
+                                    #normalization controls
                                     ui.column(
                                         7,
                                         ui.tags.div(
@@ -226,7 +229,7 @@ app_ui = ui.page_sidebar(
                                         ui.output_ui("norm_scope_hint"),
                                     ),
 
-                                    # RIGHT: arcsinh controls stacked, then Apply button
+                                    #arcsinh controls stacked, then Apply button
                                     ui.column(
                                         5,
                                         ui.tags.div(
@@ -254,7 +257,7 @@ app_ui = ui.page_sidebar(
                     class_="controls-fixed",
                 ),
 
-                # ===== Plot area =====
+                ##Main plot area --> here images will be rendered
                 ui.tags.div(
                     ui.output_plot("img_viewer", fill=True, height="100%"),
                     class_="viewer-fill",
@@ -264,20 +267,21 @@ app_ui = ui.page_sidebar(
         ),
     ),
 
-    # ---- KEYWORD ARGS (must be last) ----
+    #IMPORTANT: This must be the last argument!
     position="right",
 )
 
 
 
-# --------------- Server ---------------
+## <----------------> SERVER! <-------------------> ##
 from scipy.ndimage import median_filter
 
+
 def server(input, output, session):
-    # ---------- state ----------
-    images = reactive.Value({})                  # {sample: np.ndarray[C,Y,X]}
-    channels = reactive.Value({})                # {sample: [channel names]}
-    canonical_channels = reactive.Value([])      # list[str], from first image only
+    #Make all the reactive states of the app, will be filled later
+    images = reactive.Value({})                  #Dictionary of images, will be filled by tiffloader
+    channels = reactive.Value({})                #Dic of channel names
+    canonical_channels = reactive.Value([])      #Reference list fr the tabel
     params_df = reactive.Value(
         pd.DataFrame(columns=[
             "Channel", "DoWinsor", "Low", "High",
@@ -285,7 +289,7 @@ def server(input, output, session):
             "Noise", "NStr", "NPrctl", "WinSz",
             "DoNorm",
             "DoAsinh", "Cofac",
-            "NormScope",                # <-- NEW
+            "NormScope", #Norm per image/channel (so local or global)
         ])
     )
 
@@ -293,11 +297,14 @@ def server(input, output, session):
     setting_selects = reactive.Value(False)
     syncing_controls = reactive.Value(False)
     data_loaded = reactive.Value(False)
-    last_loaded_folder = reactive.Value("") 
+    last_loaded_folder = reactive.Value("") #This stores the last path used to load images so saving throws them into the same folder
     
-    # =============> helper funtions go here! <============
+    ## <----------------> Helper functions <-------------------> ##
     def _fmt1(x: float) -> str:
-        """One decimal, no scientific notation."""
+        """
+        One decimal, no scientific notation.
+        Best effort to turn a string into a number (float) and show as decimal
+        """
         try:
             x = float(x)
         except Exception:
@@ -307,8 +314,14 @@ def server(input, output, session):
         return f"{x:.1f}"
 
     def _winsor_quantiles(arr: np.ndarray, lo: float, hi: float):
-        """Return (q_lo, q_hi) using NaN-robust quantiles; None if invalid."""
+        """
+        Return winzorization values (q_lo, q_hi) associated with the winsorization input of the array
+        So input eg 0.01, 0.99, output are associated values of the input array
+        Reutrn quantiles; None if invalid input.
+        """
         try:
+            #selected winsorization parameters
+            #Uses numpy np.nanquantile which is robust to NaN input
             qlo, qhi = np.nanquantile(arr, [lo, hi])
             if np.isnan(qlo) or np.isnan(qhi):
                 return None
@@ -317,14 +330,17 @@ def server(input, output, session):
             return None
 
     def _get_winsor_settings():
-        """Read current UI winsor settings, clamped to [0,1]."""
+        """
+        Reads the UI winsor settings, clamped to [0,1]. 
+        Output is input for _winsor_quantiles
+        """
         do_w = bool(input.doWinsor())
         lo = max(0.0, min(1.0, float(input.winsor_low())))
         hi = max(0.0, min(1.0, float(input.winsor_high())))
         return do_w, lo, hi
 
-    # Separate cache for global ranges that depend on winsor settings
-    _global_range_cache = reactive.Value({})  # key: (channel, kind, lo, hi) -> (gmin,gmax)
+    #Stores the values from the winzorization so you don't have to recompute every time.
+    _global_range_cache = reactive.Value({})  # (channel, kind, lo, hi) -> (gmin,gmax). eg ("CD45", "winsor", 0.01, 0.99): (12.3, 845.7)
 
     def _global_range_for_channel(images_dict: dict, channels_dict: dict,
                                 channel_name: str, do_winsor: bool, lo: float, hi: float):
@@ -495,9 +511,9 @@ def server(input, output, session):
             "NPrctl": p,
             "WinSz": int(input.window_size()),
             "DoNorm": bool(input.doNorm()),
+            "NormScope": (input.norm_scope() or "page"),
             "DoAsinh": bool(input.doAsinh()),
             "Cofac": int(float(input.asinh_cofactor() or 5)),
-            "NormScope": (input.norm_scope() or "page"),   # <-- NEW
         } for ch in first_chlist]
 
         df = pd.DataFrame(rows)
@@ -933,25 +949,45 @@ def server(input, output, session):
                 img = np.arcsinh(img / float(cofac))
 
             #            # Step 5: Final normalization for display
+                        # Step 5: Final normalization for display
             if bool(input.doNorm()):
                 scope = (input.norm_scope() or "page")
+                do_w, lo, hi = _get_winsor_settings()
+
                 if scope == "global":
-                    gpair = _global_minmax_for_channel(images.get(), channels.get(), c)
+                    # Use the same logic as analysis:
+                    # - if winsor is enabled: global range from per-image winsor quantiles
+                    # - else: raw global min/max
+                    gpair = _global_range_for_channel(
+                        images.get(),
+                        channels.get(),
+                        c,
+                        do_w,
+                        lo,
+                        hi,
+                    )
+
                     if gpair is not None:
                         gmin, gmax = gpair
                         if gmax > gmin:
                             img = (img - gmin) / (gmax - gmin)
                         else:
+                            # degenerate global range → fallback to per-image
                             mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
                             if mx > mn:
                                 img = (img - mn) / (mx - mn)
                     else:
+                        # no usable global range → fallback to per-image
                         mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
                         if mx > mn:
                             img = (img - mn) / (mx - mn)
-            else:
-                # no normalization: just use processed img as-is
-                pass
+
+                else:
+                    # Per-page normalization: always based on the processed current image
+                    mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+                    if mx > mn:
+                        img = (img - mn) / (mx - mn)
+            # else: no normalization: use processed img as-is
 
             # --- Step 6: Render ---
             ax.imshow(img, cmap="gray")

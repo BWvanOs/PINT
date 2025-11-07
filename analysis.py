@@ -104,38 +104,73 @@ def channels_needing_global(params: pd.DataFrame) -> set[str]:
     return need
 
 
-def precompute_global_minmax(images: dict[str, np.ndarray],
-                             channels: dict[str, list[str]],
-                             needed: set[str]) -> dict[str, tuple[float, float] | None]:
+def precompute_global_minmax(
+    images: dict[str, np.ndarray],
+    channels: dict[str, list[str]],
+    needed: set[str],
+    params: pd.DataFrame,
+) -> dict[str, tuple[float, float] | None]:
     """
-    Compute global (min, max) per channel name across ALL samples on the RAW frames.
-    Returns {channel_name: (gmin, gmax)}; value may be None if not found or degenerate.
+    Compute global (min, max) per channel across ALL samples for channels in `needed`.
+
+    If that channel has DoWinsor=True and valid Low/High in params, we:
+      - compute per-image winsor quantiles [Low, High]
+      - take global min(q_lo) and max(q_hi) as (gmin, gmax)
+
+    Otherwise we fall back to raw global min/max.
+
+    Returns {channel_name: (gmin, gmax) or None}.
     """
     out: dict[str, tuple[float, float] | None] = {ch: None for ch in needed}
     if not needed:
         return out
 
-    gmins = {ch: np.inf for ch in needed}
-    gmaxs = {ch: -np.inf for ch in needed}
-
-    for sample, arr in images.items():
-        chlist = channels.get(sample, [])
-        for ch in needed:
-            if ch not in chlist:
+    # Quick lookup of winsor settings per channel
+    winsor_cfg: dict[str, tuple[bool, float, float]] = {}
+    if "Channel" in params.columns:
+        for _, row in params.iterrows():
+            ch = str(row["Channel"])
+            if ch not in needed:
                 continue
-            idx = chlist.index(ch)
-            raw = arr[idx]  # RAW 2D page
-            mn = float(np.nanmin(raw))
-            mx = float(np.nanmax(raw))
-            if np.isfinite(mn) and np.isfinite(mx):
-                gmins[ch] = min(gmins[ch], mn)
-                gmaxs[ch] = max(gmaxs[ch], mx)
+            do_win = bool(row.get("DoWinsor", False))
+            lo = float(row.get("Low", 0.0))
+            hi = float(row.get("High", 1.0))
+            winsor_cfg[ch] = (do_win, lo, hi)
 
     for ch in needed:
-        if np.isfinite(gmins[ch]) and np.isfinite(gmaxs[ch]) and gmaxs[ch] > gmins[ch]:
-            out[ch] = (float(gmins[ch]), float(gmaxs[ch]))
+        do_win, lo, hi = winsor_cfg.get(ch, (False, 0.0, 1.0))
+
+        gmin = np.inf
+        gmax = -np.inf
+        found = False
+
+        for sample, arr in images.items():
+            chlist = channels.get(sample, [])
+            if ch not in chlist:
+                continue
+
+            idx = chlist.index(ch)
+            frame = arr[idx].astype(np.float32)
+
+            if do_win and hi > lo:
+                # Use the winsor quantiles as that image's effective range
+                q_low, q_high = np.quantile(frame, [lo, hi])
+                mn, mx = float(q_low), float(q_high)
+            else:
+                # Fallback: raw range
+                mn = float(np.nanmin(frame))
+                mx = float(np.nanmax(frame))
+
+            if np.isfinite(mn) and np.isfinite(mx) and mx > mn:
+                gmin = min(gmin, mn)
+                gmax = max(gmax, mx)
+                found = True
+
+        if found and np.isfinite(gmin) and np.isfinite(gmax) and gmax > gmin:
+            out[ch] = (float(gmin), float(gmax))
         else:
             out[ch] = None
+
     return out
 
 
