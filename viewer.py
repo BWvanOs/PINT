@@ -1200,18 +1200,61 @@ def server(input, output, session):
             print("✅ Analysis finished.")
         except subprocess.CalledProcessError as e:
             print(f"❌ Analysis script failed: {e}")
-    #zzzzzzzz
+    
+    @output
+    @render.ui
+    def norm_scope_hint():
+        ##If nothing loaded, exit
+        if not images.get() or not input.channel():
+            return ui.tags.small(" ")
+        ##If not empty, but not set to global, also return nothing
+        if (input.norm_scope() or "page") != "global":
+            return ui.tags.small(" ")
+        ##Reads the current setting winsor quantile etc
+        ch = input.channel()
+        do_w = bool(input.doWinsor())
+        lo   = max(0.0, min(1.0, float(input.winsor_low())))
+        hi   = max(0.0, min(1.0, float(input.winsor_high())))
+        ##looks across all samples to get thehighest and the lowest numbers. This is the global max/min for per image winsorization
+        gpair = _global_range_for_channel(images.get(), channels.get(), ch, do_w, lo, hi)
+        if not gpair:
+            return ui.tags.small("Global range: NO VALID RANGE")
+        gmin, gmax = gpair
+
+        try:
+            s = input.sample()
+        except Exception:
+            s = None
+        ##This is the image winsorization settings 
+        ipair = _image_range_for_channel(images.get(), channels.get(), ch, s, do_w, lo, hi)
+
+        parts = [
+            ui.tags.small(
+                f'Global range: “{ch}” (winsor {"on" if (do_w and hi>lo) else "off"}): '
+                f'[{_fmt1(gmin)}, {_fmt1(gmax)}]'
+            )
+        ]
+        ##Note that the range is the min/max range per channel but the winsorization is per image. If winsorization if turned off there it's just glabal min max
+        if ipair:
+            imin, imax = ipair
+            label = f'Image range: “{s}” range' if s else "Image range"
+            parts += [ui.br(), ui.tags.small(f"{label}: [{_fmt1(imin)}, {_fmt1(imax)}]")]
+        return ui.div(*parts)
+
     @reactive.Effect
     @reactive.event(input.export_params)
+    ##Export function for the parameter file
     def _export_params():
+        ##copy of the parameter table, check if empty. If so, warn the user
         df = params_df.get().copy()
         if df.empty:
             print("⚠️ No parameters to export.")
             return
-
+        ##The input folder is used as default folder in the save as thats called below it
         folder = (input.path() or "").strip()
         initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
         save_path = _pick_save_csv_dialog(initialdir=initdir, initialfile="parameter_table.csv")
+        ##Save or not saved warnings
         if not save_path:
             print("🛑 Export canceled.")
             return
@@ -1222,51 +1265,16 @@ def server(input, output, session):
         except Exception as e:
             print(f"❌ Failed to write CSV: {e}")
 
-    @output
-    @render.ui
-    def norm_scope_hint():
-        if not images.get() or not input.channel():
-            return ui.tags.small(" ")
-        if (input.norm_scope() or "page") != "global":
-            return ui.tags.small(" ")
-
-        ch = input.channel()
-        do_w = bool(input.doWinsor())
-        lo   = max(0.0, min(1.0, float(input.winsor_low())))
-        hi   = max(0.0, min(1.0, float(input.winsor_high())))
-
-        gpair = _global_range_for_channel(images.get(), channels.get(), ch, do_w, lo, hi)
-        if not gpair:
-            return ui.tags.small("Global range: NO VALID RANGE")
-        gmin, gmax = gpair
-
-        try:
-            s = input.sample()
-        except Exception:
-            s = None
-        ipair = _image_range_for_channel(images.get(), channels.get(), ch, s, do_w, lo, hi)
-
-        parts = [
-            ui.tags.small(
-                f'Global range: “{ch}” (winsor {"on" if (do_w and hi>lo) else "off"}): '
-                f'[{_fmt1(gmin)}, {_fmt1(gmax)}]'
-            )
-        ]
-        if ipair:
-            imin, imax = ipair
-            label = f'Image range: “{s}” range' if s else "Image range"
-            parts += [ui.br(), ui.tags.small(f"{label}: [{_fmt1(imin)}, {_fmt1(imax)}]")]
-        return ui.div(*parts)
-
-
+ 
     @reactive.Effect
     @reactive.event(input.import_params)
+    ##This is to load back all the parameters, however, this was made (as much as possible) rebust agains user error
     def _import_params():
-        # Require a completed load (robust against stray/empty load clicks)
+        ##Require a completed load (robust against stray/empty load clicks) of images, if not error
         if not data_loaded.get():
             print("⚠️ Load images before importing parameters.")
             return
-
+        ##Try to load csv in last know location, then current input, current working dir as fallback    
         folder = last_loaded_folder.get() or (input.path() or "").strip()
         initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
 
@@ -1275,17 +1283,18 @@ def server(input, output, session):
             print("🛑 Import canceled.")
             return
 
-        # 3) Read & validate
+        #Read the seleted csv, if fails cancel
         try:
             df_in = pd.read_csv(csv_path)
         except Exception as e:
             print(f"❌ Failed to read CSV: {e}")
             return
-
+        ##If there is no channel column, also abort. Everything is aligned on this one
         if "Channel" not in df_in.columns:
             print("❌ CSV missing required 'Channel' column.")
             return
-
+        ##It will not valide that the channel names are the same. It will throw back an error if not. 
+        ##For now the channel names have to be exact, maybe change later so it will be usable on image with the same panel but slightly different names
         canon = list(canonical_channels.get() or [])
         csv_channels = [str(x) for x in df_in["Channel"].astype(str).tolist()]
         if set(csv_channels) != set(canon) or len(csv_channels) != len(canon):
@@ -1294,7 +1303,7 @@ def server(input, output, session):
             print(f"   Expected:{canon}")
             return
 
-        # 4) Normalize columns, order, and types
+        #Get the current parameter table as ground truth, also load in default to fill in if something is misssing.
         target_cols = params_df.get().columns.tolist()
         defaults = {
             "Channel": "",
@@ -1304,22 +1313,23 @@ def server(input, output, session):
             "DoNorm": True,
             "DoAsinh": False, "Cofac": 5,
         }
-
+        ##Reorder to match the canonical order (this makes it robust when loading old version into new tables)
         df_in = df_in.set_index("Channel").reindex(canon).reset_index()
 
-        # Add any missing columns with defaults
+        ##Add any missing values with defaults
         for col in target_cols:
             if col not in df_in.columns:
                 df_in[col] = defaults.get(col)
 
-        # Keep only target columns, in order
+        ##Keep only target columns, in correct order, throw away old (deprecated) cols
         df_in = df_in[target_cols].copy()
 
-        # Coerce types
+        ##Coerce types to match current version
         bool_cols  = [c for c in target_cols if c in ["DoWinsor","DoThr","Noise","DoNorm","DoAsinh"]]
         float_cols = [c for c in target_cols if c in ["Low","High","ThrVal","NStr"]]
         int_cols   = [c for c in target_cols if c in ["WinSz","Cofac"]]
 
+        ##Helper to parse booleans that were turned into 0/1 
         def _to_bool(v):
             s = str(v).strip().lower()
             if s in ("true","1","yes","y","t"): return True
@@ -1327,6 +1337,7 @@ def server(input, output, session):
             try: return bool(int(float(v)))
             except Exception: return False
 
+        ##Try to match TRUE/FALSE/1/0, if doesn't match -> defaults
         for c in bool_cols:
             df_in[c] = df_in[c].map(_to_bool)
 
@@ -1336,7 +1347,7 @@ def server(input, output, session):
         for c in int_cols:
             df_in[c] = pd.to_numeric(df_in[c], errors="coerce").fillna(defaults[c]).astype(int)
 
-        # 5) Commit and sync UI
+        #Set to the params.df and sync to interface.
         params_df.set(df_in.reset_index(drop=True))
         sel = input.channel()
         if sel:
