@@ -25,8 +25,7 @@ app_ui = ui.page_sidebar(
         width="850px",          # tweak as needed
     ),
 
-    # This is CSS i had chatgpt4 made to fix the scaling issue I had when loading in images. For some reason shiny massed up the loading of the images
-    #When I made the image load in and dynamically sclae them
+    # This is CSS to fix scaling issues with the viewer. Not that this is made by chatgpt, so edi at your own risk.
     ui.head_content(
         ui.tags.style("""
             :root{
