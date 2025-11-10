@@ -312,12 +312,13 @@ def server(input, output, session):
         if not np.isfinite(x):
             return str(x)
         return f"{x:.1f}"
-
+    
     def _winsor_quantiles(arr: np.ndarray, lo: float, hi: float):
         """
         Return winzorization values (q_lo, q_hi) associated with the winsorization input of the array
         So input eg 0.01, 0.99, output are associated values of the input array
         Reutrn quantiles; None if invalid input.
+        Used be the Shiny app to display global range
         """
         try:
             #selected winsorization parameters
@@ -325,13 +326,14 @@ def server(input, output, session):
             qlo, qhi = np.nanquantile(arr, [lo, hi])
             if np.isnan(qlo) or np.isnan(qhi):
                 return None
+            ##Returns the values as float
             return float(qlo), float(qhi)
         except Exception:
             return None
 
     def _get_winsor_settings():
         """
-        Reads the UI winsor settings, clamped to [0,1]. 
+        Reads the UI winsor settings, which is clamped to [0,1]. 
         Output is input for _winsor_quantiles
         """
         do_w = bool(input.doWinsor())
@@ -339,21 +341,23 @@ def server(input, output, session):
         hi = max(0.0, min(1.0, float(input.winsor_high())))
         return do_w, lo, hi
 
-    #Stores the values from the winzorization so you don't have to recompute every time.
-    _global_range_cache = reactive.Value({})  # (channel, kind, lo, hi) -> (gmin,gmax). eg ("CD45", "winsor", 0.01, 0.99): (12.3, 845.7)
-
+    #Stores the values from the winzorization so you don't have to recompute every time you return to this channel.
+    _global_range_cache = reactive.Value({})  ##(channel, kind, lo, hi) -> (gmin,gmax). eg ("CD45", "winsor", 0.01, 0.99): (12.3, 845.7)
     def _global_range_for_channel(images_dict: dict, channels_dict: dict,
                                 channel_name: str, do_winsor: bool, lo: float, hi: float):
         """
-        If winsor is enabled and hi>lo: global range is min of per-image q_lo, max of per-image q_hi.
-        Otherwise: fallback to raw global min/max.
+        If winsor is enabled and hi>lo*: global range is min of per-image q_lo, max of per-image q_hi. This return the global high and low for a channel
+        Otherwise: fallback (so if doWindor is FALSE) is to retturn the raw global min/max.
+        *There is no check on this in the interface
         """
+        ##key construct a cache key. If there is an exact match (so same channel, values and wins) in the global cache it'll pull it from there. If not it will compute it from there
         key = (channel_name, "winsor" if (do_winsor and hi > lo) else "raw",
             round(lo, 6), round(hi, 6))
         cache = _global_range_cache.get()
         if key in cache:
             return cache[key]
-
+        ##If not in the cache, run the winsorization on the array:
+        ##This is the CPU heavy part
         if do_winsor and hi > lo:
             gmin, gmax = np.inf, -np.inf
             found = False
@@ -370,17 +374,20 @@ def server(input, output, session):
                 gmax = max(gmax, qhi)
                 found = True
             result = (float(gmin), float(gmax)) if (found and np.isfinite(gmin) and np.isfinite(gmax)) else None
+        ##Fallback if winsorization is off
         else:
             result = _global_minmax_for_channel(images_dict, channels_dict, channel_name)
-
+        ##Stores it in the global cache and also return the results
         cache[key] = result
         _global_range_cache.set(cache)
         return result
 
+
     def _image_range_for_channel(images_dict: dict, channels_dict: dict,
                                 channel_name: str, sample: str,
                                 do_winsor: bool, lo: float, hi: float):
-        """Per-image range for current sample; winsorized if enabled (and hi>lo), else raw."""
+        """Per-image range for current sample; winsorized if enabled (and hi>lo), else return raw values."""
+        ##Same of the previous one, but then per channel. No cache is stored as the per image winsor is not that heavy.
         if not sample or sample not in images_dict:
             return None
         chlist = channels_dict.get(sample, [])
@@ -398,6 +405,7 @@ def server(input, output, session):
 
 
     def _pick_open_csv_dialog(title="Select parameter CSV", initialdir=None) -> str:
+        """Helper to select the path that the stored CSV with paramets will be loaded from"""
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -426,6 +434,7 @@ def server(input, output, session):
             return ""
 
     def _pick_save_csv_dialog(title="Save parameters CSV", initialdir=None, initialfile="parameter_table.csv") -> str:
+        """Helper to select the path where the parameter CSV will be stored"""
         try:
             import tkinter as tk
             from tkinter import filedialog
@@ -446,14 +455,16 @@ def server(input, output, session):
             return ""
 
     def pick_folder_dialog(title="Select folder with OME-TIFFs") -> str:
-        # Prefer Tk (works on Win/macOS/Linux if tkinter is installed)
+        """Helper to select the path where the OME.TIFFs are stored"""
+        ##Prefers Tk (works on both Win/macOS and Linux if tkinter is installed)
         try:
             import tkinter as tk
             from tkinter import filedialog
             root = tk.Tk()
+            ##Remove black windows. Devnote I don't know why this is neccesary but keptopening 2 windows 
             root.withdraw()
             try:
-                # bring dialog to front on some WMs
+                #Make sure the dialog window is in the front, this pixed a problem in Ubuntu24 where the window kept being opened behind firefox
                 root.wm_attributes("-topmost", 1)
             except Exception:
                 pass
@@ -461,7 +472,7 @@ def server(input, output, session):
             root.destroy()
             return path or ""
         except Exception:
-            # Linux fallback if Tk isn't available
+            #Linux fallback if Tk isn't available. For some reason tk kept failing on Linux
             if shutil.which("zenity"):
                 res = subprocess.run(
                     ["zenity", "--file-selection", "--directory", "--title", title],
@@ -472,33 +483,14 @@ def server(input, output, session):
                     return res.stdout.strip()
             return ""
 
-    def _ensure_param_columns():
-        required = ["Channel","DoWinsor","Low","High",
-                    "DoThr","ThrVal",
-                    "Noise","NStr", "NPrctl", "WinSz",
-                    "DoNorm"]  # if you're adding Normalize
-        defaults = {
-            "Channel": "",
-            "DoWinsor": False, "Low": 0.0, "High": 1.0,
-            "DoThr": False, "ThrVal": 0.0,
-            "Noise": False, "NStr": 1.0, "NPrctl": 0.995, "WinSz": 3,
-            "DoNorm": True,
-        }
-        df = params_df.get()
-        if df.empty:
-            params_df.set(pd.DataFrame(columns=required))
-            return
-        for col in required:
-            if col not in df.columns:
-                df[col] = defaults[col]
-        # enforce column order
-        params_df.set(df[required].reset_index(drop=True))
-
     def _prefill_params(first_chlist: list[str]) -> None:
-        # read the current UI slider once and map to a percentile
+        """
+        This is loaded after the _do_load() to prepare the dataframe with parameters
+        """
+        #read the current UI slider once and map to a percentile
         s = float(input.noise_strength())
         p = _strength_to_percentile(s)
-
+        ##From the state of the interface it reads the states of the sliders and prepares a new row for every channel
         rows = [{
             "Channel": ch,
             "DoWinsor": bool(input.doWinsor()),
@@ -515,12 +507,15 @@ def server(input, output, session):
             "DoAsinh": bool(input.doAsinh()),
             "Cofac": int(float(input.asinh_cofactor() or 5)),
         } for ch in first_chlist]
-
         df = pd.DataFrame(rows)
+        ##Reorder is currenly useless as order is defined by upon creation of the dataframe and all otherfunction use this order. 
+        ##Below was used in previous version to enforce the column order. Kept it in as defensive line to enforce it at all times
         params_df.set(df.reindex(columns=params_df.get().columns).reset_index(drop=True))
 
-
     def _sync_controls_from_table(channel: str) -> None:
+        """
+        This handles the defaults for the empty dataframe when loading the parameters
+        """
         if not channel:
             return
         df = params_df.get()
@@ -531,6 +526,7 @@ def server(input, output, session):
             return
         row = df.loc[m].iloc[0]
         syncing_controls.set(True)
+        ##This is how each value is determines. Eg, doWinsor -> read out current value and return it. Fallback is FALSE
         try:
             session.send_input_message("doWinsor", {"value": bool(row.get("DoWinsor", False))})
             session.send_input_message("winsor_low", {"value": float(row.get("Low", 0.0))})
@@ -555,6 +551,9 @@ def server(input, output, session):
             syncing_controls.set(False)
     
     def _cycle(lst, current, step):
+        """
+        helper to cycle through list. Used to cycle through next sample/channel. It wraps around.
+        """
         if not lst:
             return None
         try:
@@ -565,6 +564,10 @@ def server(input, output, session):
 
 
     def _apply_winsor(cur: np.ndarray, lo_q: float, hi_q: float) -> np.ndarray:
+        """
+        Applies winsorization when you apply it in the UI
+        """
+        ##Numpy quatile function to map [0,1] to array values to clip (np.clip) them
         q_low, q_high = np.quantile(cur, [lo_q, hi_q])
         return np.clip(cur, q_low, q_high)
     
@@ -573,39 +576,42 @@ def server(input, output, session):
         s = float(np.clip(s, 0.0, 1.0))
         return 1.0 - eps - s * (1.0 - eps)
 
-
     def _apply_speckle_suppress(
         img: np.ndarray,
         size: int,
         perc: float,
-        neighbor_limit: int = 2,    # ≤ 2 bright adjacent neighbors ⇒ remove
+        neighbor_limit: int = 2, ##So this essentially gives the option to customize to neigbor limit. Not yet an option, should be in future iterations
     ) -> np.ndarray:
         """
-        Old method: center is 'bright' if > local percentile in a (size×size) window.
-        Extra check: remove only if AT MOST `neighbor_limit` of the 8 adjacent pixels
-        (3×3 neighborhood, center excluded) are also bright.
+        Old method was in essence: if center is 'bright' (pixel > local percentile in an adjustable (size×size) window) remove it.
+        However, this method also remove the brightest pixels from actual hotspots such a nuclei.
+        New version includes an extra check: remove only if AT MOST `neighbor_limit` of the adjacent pixels, ie are they isolated
+        (3×3 neighborhood, center excluded) are also bright. This reduces the problem with holes forming in bright patches
+        devnote: results in a counter-intuitive J shaped curve, as neigbors are always 3x3 while the initial identification is varied. Work in progress.
         """
+        ##Force odd sized window (you need a center pixel)
         if size % 2 == 0:
             size += 1
 
-        # 1) local percentile threshold on the raw image
+        #Apply the local percentage on the image
         thr = percentile_filter(img, percentile=perc * 100.0, size=size)
         bright = (img > thr) & (img > 0)
 
-        # 2) count bright pixels in the immediate 8-neighborhood (3×3, center=0)
+        #count all the neigboring pixels that are bright
         k = np.ones((3, 3), dtype=np.float32)
         k[1, 1] = 0.0
         neighbor_count = convolve(bright.astype(np.float32), k, mode="reflect")
 
-        # 3) remove if bright and has ≤ neighbor_limit bright neighbors
+        #Remove these pixels (set to zero) if marked as bright AND nr of bright neigbor pixels < neighbor_limit
         remove = bright & (neighbor_count <= float(neighbor_limit))
-
+        ##Output is the image with the bright pixels set to 0
         out = img.copy()
         out[remove] = 0.0
         return out
 
-    # Cache for global min/max per channel (invalidated on load)
-    _global_minmax_cache = reactive.Value({})   # {channel_name: (gmin, gmax)}
+    ##Cache for global min/max per channel (invalidated on load)
+    ##Also stored previous values so moving back and forth is cached
+    _global_minmax_cache = reactive.Value({})   ##looks like {channel_name: (gmin, gmax)}
 
     def _invalidate_global_cache():
         _global_minmax_cache.set({})
@@ -614,87 +620,107 @@ def server(input, output, session):
 
     def _global_minmax_for_channel(images_dict: dict, channels_dict: dict, channel_name: str):
         """Return (gmin, gmax) across all samples for the given channel name.
-        Uses & updates a reactive cache. Skips samples that lack this channel.
+        Uses & updates a reactive cache. Skips samples that lack this channel, 
+        so it is compatible with samples with a different channel layout to harmonize samples
         """
+        ##Checks cache first. This is invalidated on loading. This solved to problem that the cache has old values when loading images
+        ##Invalid channel will return 0. Only needs 1 image in the channel to return something to return something relevant
+        ##entry examples:
+        ##  "CD45": (12.3, 845.7), 
+        ##  "PanCK": (0.0, 501.2),
+        ##  "FOXP3": None,
         cache = _global_minmax_cache.get()
         if channel_name in cache:
             return cache[channel_name]
 
+        ##accumulators
         gmin = np.inf
         gmax = -np.inf
         found_any = False
 
+        ##Loops over the channels
         for sample, arr in images_dict.items():
             chlist = channels_dict.get(sample, [])
+            ##Skip channel if not in the image
             if channel_name not in chlist:
                 continue
+            ##Make index of that channel
             idx = chlist.index(channel_name)
-            ch = arr[idx]  # raw 2D page
-            # robust against NaNs
+            ch = arr[idx]
+            ##Make robust against NaNs (should not be a problem with IMC data) and infinites (also should not be present)
             mn = float(np.nanmin(ch))
             mx = float(np.nanmax(ch))
             if np.isfinite(mn) and np.isfinite(mx):
                 gmin = min(gmin, mn)
                 gmax = max(gmax, mx)
                 found_any = True
-
+        ##This return an error if:
+        ##No image has a certain channel
+        ##All pixels are NAN/inf 
+        ##gmax </<= gmin. So empty images
+        ##It will store none in the cahce for that channel. 
         if not found_any or not np.isfinite(gmin) or not np.isfinite(gmax) or gmax <= gmin:
-            # store sentinel to avoid recomputation loops
+            #store a value so upon reload it doesn't recalculate this channel again because it's Nan/inf/flat
             cache[channel_name] = None
             _global_minmax_cache.set(cache)
             return None
-
+        ##store the results
         cache[channel_name] = (gmin, gmax)
         _global_minmax_cache.set(cache)
         return (gmin, gmax)
 
-    # ---------- load images ----------
+    ##<--------load images module ---------->
     @reactive.Effect
     @reactive.event(input.load)
     def _do_load():
+        ##If loading is already in progress don't try to start again!
         if loading.get():
             return
-        loading.set(True)
+        loading.set(True) 
         try:
-            # Try the text box first; if empty, open the dialog.
+            ##Try the text box first; if empty, open the dialog. 
+            ##So if you paste the path into the box it will not open the window ad just start loading
             folder = (input.path() or "").strip()
             if not folder:
-                # If you added pick_folder_dialog(), use it here:
+                ##So if the box is empty or not a folder
                 try:
                     folder = pick_folder_dialog()
                 except Exception:
                     folder = ""
+            ##If the loader also isn't valid, return this:
             if not folder:
                 print("🛑 Load canceled (no folder selected).")
                 return
 
-            # Reflect the path in the UI text box
+            ##Purely for visibilty, the actual folder path used is put into the text box
             session.send_input_message("path", {"value": folder})
-            print(">>> Load triggered with folder:", folder)
-
+            print(">>> Loading triggered with folder:", folder)
+            ##Loads the OME.tiff
             imgs, chs = load_tiffs_raw(folder)
+            ##If the folder didn't contain any images:
             if not imgs:
                 print("⚠️ No images found in selected folder.")
                 return
 
+            ##Store images and channels
             images.set(imgs)
             channels.set(chs)
-
+            ##Clear the cache. this prevends old settings from similar channal names to remain in memory and prevent from actually processing the images for the viewer
             _invalidate_global_cache()
-
+            ##Picks the first images as the default display.
             samples = list(imgs.keys())
             first_sample = samples[0]
             first_chlist = chs[first_sample]
             first_channel = first_chlist[0] if first_chlist else None
 
-            # set canonical + prefill table
+            #set the channel list for the left sided table and fill it will the channels. Each chanel gets a row.
             canonical_channels.set(list(first_chlist))
             _prefill_params(first_chlist)
 
-            # update selects under guard
+            ##update selects under guard, selects first image
             setting_selects.set(True)
             try:
-                ui.update_select("sample",  choices=samples,      selected=first_sample,  session=session)
+                ui.update_select("sample", choices=samples, selected=first_sample, session=session)
                 if first_channel:
                     ui.update_select("channel", choices=first_chlist, selected=first_channel, session=session)
             finally:
@@ -703,7 +729,7 @@ def server(input, output, session):
             if first_channel:
                 _sync_controls_from_table(first_channel)
 
-            # ✅ mark as loaded and remember folder
+            ##Tell user that everything is loaded and save the foldername for further use
             data_loaded.set(True)
             last_loaded_folder.set(folder)
 
@@ -716,23 +742,30 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.next_sample)
     def _next_sample():
+        ##if loading in progress or images are not set, abort.
         if loading.get() or not images.get():
             return
         samples = list(images.get().keys())
         cur = input.sample() or (samples[0] if samples else None)
+        ##Do samplenr++
         nxt = _cycle(samples, cur, +1)
         if nxt:
-            # Don’t set setting_selects here; we want _on_sample_change to run
+            ##Don’t set setting_selects here; we want _on_sample_change to run
             ui.update_select("sample", choices=samples, selected=nxt, session=session)
 
     @reactive.Effect
     @reactive.event(input.prev_sample)
     def _prev_sample():
+        ##if loading in progress or images are not set, abort.
         if loading.get() or not images.get():
             return
+        ##get list of samples
         samples = list(images.get().keys())
+        ##current sample select (or first of none selected)
         cur = input.sample() or (samples[0] if samples else None)
+        ##previous sample, uses cycler to wrap around
         prv = _cycle(samples, cur, -1)
+        ##If valid selected, update the sample dropdown menu with current sample
         if prv:
             ui.update_select("sample", choices=samples, selected=prv, session=session)
 
@@ -740,15 +773,19 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.sample)
     def _on_sample_change():
+        ##again, guard against changing while loading
         if loading.get() or setting_selects.get():
             return
+        ##Which sample selected? if none, bail
         s = input.sample()
         if not s:
             return
         chlist_current = channels.get().get(s, [])
         if not chlist_current:
             return
+        ##reorder using cannonical channels, this fixed a problem were channels were ordered differently between samples (total channels was the same)
         canon = canonical_channels.get()
+        ##Guards against missing channels
         ordered = [ch for ch in canon if ch in chlist_current] or chlist_current
         sel = input.channel()
         if sel not in ordered:
@@ -760,6 +797,8 @@ def server(input, output, session):
             setting_selects.set(False)
         _sync_controls_from_table(sel)
 
+    # ---------- react to channel change ----------
+    ##Below reactive effect work the sample as their sample counterpart, check comments there on how they work
     @reactive.Effect
     @reactive.event(input.next_channel)
     def _next_channel():
@@ -776,7 +815,6 @@ def server(input, output, session):
         cur = input.channel() or ordered[0]
         nxt = _cycle(ordered, cur, +1)
         if nxt:
-            # Let _on_channel_change run; no setting_selects here
             ui.update_select("channel", choices=ordered, selected=nxt, session=session)
 
     @reactive.Effect
@@ -797,8 +835,6 @@ def server(input, output, session):
         if prv:
             ui.update_select("channel", choices=ordered, selected=prv, session=session)
 
-
-    # ---------- react to channel change ----------
     @reactive.Effect
     @reactive.event(input.channel)
     def _on_channel_change():
@@ -809,47 +845,68 @@ def server(input, output, session):
             return
         _sync_controls_from_table(c)
 
-    # ---------- update table ----------
+    # <---------- update parameter table ---------->
+    ##Below are the effects that tie the buttons to the parameter dataframe
+    ##Important not is that i switched from immediately updating the parametern dataframe to making a copy and then applying
+    ##This solved a bug where the image viewer seemed to respond to a direct change in the parameter table?
+    ##Incidently, this will also prevent future functions that are tied to the parameter table from introducing weird behaviour 
+    ##associated with reading the table and mutating the original later. 
+    ##All buttons work generally the same way. 
+    ##Button trigger reading of the input channel, followed by a pull of the parameter table which is the copied
+    ##The user input is read, written to the copied dataframe, which in turn is written back to the params_df
+
+    ##Winsorization
     @reactive.Effect
     @reactive.event(input.apply_one)
     def _apply_one_channel():
+        ##Prevents feedback between application of change and the change of the UI
         if syncing_controls.get():
             return
+        ##read input channel, if non exit
         c = input.channel()
         if not c:
             return
+        ##Get the dataframe with parameters
         df = params_df.get()
         if df.empty:
             return
+        ##Find the correct row that matches the channel to change
         idx = df.index[df["Channel"] == c].tolist()
         if not idx:
             return
         i = idx[0]
+        #Make a copy of the parameter dataframe
         new_df = df.copy()
+        ##Update the winsor values
         new_df.at[i, "DoWinsor"] = bool(input.doWinsor())
         new_df.at[i, "Low"]      = float(input.winsor_low())
         new_df.at[i, "High"]     = float(input.winsor_high())
+        ##Write back the new table
         params_df.set(new_df.reset_index(drop=True))
 
+    ##Thresholding
     @reactive.Effect
     @reactive.event(input.apply_threshold)
+    ##This connects the update channel threshold value button to the parameter table
     def _apply_threshold_channel():
+        ##This prevents feedbackloop between the update table and "UI changed" action
         if syncing_controls.get():
             return
+        #Select input channel, if none, exit
         c = input.channel()
         if not c:
             return
+        #Get parameter table, if non, exit
         df = params_df.get()
         if df.empty:
             return
+        #From the df, get the right row. Again, if nothing, exit
         idx_list = df.index[df["Channel"] == c].tolist()
         if not idx_list:
             return
-
         i = idx_list[0]
         new_df = df.copy()
-
-        # clamp and persist to table
+        ##Note, explicitly turning it into a float prevents it from crashing out if the sldier return the value in a string. The 0.0 is only as a fallback
         try:
             thr_val = float(input.threshold_val())
         except Exception:
@@ -861,9 +918,11 @@ def server(input, output, session):
 
         params_df.set(new_df.reset_index(drop=True))
 
+    ##Noise removal
     @reactive.Effect
     @reactive.event(input.apply_noise)
     def _apply_noise_channel():
+        ##Same thing as the previous ones
         if syncing_controls.get():
             return
         c = input.channel()
@@ -882,192 +941,13 @@ def server(input, output, session):
         p = _strength_to_percentile(s)
 
         new_df.at[i, "Noise"]  = bool(input.doNoise())
-        new_df.at[i, "NStr"]   = s         # UI strength (0..1)
-        new_df.at[i, "NPrctl"] = p         # derived percentile actually used
+        new_df.at[i, "NStr"]   = s 
+        new_df.at[i, "NPrctl"] = p 
         new_df.at[i, "WinSz"]  = int(input.window_size())
 
         params_df.set(new_df.reset_index(drop=True))
 
-
-
-    # ---------- plot ----------
-    @output
-    @render.plot
-    def img_viewer():
-        # one figure only; decent size/dpi so the browser has pixels to work with
-        fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
-        try:
-            imgs = images.get()
-            s = input.sample()
-            c = input.channel()
-
-            if not imgs or not s or not c or s not in imgs:
-                ax.text(0.5, 0.5, "No image", ha="center", va="center")
-                ax.set_axis_off()
-                return fig
-
-            arr = imgs[s]
-            chlist = channels.get().get(s, [])
-            if c not in chlist:
-                ax.text(0.5, 0.5, f"Channel {c!r} not found", ha="center", va="center")
-                ax.set_axis_off()
-                return fig
-
-            idx = chlist.index(c)
-            img = arr[idx, :, :].astype(np.float32)
-
-            # Step 1: Winsorize (actually run this under doWinsor)
-            if input.doWinsor():
-                lo = max(0.0, min(1.0, float(input.winsor_low())))
-                hi = max(0.0, min(1.0, float(input.winsor_high())))
-                if hi > lo:
-                    img = _apply_winsor(img, lo, hi)
-
-            # Step 2: Global threshold (optional)
-            if input.doThreshold():
-                thr = float(input.threshold_val())
-                if thr > 0.0:
-                    cutoff = thr * (np.nanmax(img) if np.nanmax(img) > 0 else 1.0)
-                    img = np.where(img >= cutoff, img, 0.0)
-
-            # Step 3: Speckle suppression (old percentile rule + 2-neighbor check)
-            if input.doNoise():
-                wsize = max(1, int(input.window_size()))
-                if wsize % 2 == 0:
-                    wsize += 1
-                s = float(input.noise_strength())
-                p = _strength_to_percentile(s)
-                img = _apply_speckle_suppress(img, size=wsize, perc=p, neighbor_limit=2)
-
-            # Step 4: OPTIONAL arcsinh (note: now after denoise/threshold in this pipeline)
-            if input.doAsinh():
-                try:
-                    cofac = int(float(input.asinh_cofactor()))
-                except Exception:
-                    cofac = 5
-                cofac = max(2, min(10, cofac))
-                img = np.arcsinh(img / float(cofac))
-
-            #            # Step 5: Final normalization for display
-                        # Step 5: Final normalization for display
-            if bool(input.doNorm()):
-                scope = (input.norm_scope() or "page")
-                do_w, lo, hi = _get_winsor_settings()
-
-                if scope == "global":
-                    # Use the same logic as analysis:
-                    # - if winsor is enabled: global range from per-image winsor quantiles
-                    # - else: raw global min/max
-                    gpair = _global_range_for_channel(
-                        images.get(),
-                        channels.get(),
-                        c,
-                        do_w,
-                        lo,
-                        hi,
-                    )
-
-                    if gpair is not None:
-                        gmin, gmax = gpair
-                        if gmax > gmin:
-                            img = (img - gmin) / (gmax - gmin)
-                        else:
-                            # degenerate global range → fallback to per-image
-                            mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
-                            if mx > mn:
-                                img = (img - mn) / (mx - mn)
-                    else:
-                        # no usable global range → fallback to per-image
-                        mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
-                        if mx > mn:
-                            img = (img - mn) / (mx - mn)
-
-                else:
-                    # Per-page normalization: always based on the processed current image
-                    mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
-                    if mx > mn:
-                        img = (img - mn) / (mx - mn)
-            # else: no normalization: use processed img as-is
-
-            # --- Step 6: Render ---
-            ax.imshow(img, cmap="gray")
-            ax.set_axis_off()
-            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-            return fig
-
-        except Exception as e:
-            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
-            ax.set_axis_off()
-            return fig
-
-            
-    @output
-    @render.ui
-    def noise_tooltip():
-        s = float(input.noise_strength())
-        p = _strength_to_percentile(s)            # p in [0..1]
-        p_txt = f"P{p*100:.1f}"
-
-        long = (
-            f"Pixels above their local {p_txt} are marked ‘bright.’ "
-            "A pixel is removed only if ≤ 2 of its 8 neighbors are also bright. "
-            "Increase sensitivity to flag more pixels as bright (more aggressive denoising). "
-            "Decrease to preserve detail in bright patches."
-        )
-
-        # Small, muted line with a hover tooltip and a compact readout
-        return ui.tags.small(
-            ui.tags.span("ℹ️ ", class_="me-1"),
-            f"Local cutoff ≈ {p_txt}",
-            title=long,
-            class_="text-muted"
-        )
-
-
-    @reactive.Effect
-    @reactive.event(input.apply_norm)
-    def _apply_norm_channel():
-        if syncing_controls.get():
-            return
-        c = input.channel()
-        if not c:
-            return
-        df = params_df.get()
-        if df.empty:
-            return
-        idx = df.index[df["Channel"] == c].tolist()
-        if not idx:
-            return
-        i = idx[0]
-        new_df = df.copy()
-        new_df.at[i, "DoNorm"] = bool(input.doNorm())
-        params_df.set(new_df.reset_index(drop=True))
-
-
-    @output
-    @render.table
-    def param_table():
-        df = params_df.get()
-        if df.empty:
-            return pd.DataFrame({"Info": ["No parameters yet"]})
-        rename_map = {
-            "Channel": "Ch",
-            "DoWinsor": "Win",
-            "Low": "Low",
-            "High": "High",
-            "DoThr": "Thr?",
-            "ThrVal": "ThrVal",
-            "Noise": "Noise",
-            "NStr": "NStr",
-            "NPrctl": "NPerc",
-            "WinSz": "WinSz",
-            "DoNorm": "Norm?",
-            "DoAsinh": "Asinh?",
-            "Cofac": "Cofac",
-            "NormScope": "Scope",     # <-- NEW
-        }
-        return df.rename(columns=rename_map).reset_index(drop=True)
-    
+    ##Normalization and transformation
     @reactive.Effect
     @reactive.event(input.apply_norm)
     def _apply_options_channel():
@@ -1096,43 +976,173 @@ def server(input, output, session):
         new_df.at[i, "Cofac"] = cofac
         params_df.set(new_df.reset_index(drop=True))
 
-    @reactive.Effect
-    @reactive.event(input.confirm_start)
-    def _run_batch_analysis():
-        # Close the modal
-        ui.modal_remove(session=session)
-
-        folder = (input.path() or "").strip()
-        if not folder or not os.path.isdir(folder):
-            print(f"⚠️ Invalid folder: {folder!r}")
-            return
-
-        out_dir = os.path.join(folder, "normalized images")
-        os.makedirs(out_dir, exist_ok=True)
-
-        params_path = os.path.join(out_dir, "parameter_table.csv")
-        df = params_df.get().copy()
-        if df.empty:
-            print("⚠️ Parameter table is empty — nothing to analyze.")
-            return
-        df.to_csv(params_path, index=False)
-        print(f"✅ Saved parameter table → {params_path}")
-
-        script = Path(__file__).with_name("analysis.py")
-        cmd = [sys.executable, str(script),
-            "--input-dir", folder,
-            "--params-csv", params_path,
-            "--output-dir", out_dir]
-        print("▶️ Running analysis:", " ".join(cmd))
+    # <---------- plot ---------->
+    ##Below is the actual img viewer where the image is rendered and all the different thresholding stept are visualized.
+    @output
+    @render.plot
+    def img_viewer():
+        #One image is plotted only; decent size/dpi so the browser has pixels to work with
+        #Make image 19:6 (padded) with 120dpi. So 1080x720. Which is around full res for IMC images. 
+        ##Image is just scaled to fit the container, using: ui.output_plot("img_viewer", fill=True, height="100%")
+        fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
         try:
-            subprocess.run(cmd, check=True)
-            print("✅ Analysis finished.")
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Analysis script failed: {e}")
+            imgs = images.get()
+            s = input.sample()
+            c = input.channel()
+            ##If there is no image or channel then display text below
+            if not imgs or not s or not c or s not in imgs:
+                ax.text(0.5, 0.5, "No image", ha="center", va="center")
+                ax.set_axis_off()
+                return fig
+            ##array of images
+            arr = imgs[s]
+            chlist = channels.get().get(s, [])
+            ##Guards against the case where the next image doesn't have the current channel
+            if c not in chlist:
+                ax.text(0.5, 0.5, f"Channel {c!r} not found", ha="center", va="center")
+                ax.set_axis_off()
+                return fig
+            ##Current index of the channels and turn the current image into an np.array
+            idx = chlist.index(c)
+            img = arr[idx, :, :].astype(np.float32) ##this image (img) will go through th whole pipeline below
 
+            ##Step 1 is to apply the winsorization (or don't it's set to FALSE)
+            if input.doWinsor():
+                lo = max(0.0, min(1.0, float(input.winsor_low())))
+                hi = max(0.0, min(1.0, float(input.winsor_high())))
+                if hi > lo:
+                    img = _apply_winsor(img, lo, hi)
 
+            ##Step 2 If applicable, threshold with a check 
+            if input.doThreshold():
+                thr = float(input.threshold_val())
+                ##If pixel is >threshold keep it, if not set to 0. If all pixels are 0 it will use 1 to prevent multiplying and zeoring out the image
+                if thr > 0.0:
+                    cutoff = thr * (np.nanmax(img) if np.nanmax(img) > 0 else 1.0)
+                    img = np.where(img >= cutoff, img, 0.0)
+
+            ##Step 3: Spleckle suppression using _apply_speckle_suppress, input is the noise suppression parameters
+            if input.doNoise():
+                wsize = max(1, int(input.window_size()))
+                if wsize % 2 == 0:
+                    wsize += 1
+                s = float(input.noise_strength())
+                p = _strength_to_percentile(s)
+                img = _apply_speckle_suppress(img, size=wsize, perc=p, neighbor_limit=2)
+
+            #Step 4 is the arcsin5 transform, this is done on non-normalized data.
+            if input.doAsinh():
+                try:
+                    cofac = int(float(input.asinh_cofactor()))
+                except Exception:
+                    cofac = 5
+                cofac = max(2, min(10, cofac))
+                img = np.arcsinh(img / float(cofac))
+
+            ##Step5 is normalization of the channel, either on an image basis or a channel basis.
+            ##No normalization? Skip this part
+            if bool(input.doNorm()):
+                ##Scope = global versus per image
+                scope = (input.norm_scope() or "page")
+                ##Pull the winsor settings (not to winsorize again)
+                do_w, lo, hi = _get_winsor_settings()
+                ##If the scope of the normalization is global, use this part. If not skip to local(per image) version
+                if scope == "global":
+                    #if winsor is enabled: global range from per-image winsor quantiles
+                    #if not, use the raw global min/max
+                    ##It now asks for the global post winso scores and caches them
+                    gpair = _global_range_for_channel(
+                        images.get(),
+                        channels.get(),
+                        c,
+                        do_w,
+                        lo,
+                        hi,
+                    )
+                    #If not cached 
+                    if gpair is not None:
+                        gmin, gmax = gpair
+                        if gmax > gmin:
+                            img = (img - gmin) / (gmax - gmin)
+                        else:
+                            #degenerate global range it uses the per-image as fallback
+                            mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+                            if mx > mn:
+                                img = (img - mn) / (mx - mn)
+                    else:
+                        #no usable global range, again the fallback is per image
+                        mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+                        if mx > mn:
+                            img = (img - mn) / (mx - mn)
+
+                else:
+                    #Per-page normalization just divide by max intensity. 
+                    mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+                    if mx > mn:
+                        img = (img - mn) / (mx - mn)
+            ##else perform no normalization: use processed img as-is
+
+            ##Step 6 is to actually render the image
+            ax.imshow(img, cmap="gray")
+            ax.set_axis_off()
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            return fig
+        ##If anything goed wrong, catch the exception and display it
+        except Exception as e:
+            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
+            ax.set_axis_off()
+            return fig
+            
+    @output
+    @render.ui
+    ##This is the small tooltip that gived information about how the normalization actually workd
+    def noise_tooltip():
+        s = float(input.noise_strength())
+        p = _strength_to_percentile(s)
+        p_txt = f"P{p*100:.1f}"
+        long = (
+            f"Pixels above their local {p_txt} are marked ‘bright.’ "
+            "A pixel is removed only if ≤ 2 of its 8 neighbors (not scaled with window size) are also bright. "
+            "Increase sensitivity to flag more pixels as bright (more aggressive denoising). "
+            "Decrease to preserve detail in bright patches."
+        )
+        ##Small, muted line with a hover tooltip and a compact readout
+        return ui.tags.small(
+            ui.tags.span("ℹ️ ", class_="me-1"),
+            f"Local cutoff ≈ {p_txt}",
+            title=long,
+            class_="text-muted"
+        )
+
+    @output
+    @render.table
+    ##This is the table that is actually used to render the big parameter table on the left side
+    def param_table():
+        df = params_df.get()
+        if df.empty:
+            return pd.DataFrame({"Info": ["No parameters yet"]})
+        ##Rename for better readability, right side is the side the user sees
+        rename_map = {
+            "Channel": "Ch",
+            "DoWinsor": "Win",
+            "Low": "Low",
+            "High": "High",
+            "DoThr": "Thr?",
+            "ThrVal": "ThrVal",
+            "Noise": "Noise",
+            "NStr": "NStr",
+            "NPrctl": "NPerc",
+            "WinSz": "WinSz",
+            "DoNorm": "Norm?",
+            "DoAsinh": "Asinh?",
+            "Cofac": "Cofac",
+            "NormScope": "Scope",
+        }
+        return df.rename(columns=rename_map).reset_index(drop=True)
+    
     @reactive.Effect
     @reactive.event(input.perform_analysis)
+    ##The moment you hit "analyze" this will popup to give the user a chance to cancel if it was by accident
     def _confirm_start_modal():
         folder = (input.path() or "").strip()
         msg = ui.div(
@@ -1151,6 +1161,46 @@ def server(input, output, session):
         )
         ui.modal_show(m, session=session)
 
+
+    @reactive.Effect
+    @reactive.event(input.confirm_start)
+    ##This will run the batch of images through he analysis.py pipeline
+    def _run_batch_analysis():
+        #Close the modal (the yes i'm sure button), see above block
+        ui.modal_remove(session=session)
+        ##reads the folder path, uses the input folder, checks if its non-empty and it exist. Strips all the white space.
+        ##Throws an exception if not
+        folder = (input.path() or "").strip()
+        if not folder or not os.path.isdir(folder):
+            print(f"⚠️ Invalid folder: {folder!r}")
+            return
+        ##Create new folder inside of the input one.
+        out_dir = os.path.join(folder, "normalized images")
+        os.makedirs(out_dir, exist_ok=True)
+        ##Makes an output path for the parameter file to save it
+        ##If the table is empty it will return a messege to tell the user
+        params_path = os.path.join(out_dir, "parameter_table.csv")
+        df = params_df.get().copy()
+        if df.empty:
+            print("⚠️ Parameter table is empty — nothing to analyze.")
+            return
+        df.to_csv(params_path, index=False)
+        print(f"✅ Saved parameter table → {params_path}")
+        ##Tries to open de analysis.py file from the same folder as the viewer.
+        script = Path(__file__).with_name("analysis.py")
+        ##Uses the same python interpreter to run the scipt with the input created above.
+        ##If that fails it will throw the appropriate errors.
+        cmd = [sys.executable, str(script),
+            "--input-dir", folder,
+            "--params-csv", params_path,
+            "--output-dir", out_dir]
+        print("▶️ Running analysis:", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+            print("✅ Analysis finished.")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Analysis script failed: {e}")
+    #zzzzzzzz
     @reactive.Effect
     @reactive.event(input.export_params)
     def _export_params():
@@ -1187,7 +1237,7 @@ def server(input, output, session):
 
         gpair = _global_range_for_channel(images.get(), channels.get(), ch, do_w, lo, hi)
         if not gpair:
-            return ui.tags.small("Global range: —")
+            return ui.tags.small("Global range: NO VALID RANGE")
         gmin, gmax = gpair
 
         try:
@@ -1294,6 +1344,5 @@ def server(input, output, session):
 
         print(f"✅ Imported parameters from {csv_path}")
 
-from shiny import App  # (you already have this at the top)
 
 app = App(app_ui, server)
