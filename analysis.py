@@ -205,7 +205,7 @@ def main():
     # Load stacks
     imgs, chs = load_tiffs_raw(str(in_dir))
 
-    # Precompute global min/max where requested (RAW frames, across all samples)
+    #Precompute global min/max where requested (RAW frames, across all samples)
     need_global = channels_needing_global(params)
     global_minmax = precompute_global_minmax(imgs, chs, need_global, params)  # {ch: (gmin,gmax) | None}
 

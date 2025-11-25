@@ -11,6 +11,10 @@ import os, sys, subprocess
 import shutil
 import warnings
 
+
+from HelperFiles.formatting import fmt1
+
+
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
 
 
@@ -25,7 +29,7 @@ app_ui = ui.page_sidebar(
         width="850px",          # tweak as needed
     ),
 
-    # This is CSS to fix scaling issues with the viewer. Not that this is made by chatgpt, so edi at your own risk.
+    # This is CSS to fix scaling issues with the viewer. Not that this is made by chatgpt, so edit at your own risk.
     ui.head_content(
         ui.tags.style("""
             :root{
@@ -112,7 +116,6 @@ app_ui = ui.page_sidebar(
                             ),
                         ),
                         #Another spacers
-                        ui.column(1),
                         ##export import and process images buttons
                         ui.column(
                             1,
@@ -130,18 +133,21 @@ app_ui = ui.page_sidebar(
                             ),
                             ui.row(
                                 ui.div(
-                                    ui.input_action_button(
-                                        "perform_analysis",
-                                        "Process Images",
-                                        class_="btn btn-primary text-white w-100 h-100",
+                                    ui.input_action_button("perform_analysis", "Process Images",class_="btn btn-primary text-white w-100 h-100",
                                     ),
                                     class_="d-flex h-100 align-items-stretch",
                                 ),
                             ),
                         ),
-
-                        ui.column(1),
-
+                        ui.column(1), ##spacer
+                        ui.column(
+                            1,
+                            ui.row(
+                                ui.div(
+                                    ui.input_action_button("neigborhood_analysis", "Neigborhood Analysis", class_="btn btn-secondary w-100")
+                                )
+                            )                                
+                        ),
                         #IMPORTANT: this is part of the SAME ui.row(...) call; note the comma! If you move this it will break everything
 
                         class_="controls-top align-items-center gy-0",
@@ -299,19 +305,6 @@ def server(input, output, session):
     last_loaded_folder = reactive.Value("") #This stores the last path used to load images so saving throws them into the same folder
     
     ## <----------------> Helper functions <-------------------> ##
-    def _fmt1(x: float) -> str:
-        """
-        One decimal, no scientific notation.
-        Best effort to turn a string into a number (float) and show as decimal
-        """
-        try:
-            x = float(x)
-        except Exception:
-            return str(x)
-        if not np.isfinite(x):
-            return str(x)
-        return f"{x:.1f}"
-    
     def _winsor_quantiles(arr: np.ndarray, lo: float, hi: float):
         """
         Return winzorization values (q_lo, q_hi) associated with the winsorization input of the array
@@ -1230,14 +1223,14 @@ def server(input, output, session):
         parts = [
             ui.tags.small(
                 f'Global range: “{ch}” (winsor {"on" if (do_w and hi>lo) else "off"}): '
-                f'[{_fmt1(gmin)}, {_fmt1(gmax)}]'
+                f'[{fmt1(gmin)}, {fmt1(gmax)}]'
             )
         ]
         ##Note that the range is the min/max range per channel but the winsorization is per image. If winsorization if turned off there it's just glabal min max
         if ipair:
             imin, imax = ipair
             label = f'Image range: “{s}” range' if s else "Image range"
-            parts += [ui.br(), ui.tags.small(f"{label}: [{_fmt1(imin)}, {_fmt1(imax)}]")]
+            parts += [ui.br(), ui.tags.small(f"{label}: [{fmt1(imin)}, {fmt1(imax)}]")]
         return ui.div(*parts)
 
     @reactive.Effect
