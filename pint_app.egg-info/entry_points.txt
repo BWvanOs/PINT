@@ -1,0 +1,7 @@
+[console_scripts]
+PINT = pint_app.cli:main
+PINT-analysis = pint_app.cli:analysis
+PINT-viewer = pint_app.cli:viewer
+pint = pint_app.cli:main
+pint-analysis = pint_app.cli:analysis
+pint-viewer = pint_app.cli:viewer

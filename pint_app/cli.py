@@ -1,5 +1,3 @@
-cat > pint_app/cli.py <<'PY'
-from __future__ import annotations
 import sys, subprocess
 from pathlib import Path
 
@@ -30,4 +28,3 @@ def analysis():
         print(f"[pint-analysis] Could not find {analysis_py}", file=sys.stderr)
         sys.exit(2)
     sys.exit(subprocess.call([sys.executable, str(analysis_py), *sys.argv[1:]]))
-PY

@@ -20,6 +20,14 @@ dependencies = [
 ]
 
 [project.scripts]
+PINT = "pint_app.cli:main"
 pint = "pint_app.cli:main"
+
+PINT-viewer = "pint_app.cli:viewer"
 pint-viewer = "pint_app.cli:viewer"
+PINT-analysis = "pint_app.cli:analysis"
 pint-analysis = "pint_app.cli:analysis"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pint_app*", "HelperFiles*"]

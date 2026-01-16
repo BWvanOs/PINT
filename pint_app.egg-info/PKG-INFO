@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: pint-app
+Version: 0.1.0
+Summary: PINT: IMC/ CyTOF normalization viewer + batch analysis
+Requires-Python: >=3.11
+Requires-Dist: shiny>=0.8.0
+Requires-Dist: numpy>=1.26
+Requires-Dist: pandas>=2.1
+Requires-Dist: scipy>=1.11
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: tifffile>=2024.5.22
+Requires-Dist: openpyxl>=3.1
+Requires-Dist: jinja2>=3.1
+Requires-Dist: ome-types>=0.5.0

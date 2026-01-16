@@ -13,6 +13,7 @@ import warnings
 
 
 from HelperFiles.formatting import fmt1
+from HelperFiles.winsor_quantiles import winsor_quantiles
 
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
@@ -305,28 +306,10 @@ def server(input, output, session):
     last_loaded_folder = reactive.Value("") #This stores the last path used to load images so saving throws them into the same folder
     
     ## <----------------> Helper functions <-------------------> ##
-    def _winsor_quantiles(arr: np.ndarray, lo: float, hi: float):
-        """
-        Return winzorization values (q_lo, q_hi) associated with the winsorization input of the array
-        So input eg 0.01, 0.99, output are associated values of the input array
-        Reutrn quantiles; None if invalid input.
-        Used be the Shiny app to display global range
-        """
-        try:
-            #selected winsorization parameters
-            #Uses numpy np.nanquantile which is robust to NaN input
-            qlo, qhi = np.nanquantile(arr, [lo, hi])
-            if np.isnan(qlo) or np.isnan(qhi):
-                return None
-            ##Returns the values as float
-            return float(qlo), float(qhi)
-        except Exception:
-            return None
-
     def _get_winsor_settings():
         """
         Reads the UI winsor settings, which is clamped to [0,1]. 
-        Output is input for _winsor_quantiles
+        Output is input for winsor_quantiles
         """
         do_w = bool(input.doWinsor())
         lo = max(0.0, min(1.0, float(input.winsor_low())))
@@ -358,7 +341,7 @@ def server(input, output, session):
                 if channel_name not in chlist:
                     continue
                 idx = chlist.index(channel_name)
-                qpair = _winsor_quantiles(arr[idx], lo, hi)
+                qpair = winsor_quantiles(arr[idx], lo, hi)
                 if not qpair:
                     continue
                 qlo, qhi = qpair
@@ -388,7 +371,7 @@ def server(input, output, session):
         idx = chlist.index(channel_name)
         arr = images_dict[sample][idx]
         if do_winsor and hi > lo:
-            return _winsor_quantiles(arr, lo, hi)
+            return winsor_quantiles(arr, lo, hi)
         # raw fallback
         mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
         if not (np.isfinite(mn) and np.isfinite(mx)):

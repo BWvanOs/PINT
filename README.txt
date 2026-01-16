@@ -1,14 +1,22 @@
-##Install like this:
+##Welcome to PINT, a normalization and noise removal tool for Imaging mass cytometry.
 
-##Make sur git is installed:
+##Prerequisites:
 
-##conda install -c conda-forge git    # or: sudo apt install git / brew install git
+- Git
+- Conda (Miniconda (or if prefered Anaconda))
 
-##clone the repo:
-##git clone https://github.com/<OWNER>/<REPO>.git
+##Installation (recommended)
 
-##cd PINT
+###First clone the repository
+    git clone https://github.com/BWvanOs/PINT
+    cd PINT-main
 
-##conda env create -f environment.yml
-##conda activate pint
-##python PINT.py
+###Create conda environment
+    conda env create -f environment.yml
+    conda activate pint_env
+    pip install -e .
+    PINT
+
+##For daily use after installation:
+    conda activate pint_env
+    PINT
