@@ -23,9 +23,10 @@
 
 ##----------> How to update to a new version <----------##
 ###Navigate to your PINT folder
+    conda activate pint_env
     cd /path/to/PINT-main
     git pull
     conda env update -f environment.yml --prune
-    pip install .
+    pip install -e .
     PINT
 
