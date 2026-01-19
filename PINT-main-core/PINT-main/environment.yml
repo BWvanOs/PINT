@@ -1,0 +1,19 @@
+name: pint_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy>=1.26
+  - pandas>=2.1
+  - scipy>=1.11
+  - matplotlib>=3.8
+  - tifffile>=2024.5.22
+  - openpyxl>=3.1
+  - jinja2>=3.1
+  - pip
+  - pip:
+      - -e .
+      - shiny>=0.8.0
+      - ome-types>=0.5.0
+
