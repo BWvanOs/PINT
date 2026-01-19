@@ -8,3 +8,6 @@ dist/
 build/
 
 .DS_Store
+
+PINT-main-core/
+PINT-main/
