@@ -1,0 +1,6 @@
+Version history
+
+0.2.0
+Introduces functional button that opens a new tab for an eventual neigborhood analysis
+
+0.1.0
