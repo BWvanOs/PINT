@@ -162,14 +162,16 @@ app_ui = ui.page_sidebar(
                         ui.column(1), ##spacer
                         ui.column(
                             1,
-                            ui.row(
-                                ui.div(
-                                    ui.input_action_button("neigborhood_analysis", "Neigborhood Analysis", class_="btn btn-secondary w-100")
-                                )
-                            )                                
+                            ui.tags.a(
+                                "Neighborhood analysis",
+                                href="/neighborhood/",
+                                target="_blank",
+                                role="button",
+                                class_="btn btn-secondary w-100",
+                                style="pointer-events: auto;",
+                            ),
                         ),
                         #IMPORTANT: this is part of the SAME ui.row(...) call; note the comma! If you move this it will break everything
-
                         class_="controls-top align-items-center gy-0",
                     ),
                     ##line to seperate the UI elements

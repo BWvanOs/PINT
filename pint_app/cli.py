@@ -14,14 +14,12 @@ def main():
     raise SystemExit(subprocess.call([sys.executable, str(script), *sys.argv[1:]]))
 
 def viewer():
-    """Run the Shiny viewer directly."""
-    viewer_py = _root() / "viewer.py"
-    if not viewer_py.exists():
-        print(f"[pint-viewer] Could not find {viewer_py}", file=sys.stderr)
-        raise SystemExit(2)
-    raise SystemExit(subprocess.call([
-        sys.executable, "-m", "shiny", "run", "--port", "8000", str(viewer_py), *sys.argv[1:]
-    ]))
+    """Run the (mounted) Shiny server (viewer at /, neighborhood at /neighborhood)."""
+    # Ensure the ASGI entry point exists
+    asgi_app = "pint_app.asgi:app"
+
+    cmd = [sys.executable, "-m", "uvicorn", asgi_app, "--host", "127.0.0.1", "--port", "8000", *sys.argv[1:],]
+    raise SystemExit(subprocess.call(cmd))
 
 def analysis():
     """Run the batch analysis script directly."""
