@@ -15,11 +15,33 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+
+
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _zenity_available() -> bool:
+    return shutil.which("zenity") is not None
 
 
 def pick_open_csv_dialog(title: str = "Select parameter CSV", initialdir: str | None = None) -> str:
     """Open a file selection dialog for a CSV file."""
-    # Prefer tkinter
+    # Linux: prefer zenity (GNOME-style)
+    if _is_linux() and _zenity_available():
+        try:
+            cmd = ["zenity", "--file-selection", "--title", title]
+            if initialdir:
+                cmd += ["--filename", os.path.join(initialdir, "")]
+            # zenity filters are a bit particular; this works well in practice
+            cmd += ["--file-filter=CSV files | *.csv", "--file-filter=All files | *"]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            return res.stdout.strip() if res.returncode == 0 else ""
+        except Exception:
+            pass
+
+    # Fallback: tkinter
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -30,6 +52,7 @@ def pick_open_csv_dialog(title: str = "Select parameter CSV", initialdir: str | 
             root.wm_attributes("-topmost", 1)
         except Exception:
             pass
+
         path = filedialog.askopenfilename(
             title=title,
             initialdir=initialdir or os.getcwd(),
@@ -38,21 +61,7 @@ def pick_open_csv_dialog(title: str = "Select parameter CSV", initialdir: str | 
         root.destroy()
         return path or ""
     except Exception:
-        pass
-
-    # Linux fallback: zenity
-    try:
-        if shutil.which("zenity"):
-            res = subprocess.run(
-                ["zenity", "--file-selection", "--title", title, "--file-filter=*.csv"],
-                capture_output=True,
-                text=True,
-            )
-            return res.stdout.strip() if res.returncode == 0 else ""
-    except Exception:
-        pass
-
-    return ""
+        return ""
 
 
 def pick_save_csv_dialog(
@@ -61,6 +70,31 @@ def pick_save_csv_dialog(
     initialfile: str = "parameter_table.csv",
 ) -> str:
     """Open a save-as dialog for a CSV file."""
+    # Linux: prefer zenity (GNOME-style)
+    if _is_linux() and _zenity_available():
+        try:
+            # zenity save mode uses --save and can prefill filename
+            start = initialdir or os.getcwd()
+            suggested = os.path.join(start, initialfile)
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                "--title", title,
+                "--filename", suggested,
+                "--file-filter=CSV files | *.csv",
+                "--file-filter=All files | *",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            out = res.stdout.strip() if res.returncode == 0 else ""
+            if out and not out.lower().endswith(".csv"):
+                out += ".csv"
+            return out
+        except Exception:
+            pass
+
+    # Fallback: tkinter
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -71,6 +105,7 @@ def pick_save_csv_dialog(
             root.wm_attributes("-topmost", 1)
         except Exception:
             pass
+
         path = filedialog.asksaveasfilename(
             title=title,
             initialdir=initialdir or os.getcwd(),
@@ -84,9 +119,20 @@ def pick_save_csv_dialog(
         return ""
 
 
-def pick_folder_dialog(title: str = "Select folder") -> str:
+def pick_folder_dialog(title: str = "Select folder", initialdir: str | None = None) -> str:
     """Open a folder selection dialog."""
-    # Prefer tkinter
+    # Linux: prefer zenity (GNOME-style)
+    if _is_linux() and _zenity_available():
+        try:
+            cmd = ["zenity", "--file-selection", "--directory", "--title", title]
+            if initialdir:
+                cmd += ["--filename", os.path.join(initialdir, "")]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            return res.stdout.strip() if res.returncode == 0 else ""
+        except Exception:
+            pass
+
+    # Fallback: tkinter
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -97,22 +143,9 @@ def pick_folder_dialog(title: str = "Select folder") -> str:
             root.wm_attributes("-topmost", 1)
         except Exception:
             pass
-        path = filedialog.askdirectory(title=title)
+
+        path = filedialog.askdirectory(title=title, initialdir=initialdir or os.getcwd())
         root.destroy()
         return path or ""
     except Exception:
-        pass
-
-    # Linux fallback: zenity
-    try:
-        if shutil.which("zenity"):
-            res = subprocess.run(
-                ["zenity", "--file-selection", "--directory", "--title", title],
-                capture_output=True,
-                text=True,
-            )
-            return res.stdout.strip() if res.returncode == 0 else ""
-    except Exception:
-        pass
-
-    return ""
+        return ""
