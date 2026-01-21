@@ -21,6 +21,7 @@ from pint_app.core.processing import (
     arcsinh_transform,
     apply_speckle_suppress,
     strength_to_percentile,
+    normalize_minmax,
     global_minmax_for_channel as compute_global_minmax_for_channel,
     global_winsor_range_for_channel as compute_global_winsor_range_for_channel,
     image_winsor_range as compute_image_winsor_range,
@@ -837,9 +838,12 @@ def server(input, output, session):
 
             # Step 4: arcsinh transform
             if input.doAsinh():
-                img = arcsinh_transform(img, input.asinh_cofactor())
-
-            ##Step5 is normalization of the channel, either on an image basis or a channel basis.
+                try:
+                    cof = int(float(input.asinh_cofactor() or 5))
+                except Exception:
+                    cof = 5
+                img = arcsinh_transform(img, cof)
+                        ##Step5 is normalization of the channel, either on an image basis or a channel basis.
             ##No normalization? Skip this part
             if bool(input.doNorm()):
                 ##Scope = global versus per image
@@ -871,6 +875,7 @@ def server(input, output, session):
             ##else perform no normalization: use processed img as-is
 
             ##Step 6 is to actually render the image
+            img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
             ax.imshow(img, cmap="gray")
             ax.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
@@ -1031,7 +1036,14 @@ def server(input, output, session):
             df.to_csv(save_path, index=False)
             print(f"✅ Exported parameters → {save_path}")
         except Exception as e:
-            print(f"❌ Failed to write CSV: {e}")
+            import traceback
+            traceback.print_exc()
+            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
+            ax.set_axis_off()
+            return fig
+                
+        #except Exception as e:
+        #    print(f"❌ Failed to write CSV: {e}")
 
  
     @reactive.Effect

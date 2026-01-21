@@ -11,10 +11,10 @@ def run_viewer():
     threading.Thread(target=_open, daemon=True).start()
 
     cmd = [
-        sys.executable, "-m", "uvicorn",
-        "pint_app.asgi:app",
-        "--host", "127.0.0.1",
-        "--port", "8000",
+    sys.executable, "-m", "uvicorn", "pint_app.asgi:app",
+    "--host", "127.0.0.1", "--port", "8000",
+    "--ws-ping-interval", "120",
+    "--ws-ping-timeout", "120",
     ]
     subprocess.run(cmd, check=True)
 
