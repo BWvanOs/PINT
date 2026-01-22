@@ -1,3 +1,5 @@
+Current version 0.3.0
+
 ##Install like this:
 
 ##Make sure git is installed:
