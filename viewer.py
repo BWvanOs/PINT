@@ -1035,15 +1035,9 @@ def server(input, output, session):
         try:
             df.to_csv(save_path, index=False)
             print(f"✅ Exported parameters → {save_path}")
+                 
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
-            ax.set_axis_off()
-            return fig
-                
-        #except Exception as e:
-        #    print(f"❌ Failed to write CSV: {e}")
+            print(f"❌ Failed to write CSV: {e}")
 
  
     @reactive.Effect
