@@ -1,12 +1,40 @@
 from shiny import App, ui, render, reactive
 import pandas as pd
+import numpy as np
 import tempfile
 from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+
 from pint_app.neighborhood.params import example_input_df, REQUIRED_COLUMNS
 from pint_app.neighborhood.csvloading import load_and_validate_csv
 from pint_app.neighborhood.neighborhood_analysis import observed_neighbors, chance_corrected_interactions
 
 app_ui = ui.page_fluid(
+    ##Made the CSS with LLM, touch at your own risk
+    ui.tags.style("""
+    /* Blue buttons (shared) */
+    .csv-file-primary .btn,
+    .csv-file-primary .input-group > .btn,
+    .csv-file-primary .input-group > .btn-file,
+    .csv-file-primary .input-group > .input-group-text,
+    .csv-file-primary .input-group > label {
+    background-color: #0d6efd !important;
+    border-color: #0d6efd !important;
+    color: #ffffff !important;
+    }
+
+    .csv-file-primary .btn:hover,
+    .csv-file-primary .input-group > .btn:hover,
+    .csv-file-primary .input-group > .btn-file:hover,
+    .csv-file-primary .input-group > .input-group-text:hover,
+    .csv-file-primary .input-group > label:hover {
+    background-color: #0b5ed7 !important;
+    border-color: #0b5ed7 !important;
+    color: #ffffff !important;
+    }
+    """),
+
     ui.layout_columns(
         ui.div(
        
@@ -17,65 +45,80 @@ app_ui = ui.page_fluid(
 
             ui.h4("Upload CSV data"),
 
-            ui.input_file("csv_file",
-                "Choose a csv file",
-                accept=[".csv", ".txt", "text/csv"],
-                multiple = False,
+            ui.div(
+                ui.input_file(
+                    "csv_file",
+                    "Choose a csv file",
+                    accept=[".csv", ".txt", "text/csv"],
+                    multiple=False,
+                ),
+                class_="csv-file-primary",
             ),
-
 
             ui.h4("Example input format"),
             ui.output_data_frame("schema_example"),
 
-            style="border-right: 1px solid #ddd; padding-right: 1rem; height: 100%;",
-        ),
-        ui.div(
-            ui.h2("Load status"),
+            ui.hr(),
+            ui.h2("Load status", style="margin: 0;"),
             ui.output_text_verbatim("load_status"),
-
             ui.h4("Preview (validated)"),
             ui.output_data_frame("preview"),
-            ui.h4("Parameters"),
+
+            style="border-right: 1px solid #ddd; padding-right: 1rem; height: 100%;",
+
+
+        ),
+        ui.div(
+            ui.h2("Input parameters for neighborhood analysis"),
             ui.input_numeric("radius", "Radius", 50, min=1, step=1),
             ui.input_numeric("n_perm", "N permutations", 1000, min=0, step=100),
             ui.input_action_button("analyze", "Analyze now"),
-            ui.output_text_verbatim("analysis_status"),
-
 
             ui.hr(),
+            ui.h2("Results from neighborhood analysis"),            
+            ui.output_text_verbatim("results_io_status"),
+            ui.output_data_frame("neighbors_preview"),
             ui.h2("Load previous results"),
             ui.h6("Save your results after running, or load previous results. Table below shows active results from neighborhood analysis"),
-            ui.layout_columns(
-                ui.div(
-                    ui.download_button("save_results", "Save results (.csv)"),
+
+            ui.div(
+                ui.layout_columns(
                     ui.div(
+                        ui.download_button("save_results", "Save results (.csv)"),
                         ui.div(
-                            ui.input_file(
-                                "results_file",
-                                None,
-                                accept=[".csv", "text/csv"],
-                                multiple=False,
+                            ui.div(
+                                ui.input_file("results_file", None, accept=[".csv", "text/csv"], multiple=False),
+                                style="flex: 1; min-width: 320px; margin: 0; padding: 0; transform: translateY(15px);",
                             ),
-                            style="flex: 1; min-width: 320px; margin: 0; padding: 0; transform: translateY(15px);",
+                            ui.input_action_button("load_results", "Load"),
+                            style="display: flex; gap: 0.5rem; align-items: center;",
                         ),
-                        ui.input_action_button("load_results", "Load"),
-                        style="display: flex; gap: 0.5rem; align-items: center;",
+                        style="display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap;",
                     ),
-                    style="display: flex; gap: 1rem; align-items: center; justify-content: space-between; flex-wrap: wrap;",
                 ),
+                class_="csv-file-primary",
             ),
+
+            ui.tags.hr(),
 
             style="border-right: 1px solid #ddd; padding-right: 1rem; height: 100%;",
         ),
         ui.div(
-            ui.h2("Results from neighborhood analysis"),
-            ui.tags.hr(),
-            
-            ui.output_text_verbatim("results_io_status"),
-            ui.output_data_frame("neighbors_preview"),
+            ui.div(
+                ui.h2("Interaction heatmap"),
+                ui.output_plot("interaction_heatmap", height="700px"),
+                ui.input_selectize(
+                    "sample_for_heatmap",
+                    "Sample",
+                    choices=[],   # populated from server after results exist
+                    multiple=False,
+                    width="100%",
+                ),
+                style="padding-left: 1rem;",
+            ),
         ),
 
-        col_widths=(3, 3, 6),
+        col_widths=(3, 5, 4),
         
     )
 )
@@ -88,7 +131,7 @@ def server(input, output, session):
     @render.data_frame
     def schema_example():
         # Shiny renders pandas DataFrames nicely in the browser
-        return render.DataGrid(example_input_df(), height="500px")
+        return render.DataGrid(example_input_df(), height="auto")
     
     @reactive.calc
     def validated_df():
@@ -267,6 +310,100 @@ def server(input, output, session):
         msg = results_io_msg.get()
         return msg if msg else ""        
 
+    @reactive.effect
+    def _sync_heatmap_sample_choices():
+        res = neighbors_val.get()
 
+        if res is None or (hasattr(res, "empty") and res.empty) or ("SampleNumber" not in res.columns):
+            ui.update_selectize("sample_for_heatmap", choices=[], selected=None, session=session)
+            return
+
+        samples = sorted(res["SampleNumber"].astype(str).unique().tolist())
+
+        # Keep current selection if valid; otherwise default to first sample
+        current = input.sample_for_heatmap()
+        selected = current if (current in samples) else (samples[0] if samples else None)
+
+        ui.update_selectize(
+            "sample_for_heatmap",
+            choices=samples,
+            selected=selected,
+            session=session,
+        )
+
+    @render.plot
+    def interaction_heatmap():
+        res = neighbors_val.get()
+
+        # Empty state
+        if res is None or (hasattr(res, "empty") and res.empty):
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.axis("off")
+            ax.text(0.5, 0.5, "Run analysis or load results to view heatmaps.",
+                    ha="center", va="center")
+            return fig
+
+        needed = {"SampleNumber", "cell_cluster", "neighbor_cluster", "ChanceCorrectedInteraction"}
+        if not needed.issubset(set(res.columns)):
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.axis("off")
+            ax.text(0.5, 0.5, f"Missing columns for heatmap:\n{sorted(list(needed - set(res.columns)))}",
+                    ha="center", va="center")
+            return fig
+
+        # Determine selected sample (stored as string)
+        sample = input.sample_for_heatmap()
+        if not sample:
+            sample = str(sorted(res["SampleNumber"].astype(str).unique().tolist())[0])
+
+        temp = res[res["SampleNumber"].astype(str) == str(sample)].copy()
+
+        if temp.empty:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.axis("off")
+            ax.text(0.5, 0.5, f"No data for sample {sample}.", ha="center", va="center")
+            return fig
+
+        # Pivot wide (like pivot_wider), NA -> 0
+        mat = (
+            temp.pivot_table(
+                index="cell_cluster",
+                columns="neighbor_cluster",
+                values="ChanceCorrectedInteraction",
+                aggfunc="mean",
+            )
+            .fillna(0.0)
+        )
+
+        # Optional: stable ordering
+        mat = mat.sort_index().sort_index(axis=1)
+
+        # Clip to [-3, 3] to match your breaks range
+        mat_vals = np.clip(mat.to_numpy(dtype=float), -3.0, 3.0)
+
+        # pheatmap-style diverging palette
+        cmap = LinearSegmentedColormap.from_list(
+            "interaction_div",
+            ["#4A6A91", "#FCFCFC", "#FFC06B"],
+        )
+        norm = TwoSlopeNorm(vmin=-3.0, vcenter=0.0, vmax=3.0)
+
+        # Plot
+        fig, ax = plt.subplots(figsize=(8, 8))
+        im = ax.imshow(mat_vals, cmap=cmap, norm=norm, aspect="auto", interpolation="nearest")
+
+        ax.set_title(f"Interaction heatmap of sample {sample}")
+
+        ax.set_xticks(range(mat.shape[1]))
+        ax.set_xticklabels(mat.columns.tolist(), rotation=90, fontsize=7)
+
+        ax.set_yticks(range(mat.shape[0]))
+        ax.set_yticklabels(mat.index.tolist(), fontsize=7)
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("ChanceCorrectedInteraction")
+
+        fig.tight_layout()
+        return fig
 
 app = App(app_ui, server)

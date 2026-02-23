@@ -28,7 +28,7 @@ def _zenity_available() -> bool:
 
 def pick_open_csv_dialog(title: str = "Select parameter CSV", initialdir: str | None = None) -> str:
     """Open a file selection dialog for a CSV file."""
-    # Linux: prefer zenity (GNOME-style)
+    #Linux: prefer zenity (GNOME-style), tkinter is unusable on hihg DPI screens
     if _is_linux() and _zenity_available():
         try:
             cmd = ["zenity", "--file-selection", "--title", title]
@@ -41,7 +41,7 @@ def pick_open_csv_dialog(title: str = "Select parameter CSV", initialdir: str | 
         except Exception:
             pass
 
-    # Fallback: tkinter
+    # Fallback is tkinter, need to find an alternative
     try:
         import tkinter as tk
         from tkinter import filedialog
