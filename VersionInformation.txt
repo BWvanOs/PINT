@@ -1,4 +1,8 @@
 Version history
+0.4
+New version switches to absolute thresholding as a default, relative thresholding still available (percentile based) but by default off
+Analysis order still the same: Winsorization -> Thresholding -> Denoising -> Transformation -> Normalization, with all steps being optional 
+
 0.3.1
 Move the viewer to /pint_app
 Created /apps/viewer_app.py that direct asgi to view.py so it is easier to move the viewer and or refractor it

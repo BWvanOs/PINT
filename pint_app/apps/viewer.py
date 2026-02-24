@@ -202,7 +202,7 @@ app_ui = ui.page_sidebar(
                             ui.card(
                                 ui.card_header("Thresholding"),
                                 ui.row(
-                                    ui.column(6, ui.input_slider("abs_threshold_val", "Absolute threshold (counts)", min=0.0, max=100.0, value=2.5, step=0.1)),
+                                    ui.column(6, ui.input_slider("abs_threshold_val", "Absolute threshold (counts)", min=0.0, max=100.0, value=1, step=0.1)),
                                     ui.column(6, ui.input_slider("thr_fraction_val", "Fraction of max (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
                                 ),
                                 ui.row(
