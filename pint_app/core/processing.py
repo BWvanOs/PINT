@@ -67,6 +67,31 @@ def apply_threshold_fraction_of_max(img: np.ndarray, thr_fraction: float) -> np.
     return np.where(img >= cutoff, img, 0.0)
 
 
+def apply_threshold_absolute(img: np.ndarray, thr_abs: float) -> np.ndarray:
+    """Zero pixels below an absolute cutoff value.
+
+    Useful for IMC "dual count" background suppression, where you may want to
+    hard-zero everything below e.g. 2.5.
+
+    Parameters
+    ----------
+    img:
+        Input image.
+    thr_abs:
+        Absolute cutoff in the same units as the image (raw counts / duals).
+        Values <= 0 return img unchanged.
+    """
+    try:
+        thr_abs = float(thr_abs)
+    except Exception:
+        thr_abs = 0.0
+
+    if not np.isfinite(thr_abs) or thr_abs <= 0.0:
+        return img
+
+    return np.where(img >= thr_abs, img, 0.0)
+
+
 def strength_to_percentile(s: float, eps: float = 0.005) -> float:
     """Map a UI "strength" slider (0..1) to a local percentile cutoff.
 

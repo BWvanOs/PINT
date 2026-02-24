@@ -16,6 +16,7 @@ from pint_app.core.dialogs import pick_folder_dialog, pick_open_csv_dialog, pick
 from pint_app.core.processing import (
     clamp01,
     apply_winsor,
+    apply_threshold_absolute,
     apply_threshold_fraction_of_max,
     arcsinh_transform,
     apply_speckle_suppress,
@@ -90,7 +91,7 @@ app_ui = ui.page_sidebar(
                 overflow: hidden;
                 text-align: left;
             }
-            .param-table-wrap th { font-weight: 600; text-align: left; }
+            .param-table-wrap th { font-weight: 750; text-align: left; }
 
             /* Make sure the sidebar overlays other content when open */
             .bslib-sidebar-layout > .bslib-sidebar { z-index: 1050; }
@@ -201,11 +202,22 @@ app_ui = ui.page_sidebar(
                             ui.card(
                                 ui.card_header("Thresholding"),
                                 ui.row(
-                                    ui.column(6, ui.input_slider("threshold_val", "Absolute threshold (0-100)", min=0.0, max=100.0, value=2.5, step=0.1)),
-                                    ui.column(6, ui.input_slider("threshold_val", "Percentile threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01)),
+                                    ui.column(6, ui.input_slider("abs_threshold_val", "Absolute threshold (counts)", min=0.0, max=100.0, value=2.5, step=0.1)),
+                                    ui.column(6, ui.input_slider("thr_fraction_val", "Fraction of max (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
                                 ),
                                 ui.row(
-                                    ui.column(6, ui.input_checkbox("doThreshold", "Apply threshold", value=True)),
+                                    ui.column(
+                                        3,
+                                        ui.tags.div(
+                                            ui.input_checkbox("doAbsThreshold", "Do Abs thresholding", value=True),
+                                        ),
+                                    ),
+                                    ui.column(
+                                        3,
+                                        ui.tags.div(
+                                            ui.input_checkbox("doThreshold", "Do Perc thresholding", value=False),
+                                        ),
+                                    ),
                                     ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
                                 ),
                             ),
@@ -226,7 +238,7 @@ app_ui = ui.page_sidebar(
                                     ui.row(
                                         ui.column(
                                             12,
-                                            ui.output_ui("noise_tooltip"),   # dynamic helper + tooltip
+                                            ui.output_ui("noise_tooltip"),
                                         ),
                                     ),
                                 ),
@@ -398,7 +410,9 @@ def server(input, output, session):
             low=float(input.winsor_low()),
             high=float(input.winsor_high()),
             do_threshold=bool(input.doThreshold()),
-            thr_val=float(input.threshold_val()),
+            thr_val=float(input.thr_fraction_val()),
+            do_abs_threshold=bool(input.doAbsThreshold()),
+            abs_thr_val=float(input.abs_threshold_val()),
             do_noise=bool(input.doNoise()),
             noise_strength=s,
             noise_percentile=p,
@@ -431,7 +445,10 @@ def server(input, output, session):
             session.send_input_message("winsor_high", {"value": float(row.get("High", 1.0))})
 
             session.send_input_message("doThreshold", {"value": bool(row.get("DoThr", False))})
-            session.send_input_message("threshold_val", {"value": float(row.get("ThrVal", 0.0))})
+            session.send_input_message("thr_fraction_val", {"value": float(row.get("ThrVal", 0.0))})
+
+            session.send_input_message("doAbsThreshold", {"value": bool(row.get("DoAbsThr", False))})
+            session.send_input_message("abs_threshold_val", {"value": float(row.get("AbsThrVal", 0.0))})
 
             session.send_input_message("doNoise", {"value": bool(row.get("Noise", False))})
             winsz = int(row.get("WinSz", int(input.window_size())))
@@ -718,19 +735,28 @@ def server(input, output, session):
         if not c:
             return
         df = params_df.get()
+        # Fraction-of-max threshold (0..1)
         try:
-            thr_val = float(input.threshold_val())
+            thr_val = float(input.thr_fraction_val())
         except Exception:
             thr_val = 0.0
         thr_val = clamp01(thr_val)
+
+        # Absolute threshold (counts)
+        try:
+            abs_thr_val = float(input.abs_threshold_val())
+        except Exception:
+            abs_thr_val = 0.0
 
         params_df.set(
             update_channel_row(
                 df,
                 c,
                 {
+                    "DoAbsThr": bool(input.doAbsThreshold()),
+                    "AbsThrVal": float(abs_thr_val),
                     "DoThr": bool(input.doThreshold()),
-                    "ThrVal": thr_val,
+                    "ThrVal": float(thr_val),
                 },
             )
         )
@@ -826,9 +852,17 @@ def server(input, output, session):
                 if hi > lo:
                     img = apply_winsor(img, lo, hi)
 
-            # Step 2: global threshold (fraction of max)
+            # Step 2a: absolute threshold (raw counts)
+            if input.doAbsThreshold():
+                try:
+                    abs_thr = float(input.abs_threshold_val())
+                except Exception:
+                    abs_thr = 0.0
+                img = apply_threshold_absolute(img, abs_thr)
+
+            # Step 2b: global threshold (fraction of max)
             if input.doThreshold():
-                thr = clamp01(input.threshold_val())
+                thr = clamp01(input.thr_fraction_val())
                 img = apply_threshold_fraction_of_max(img, thr)
 
             # Step 3: speckle suppression

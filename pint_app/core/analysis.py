@@ -9,6 +9,7 @@ from tifffile import imwrite
 from pint_app.core.load_tiffs import load_tiffs_raw
 from pint_app.core.processing import (
     winsorize_with_bounds,
+    apply_threshold_absolute,
     apply_threshold_fraction_of_max,
     strength_to_percentile,
     apply_speckle_suppress,
@@ -149,6 +150,9 @@ def main():
             doThr   = bool(r.get("DoThr",     DEFAULTS["DoThr"]))
             thrN    = float(r.get("ThrVal",   DEFAULTS["ThrVal"]))     # 0..1
 
+            doAbsThr = bool(r.get("DoAbsThr", DEFAULTS.get("DoAbsThr", False)))
+            absThr   = float(r.get("AbsThrVal", DEFAULTS.get("AbsThrVal", 0.0)))
+
             doNoise = bool(r.get("Noise",     DEFAULTS["Noise"]))
             sVal    = float(r.get("NStr",     DEFAULTS["NStr"]))       # UI strength 0..1
             pCsv    = float(r.get("NPrctl",   DEFAULTS["NPrctl"]))     # if present in CSV
@@ -172,6 +176,12 @@ def main():
                 rawFloor, rawCeil = preMin, preMax
 
             # 2) Global threshold (cutoff = thr * max(after winsor))
+            abs_thr_used = np.nan
+            if doAbsThr and np.isfinite(absThr) and absThr > 0.0:
+                frame = apply_threshold_absolute(frame, absThr)
+                abs_thr_used = float(absThr)
+
+            # 3) Fraction-of-max threshold (cutoff = thr * max(after winsor/absThr))
             if doThr and thrN > 0.0:
                 mx = float(np.nanmax(frame))
                 if mx > 0.0:
@@ -183,13 +193,13 @@ def main():
             else:
                 thr_used = np.nan
 
-            # 3) Local percentile speckle removal + neighbor rule (viewer parity)
+            # 4) Local percentile speckle removal + neighbor rule (viewer parity)
             pct_used = np.nan
             if doNoise and winSz >= 1 and (0.0 < pUsed < 1.0):
                 frame = apply_speckle_suppress(frame, size=winSz, perc=pUsed, neighbor_limit=2)
                 pct_used = float(pUsed)
 
-            # 4) Optional arcsinh (after denoise, before normalization)
+            # 5) Optional arcsinh (after denoise, before normalization)
             asinh_applied = False
             asinh_cofac = np.nan
             if doAsinh:
@@ -198,7 +208,7 @@ def main():
                 asinh_applied = True
                 asinh_cofac = float(used_cofac)
 
-            # 5) Optional normalization
+            # 6) Optional normalization
             normalized = False
             gmin_used = np.nan
             gmax_used = np.nan
@@ -238,6 +248,7 @@ def main():
                 "WinsorLower":    float(rawFloor),
                 "WinsorUpper":    float(rawCeil),
                 "Threshold":      thr_used,
+                "AbsThreshold":   abs_thr_used,
                 "Strength":       float(sVal),
                 "Percentile":     pct_used,
                 "WindowSize":     int(winSz),

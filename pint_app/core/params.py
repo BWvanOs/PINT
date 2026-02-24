@@ -21,6 +21,7 @@ import pandas as pd
 
 PARAM_COLUMNS: list[str] = [
     "Channel", "DoWinsor", "Low", "High",
+    "DoAbsThr", "AbsThrVal",
     "DoThr", "ThrVal",
     "Noise", "NStr", "NPrctl", "WinSz",
     "DoNorm", "NormScope",
@@ -33,6 +34,8 @@ DEFAULTS: dict[str, Any] = {
     "DoWinsor": False,
     "Low": 0.0,
     "High": 0.99,
+    "DoAbsThr": False,
+    "AbsThrVal": 0.0,
     "DoThr": False,
     "ThrVal": 0.0,
     "Noise": False,
@@ -51,6 +54,8 @@ DISPLAY_RENAME_MAP: dict[str, str] = {
     "DoWinsor": "Win",
     "Low": "Low",
     "High": "High",
+    "DoAbsThr": "AbsThr?",
+    "AbsThrVal": "AbsThr",
     "DoThr": "Thr?",
     "ThrVal": "ThrVal",
     "Noise": "Noise",
@@ -72,6 +77,8 @@ def make_params_df(
     high: float,
     do_threshold: bool,
     thr_val: float,
+    do_abs_threshold: bool,
+    abs_thr_val: float,
     do_noise: bool,
     noise_strength: float,
     noise_percentile: float,
@@ -92,6 +99,8 @@ def make_params_df(
                 "High": float(high),
                 "DoThr": bool(do_threshold),
                 "ThrVal": float(thr_val),
+                "DoAbsThr": bool(do_abs_threshold),
+                "AbsThrVal": float(abs_thr_val),
                 "Noise": bool(do_noise),
                 "NStr": float(noise_strength),
                 "NPrctl": float(noise_percentile),
@@ -179,8 +188,8 @@ def coerce_params_df(
     # Drop unknown/deprecated columns and enforce column order
     df = df[list(PARAM_COLUMNS)].copy()
 
-    bool_cols = ["DoWinsor", "DoThr", "Noise", "DoNorm", "DoAsinh"]
-    float_cols = ["Low", "High", "ThrVal", "NStr", "NPrctl"]
+    bool_cols = ["DoWinsor", "DoAbsThr", "DoThr", "Noise", "DoNorm", "DoAsinh"]
+    float_cols = ["Low", "High", "AbsThrVal", "ThrVal", "NStr", "NPrctl"]
     int_cols = ["WinSz", "Cofac"]
 
     for c in bool_cols:
