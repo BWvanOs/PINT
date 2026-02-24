@@ -1,13 +1,42 @@
-.vscode/
-
-**/__pycache__/
+# =========================
+# Python / packaging stuff to ignore when pushing to github
+# =========================
+__pycache__/
 *.py[cod]
+*$py.class
+*.pyd
+*.so
 
-*.egg-info/
-dist/
 build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.wheels/
+MANIFEST
 
-.DS_Store
+# Virtualenv / conda
+.venv/
+venv/
+ENV/
+env/
+conda-env/
+.env
+.env.*
 
-PINT-main-core/
-PINT-main/
+# Jupyter / IPython
+.ipynb_checkpoints/
+.profile_default/
+.ipython/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/

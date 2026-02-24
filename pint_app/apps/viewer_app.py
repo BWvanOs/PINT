@@ -1,3 +1,3 @@
-import viewer  # imports /repo-root/viewer.py
+"""ASGI mountable app for the viewer (mounted at '/')."""
 
-app = viewer.app
+from pint_app.apps.viewer import app
