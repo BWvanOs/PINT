@@ -22,9 +22,10 @@ def viewer():
     raise SystemExit(subprocess.call(cmd))
 
 def analysis():
-    """Run the batch analysis script directly."""
-    analysis_py = _root() / "analysis.py"
-    if not analysis_py.exists():
-        print(f"[pint-analysis] Could not find {analysis_py}", file=sys.stderr)
+    """Run batch analysis via the installed module entry point."""
+    cmd = [sys.executable, "-m", "pint_app.core.analysis", *sys.argv[1:]]
+    try:
+        raise SystemExit(subprocess.call(cmd))
+    except FileNotFoundError as e:
+        print(f"[pint-analysis] Python executable not found: {e}", file=sys.stderr)
         raise SystemExit(2)
-    raise SystemExit(subprocess.call([sys.executable, str(analysis_py), *sys.argv[1:]]))

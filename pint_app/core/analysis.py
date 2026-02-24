@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
 import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from tifffile import imwrite
 
-# Reuse your loader
-from load_tiffs import load_tiffs_raw
-
+from pint_app.core.load_tiffs import load_tiffs_raw
 from pint_app.core.processing import (
     winsorize_with_bounds,
     apply_threshold_fraction_of_max,

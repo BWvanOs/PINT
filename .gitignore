@@ -1,6 +1,7 @@
 # =========================
 # Python / packaging stuff to ignore when pushing to github
 # =========================
+gitignoreTest.py
 __pycache__/
 *.py[cod]
 *$py.class

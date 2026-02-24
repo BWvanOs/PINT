@@ -5,13 +5,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 from shiny import App, ui, render, reactive
-from load_tiffs import load_tiffs_raw
 from scipy.ndimage import grey_opening, uniform_filter
 import os, sys, subprocess
 import shutil
 import warnings
 
-
+from pint_app.core.load_tiffs import load_tiffs_raw
 from pint_app.core.formatting import fmt1
 from pint_app.core.dialogs import pick_folder_dialog, pick_open_csv_dialog, pick_save_csv_dialog
 from pint_app.core.processing import (
@@ -196,12 +195,15 @@ app_ui = ui.page_sidebar(
                             ),
                         ),
 
-                        #Panel 2 Global thresholding
+                        #Panel 2 Thresholding
                         ui.column(
                             3,
                             ui.card(
-                                ui.card_header("Global Threshold"),
-                                ui.row(ui.column(12, ui.input_slider("threshold_val", "Threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01))),
+                                ui.card_header("Thresholding"),
+                                ui.row(
+                                    ui.column(6, ui.input_slider("threshold_val", "Absolute threshold (0-100)", min=0.0, max=100.0, value=2.5, step=0.1)),
+                                    ui.column(6, ui.input_slider("threshold_val", "Percentile threshold (0-1)", min=0.0, max=1.0, value=0.1, step=0.01)),
+                                ),
                                 ui.row(
                                     ui.column(6, ui.input_checkbox("doThreshold", "Apply threshold", value=True)),
                                     ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
@@ -960,13 +962,12 @@ def server(input, output, session):
         df.to_csv(params_path, index=False)
         print(f"✅ Saved parameter table → {params_path}")
         ##Tries to open de analysis.py file from the same folder as the viewer.
-        script = Path(__file__).with_name("analysis.py")
-        ##Uses the same python interpreter to run the scipt with the input created above.
-        ##If that fails it will throw the appropriate errors.
-        cmd = [sys.executable, str(script),
+        cmd = [
+            sys.executable, "-m", "pint_app.core.analysis",
             "--input-dir", folder,
             "--params-csv", params_path,
-            "--output-dir", out_dir]
+            "--output-dir", out_dir,
+        ]   
         print("▶️ Running analysis:", " ".join(cmd))
         try:
             subprocess.run(cmd, check=True)
