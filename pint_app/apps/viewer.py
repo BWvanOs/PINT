@@ -539,8 +539,21 @@ def server(input, output, session):
             ##Purely for visibilty, the actual folder path used is put into the text box
             session.send_input_message("path", {"value": folder})
             print(">>> Loading triggered with folder:", folder)
-            ##Loads the OME.tiff
-            imgs, chs = load_tiffs_raw(folder)
+            ##Loads the OME.tiff, also checks if channels are consistent and throws an error if one of the images if different from the first one
+            ##Error from load_tiffs_raw is passed on to the interface
+            try:
+                imgs, chs = load_tiffs_raw(folder)  # ideally load_tiffs_raw(folder, validate_consistent=True)
+            except ValueError as e:
+                ui.modal_show(
+                    ui.modal(
+                        ui.h4("Channel mismatch..."),
+                        ui.pre(str(e)),
+                        easy_close=True,
+                        footer=ui.modal_button("OK"),
+                    ),
+                    session=session,
+                )
+                return
             ##If the folder didn't contain any images:
             if not imgs:
                 print("⚠️ No images found in selected folder.")

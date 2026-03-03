@@ -53,6 +53,15 @@ def apply_winsor(img: np.ndarray, lo_q: float, hi_q: float) -> np.ndarray:
     """Winsorize an image by clipping to quantiles."""
     return winsorize_with_bounds(img, lo_q, hi_q)[0]
 
+def apply_threshold_absolute(img: np.ndarray, thr_abs: float) -> np.ndarray:
+    """Zero pixels below an absolute cutoff value (IMC dual-count background)."""
+    try:
+        thr_abs = float(thr_abs)
+    except Exception:
+        thr_abs = 0.0
+    if not np.isfinite(thr_abs) or thr_abs <= 0.0:
+        return img
+    return np.where(img >= thr_abs, img, 0.0)
 
 def apply_threshold_fraction_of_max(img: np.ndarray, thr_fraction: float) -> np.ndarray:
     """Zero pixels below `thr_fraction * max(img)`.
@@ -65,31 +74,6 @@ def apply_threshold_fraction_of_max(img: np.ndarray, thr_fraction: float) -> np.
     m = float(np.nanmax(img))
     cutoff = thr_fraction * (m if m > 0 else 1.0)
     return np.where(img >= cutoff, img, 0.0)
-
-
-def apply_threshold_absolute(img: np.ndarray, thr_abs: float) -> np.ndarray:
-    """Zero pixels below an absolute cutoff value.
-
-    Useful for IMC "dual count" background suppression, where you may want to
-    hard-zero everything below e.g. 2.5.
-
-    Parameters
-    ----------
-    img:
-        Input image.
-    thr_abs:
-        Absolute cutoff in the same units as the image (raw counts / duals).
-        Values <= 0 return img unchanged.
-    """
-    try:
-        thr_abs = float(thr_abs)
-    except Exception:
-        thr_abs = 0.0
-
-    if not np.isfinite(thr_abs) or thr_abs <= 0.0:
-        return img
-
-    return np.where(img >= thr_abs, img, 0.0)
 
 
 def strength_to_percentile(s: float, eps: float = 0.005) -> float:
@@ -145,18 +129,22 @@ def arcsinh_transform(img: np.ndarray, cofactor: int | float = 5) -> np.ndarray:
     return np.arcsinh(img / float(cofac))
 
 
-def normalize_minmax(img: np.ndarray, vmin: float | None = None, vmax: float | None = None) -> np.ndarray:
+def normalize_minmax(img: np.ndarray, vmin=None, vmax=None) -> np.ndarray:
     """Normalize image to [0,1] using min/max.
 
     If vmin/vmax are not provided, uses nanmin/nanmax of `img`.
     """
+    x = img.astype(np.float32, copy=False)
     if vmin is None:
-        vmin = float(np.nanmin(img))
+        vmin = float(np.nanmin(x))
     if vmax is None:
-        vmax = float(np.nanmax(img))
-    if not (np.isfinite(vmin) and np.isfinite(vmax)) or vmax <= vmin:
-        return img
-    return (img - float(vmin)) / (float(vmax) - float(vmin))
+        vmax = float(np.nanmax(x))
+
+    if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmax <= vmin):
+        return np.zeros_like(x, dtype=np.float32)
+
+    y = (x - vmin) / (vmax - vmin)
+    return np.clip(np.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0) 
 
 
 def global_minmax_for_channel(images_dict: dict, channels_dict: dict, channel_name: str):

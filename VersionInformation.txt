@@ -1,4 +1,15 @@
 Version history
+0.4.1
+Added more comments to explani workings of the pipeline
+bugfixes:
+    -analysis.py main() would turn "Not a Number"/NaN" to "nan" and pd.NA would not pick up the missing values, leading to unexpected behaviour
+    -If you added a stack of tiff where images >1 through n contained all channelnames from image 1, but channelsnames(1) != channelnames(!1) it would continue loading.
+     it now take image 1 channels as ground truth and check for each subsequent imag of the channel names match exactly.
+
+open problems
+    -If global normalization for a given channels fails it's not fed back tot he user. It is stored in the resulting csv.
+
+
 0.4
 New version switches to absolute thresholding as a default, relative thresholding still available (percentile based) but by default off
 Analysis order still the same: Winsorization -> Thresholding -> Denoising -> Transformation -> Normalization, with all steps being optional 
@@ -18,3 +29,4 @@ Added a neighborhood analysis function. This one implements KD-tree radius query
 Introduces functional button that opens a new tab for an eventual neigborhood analysis
 
 0.1.0
+First version with functional normalization tool
