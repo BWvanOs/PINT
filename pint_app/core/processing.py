@@ -31,27 +31,68 @@ def sanitize_cofactor(cofactor: int | float) -> int:
     return max(2, min(10, cofac))
 
 
-def winsorize_with_bounds(img: np.ndarray, lo_q: float, hi_q: float) -> tuple[np.ndarray, float, float]:
+def winsorize_with_bounds(
+    img: np.ndarray,
+    lo_q: float,
+    hi_q: float,
+    min_upper_bound: float = 5.0,
+) -> tuple[np.ndarray, float, float]:
     """Winsorize an image by quantiles and also return the (low, high) bounds used.
 
-    If the quantiles are invalid (hi<=lo) the image is returned unchanged and the
-    bounds are the raw min/max.
+    Important:
+      - The upper winsor bound is floored at `min_upper_bound`.
+      - This prevents rare positive staining from being clipped into background.
+
+    Example:
+      q_high = 3.7, min_upper_bound = 5.0 -> use 5.0 as upper clip bound
     """
     lo_q = clamp01(lo_q)
     hi_q = clamp01(hi_q)
+
+    try:
+        min_upper_bound = float(min_upper_bound)
+    except Exception:
+        min_upper_bound = 5.0
 
     if hi_q <= lo_q:
         mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
         return img, mn, mx
 
     q_low, q_high = np.nanquantile(img, [lo_q, hi_q])
+
+    if np.isnan(q_low) or np.isnan(q_high):
+        mn, mx = float(np.nanmin(img)), float(np.nanmax(img))
+        return img, mn, mx
+
+    if np.isfinite(min_upper_bound):
+        q_high = max(float(q_high), float(min_upper_bound))
+
+    # Safety: make sure upper is not below lower
+    if q_high < q_low:
+        q_high = q_low
+
     out = np.clip(img, q_low, q_high)
     return out, float(q_low), float(q_high)
 
 
-def apply_winsor(img: np.ndarray, lo_q: float, hi_q: float) -> np.ndarray:
-    """Winsorize an image by clipping to quantiles."""
-    return winsorize_with_bounds(img, lo_q, hi_q)[0]
+def apply_winsor(
+    img: np.ndarray,
+    lo_q: float,
+    hi_q: float,
+    min_upper_bound: float = 5.0,
+) -> np.ndarray:
+    """Winsorize an image by clipping to quantiles.
+
+    The upper clip bound is floored at `min_upper_bound` so sparse true signal
+    is not clipped down into the Hyperion background range.
+    """
+    return winsorize_with_bounds(
+        img,
+        lo_q,
+        hi_q,
+        min_upper_bound=min_upper_bound,
+    )[0]
+
 
 def apply_threshold_absolute(img: np.ndarray, thr_abs: float) -> np.ndarray:
     """Zero pixels below an absolute cutoff value (IMC dual-count background)."""
@@ -62,6 +103,7 @@ def apply_threshold_absolute(img: np.ndarray, thr_abs: float) -> np.ndarray:
     if not np.isfinite(thr_abs) or thr_abs <= 0.0:
         return img
     return np.where(img >= thr_abs, img, 0.0)
+
 
 def apply_threshold_fraction_of_max(img: np.ndarray, thr_fraction: float) -> np.ndarray:
     """Zero pixels below `thr_fraction * max(img)`.
@@ -144,7 +186,7 @@ def normalize_minmax(img: np.ndarray, vmin=None, vmax=None) -> np.ndarray:
         return np.zeros_like(x, dtype=np.float32)
 
     y = (x - vmin) / (vmax - vmin)
-    return np.clip(np.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0) 
+    return np.clip(np.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
 
 
 def global_minmax_for_channel(images_dict: dict, channels_dict: dict, channel_name: str):
@@ -181,37 +223,50 @@ def global_winsor_range_for_channel(
     channel_name: str,
     lo: float,
     hi: float,
+    min_upper_bound: float = 5.0,
 ):
     """Compute global winsor range for a channel.
 
     The global range is defined as:
       - min over samples of q_lo
-      - max over samples of q_hi
+      - max over samples of adjusted q_hi
 
-    Returns None if no sample provides a valid quantile pair.
+    Where adjusted q_hi = max(raw q_hi, min_upper_bound)
     """
     lo = clamp01(lo)
     hi = clamp01(hi)
     if hi <= lo:
         return None
 
-    gmin, gmax = np.inf, -np.inf
+    try:
+        min_upper_bound = float(min_upper_bound)
+    except Exception:
+        min_upper_bound = 5.0
+
+    gmin = np.inf
+    gmax = -np.inf
     found = False
 
     for sample, arr in images_dict.items():
         chlist = channels_dict.get(sample, [])
         if channel_name not in chlist:
             continue
+
         idx = chlist.index(channel_name)
         qlo, qhi = np.nanquantile(arr[idx], [lo, hi])
+
         if np.isnan(qlo) or np.isnan(qhi):
             continue
+
+        qhi = max(float(qhi), float(min_upper_bound))
+
         gmin = min(gmin, float(qlo))
         gmax = max(gmax, float(qhi))
         found = True
 
     if not found or not np.isfinite(gmin) or not np.isfinite(gmax) or gmax <= gmin:
         return None
+
     return float(gmin), float(gmax)
 
 
@@ -222,20 +277,31 @@ def image_winsor_range(
     sample: str,
     lo: float,
     hi: float,
+    min_upper_bound: float = 5.0,
 ):
     """Compute winsor range for a single sample/channel."""
     if not sample or sample not in images_dict:
         return None
+
     chlist = channels_dict.get(sample, [])
     if channel_name not in chlist:
         return None
+
     lo = clamp01(lo)
     hi = clamp01(hi)
     if hi <= lo:
         return None
 
+    try:
+        min_upper_bound = float(min_upper_bound)
+    except Exception:
+        min_upper_bound = 5.0
+
     idx = chlist.index(channel_name)
     qlo, qhi = np.nanquantile(images_dict[sample][idx], [lo, hi])
+
     if np.isnan(qlo) or np.isnan(qhi):
         return None
+
+    qhi = max(float(qhi), float(min_upper_bound))
     return float(qlo), float(qhi)

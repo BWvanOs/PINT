@@ -470,8 +470,10 @@ def server(input, output, session):
     def _cycle(lst, current, step):
         return cycle_list(lst, current, step)
 
+    WINSOR_MIN_UPPER_BOUND = 5.0
+
     def _apply_winsor(cur: np.ndarray, lo_q: float, hi_q: float) -> np.ndarray:
-        return apply_winsor(cur, lo_q, hi_q)
+        return apply_winsor(cur, lo_q, hi_q, min_upper_bound=WINSOR_MIN_UPPER_BOUND)
 
     def _strength_to_percentile(s: float, eps: float = 0.005) -> float:
         return strength_to_percentile(s, eps=eps)
@@ -863,7 +865,7 @@ def server(input, output, session):
                 lo = clamp01(input.winsor_low())
                 hi = clamp01(input.winsor_high())
                 if hi > lo:
-                    img = apply_winsor(img, lo, hi)
+                    img = apply_winsor(img, lo, hi, min_upper_bound=WINSOR_MIN_UPPER_BOUND)
 
             # Step 2a: absolute threshold (raw counts)
             if input.doAbsThreshold():

@@ -24,6 +24,8 @@ from pint_app.core.params import coerce_params_df, channels_needing_global, DEFA
 
 # ----------------------> helpers <----------------------
 ## Use these arguments to run the script from the command line
+WINSOR_MIN_UPPER_BOUND = 5.0
+
 def parse_args():
     p = argparse.ArgumentParser(description="Batch-process IMC stacks using viewer parameters.")
     p.add_argument("--input-dir", required=True, help="Folder containing OME-TIFF images")
@@ -102,7 +104,14 @@ def precompute_global_minmax(
         do_win, lo, hi = winsor_cfg.get(ch, (False, 0.0, 1.0))
 
         if do_win and hi > lo:
-            out[ch] = global_winsor_range_for_channel(images, channels, ch, lo, hi)
+            out[ch] = global_winsor_range_for_channel(
+                images,
+                channels,
+                ch,
+                lo,
+                hi,
+                min_upper_bound=WINSOR_MIN_UPPER_BOUND,
+            )
         else:
             out[ch] = global_minmax_for_channel(images, channels, ch)
 
@@ -197,7 +206,12 @@ def main():
             ##------------------------------------> Calling the thresholding/norm etc function <----------------------------##
             #1)Winsorization, clipping values
             if doWin:
-                frame, rawFloor, rawCeil = winsorize_with_bounds(frame, lo_q, hi_q)
+                frame, rawFloor, rawCeil = winsorize_with_bounds(
+                    frame,
+                    lo_q,
+                    hi_q,
+                    min_upper_bound=WINSOR_MIN_UPPER_BOUND,
+                )
             else:
                 rawFloor, rawCeil = preMin, preMax
 

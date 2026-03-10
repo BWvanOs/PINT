@@ -2,15 +2,17 @@ from pathlib import Path
 import tifffile
 import numpy as np
 
+##Function to het all the names from the pages. It uses the TIFF standard tag 285 for the name 
 def _channel_names_from_page_tags(tif: tifffile.TiffFile):
     """
-    Preferred: read TIFF 'PageName' (tag 285) per page.
-    Returns list[str] or None if not present.
+    Preferred: read THE pagename of the TIFF form the 'PageName' tag (tag 285) per page.
+    Returns list[str] or None if not present. 
     """
     names = []
     has_any = False
     for i, page in enumerate(tif.pages):
-        tag = page.tags.get("PageName") or page.tags.get(285)
+        ##removed tag = page.tags.get("PageName") as underwater is just reads tag 285
+        tag = page.tags.get(285)
         name = None
         if tag is not None:
             val = tag.value
@@ -23,7 +25,7 @@ def _channel_names_from_page_tags(tif: tifffile.TiffFile):
         else:
             names.append(None)
     if has_any:
-        # fill missing with Channel#
+        ##fill missing with Channelnr, might return a list partially filled with channel names
         return [n if n else f"Channel{i+1}" for i, n in enumerate(names)]
     return None
 
