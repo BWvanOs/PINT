@@ -12,7 +12,12 @@ import warnings
 
 from pint_app.core.load_tiffs import load_tiffs_raw
 from pint_app.core.formatting import fmt1
-from pint_app.core.dialogs import pick_folder_dialog, pick_open_csv_dialog, pick_save_csv_dialog
+from pint_app.core.dialogs import (
+    pick_folder_dialog,
+    pick_open_csv_dialog,
+    pick_save_csv_dialog,
+    pick_save_png_dialog,
+)
 from pint_app.core.processing import (
     clamp01,
     apply_winsor,
@@ -25,6 +30,7 @@ from pint_app.core.processing import (
     global_minmax_for_channel as compute_global_minmax_for_channel,
     global_winsor_range_for_channel as compute_global_winsor_range_for_channel,
     image_winsor_range as compute_image_winsor_range,
+    process_image_pipeline,
 )
 from pint_app.core.selection import cycle_list, order_by_canonical
 from pint_app.core.params import (
@@ -38,6 +44,61 @@ from pint_app.core.params import (
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
 
+COMPOSITE_PALETTE = {
+    "Cyan":    (0.00, 1.00, 1.00),
+    "Magenta": (1.00, 0.00, 1.00),
+    "Yellow":  (1.00, 1.00, 0.00),
+    "Green":   (0.00, 1.00, 0.00),
+    "Red":     (1.00, 0.00, 0.00),
+    "Blue":    (0.00, 0.40, 1.00),
+    "Orange":  (1.00, 0.55, 0.00),
+    "White":   (1.00, 1.00, 1.00),
+}
+
+COMPOSITE_COLOR_CHOICES = list(COMPOSITE_PALETTE.keys())
+MAX_COMPOSITE_CHANNELS = 8
+
+
+def make_composite_slot(slotIdx: int):
+    defaultColor = COMPOSITE_COLOR_CHOICES[(slotIdx - 1) % len(COMPOSITE_COLOR_CHOICES)]
+    return ui.row(
+        ui.column(
+            1,
+            ui.input_checkbox(f"comp_enable_{slotIdx}", "", value=(slotIdx <= 3)),
+        ),
+        ui.column(
+            6,
+            ui.input_select(
+                f"comp_channel_{slotIdx}",
+                "",
+                choices=[],
+                selected=None,
+                width="100%",
+            ),
+        ),
+        ui.column(
+            3,
+            ui.input_select(
+                f"comp_color_{slotIdx}",
+                "",
+                choices=COMPOSITE_COLOR_CHOICES,
+                selected=defaultColor,
+                width="100%",
+            ),
+        ),
+        ui.column(
+            2,
+            ui.input_slider(
+                f"comp_gain_{slotIdx}",
+                "",
+                min=0.1,
+                max=3.0,
+                value=1.0,
+                step=0.1,
+            ),
+        ),
+        class_="align-items-end gy-0",
+    )
 
 app_ui = ui.page_sidebar(
     # This is the right side of the window that collapses when opening the sidebar.
@@ -55,7 +116,7 @@ app_ui = ui.page_sidebar(
         ui.tags.style("""
             :root{
                 /* You can tweak these two and nothing else! */
-                --controls-h: 500px;     /* total height of the top area (toolbar + panels) */
+                --controls-h: 350px;     /* total height of the top area (toolbar + panels) */
                 --controls-top-h: 170px; /* height of the toolbar row */
             }
 
@@ -63,13 +124,17 @@ app_ui = ui.page_sidebar(
             .flex-col { display:flex; flex-direction:column; height:100vh; }
 
             .controls-fixed {
-                flex: 0 0 var(--controls-h);
+                flex: 0 0 auto;
+                min-height: var(--controls-h);
                 display: flex;
                 flex-direction: column;
-                overflow: hidden;
+                overflow: visible;
             }
-            .controls-top  { flex: 0 0 var(--controls-top-h); overflow: visible; }
-
+            .controls-top  {
+                flex: 0 0 auto;
+                min-height: var(--controls-top-h);
+                overflow: visible;
+            }
             /* No CSS layout for the second row (panels) —
                 sizes/spacing come only from your Python row/column props. */
 
@@ -96,6 +161,19 @@ app_ui = ui.page_sidebar(
             /* Make sure the sidebar overlays other content when open */
             .bslib-sidebar-layout > .bslib-sidebar { z-index: 1050; }
             .bslib-sidebar-layout .bslib-sidebar-toggle { z-index: 1060; }
+
+            .nav-tabs {
+                margin-bottom: 10px;
+            }
+
+            .nav-tabs .nav-link {
+                font-weight: 600;
+            }
+
+            .nav-tabs .nav-link.active {
+                background-color: #f8f9fa;
+                border-color: #dee2e6 #dee2e6 #fff;
+            }          
 
             /* Tighten the toolbar only (kills the “ghost row”) */
             .controls-top .shiny-input-container { margin-bottom: 0 !important; }
@@ -178,123 +256,173 @@ app_ui = ui.page_sidebar(
                     ##line to seperate the UI elements
                     ui.hr(),
 
-                    ui.row(
-                        #From left to right:
-                        #Panel 1 winsorization
-                        ui.column(
-                            3,
-                            ui.card(
-                                ui.card_header("Winsorization"),
-                                ui.row(
-                                    ui.column(6, ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01)),
-                                    ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.0, max=1.0, value=0.99, step=0.01)),
+                    ui.navset_tab(
+                        ui.nav_panel(
+                            "Single channel",
+                            ui.row(
+                                # Panel 1 winsorization
+                                ui.column(
+                                    3,
+                                    ui.card(
+                                        ui.card_header("Winsorization"),
+                                        ui.row(
+                                            ui.column(6, ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01)),
+                                            ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.0, max=1.0, value=0.99, step=0.01)),
+                                        ),
+                                        ui.row(
+                                            ui.column(6, ui.input_checkbox("doWinsor", "doWinsorize", value=True)),
+                                            ui.column(6, ui.input_action_button("apply_one", "Update channel", class_="btn btn-primary w-100")),
+                                        ),
+                                    ),
                                 ),
-                                ui.row(
-                                    ui.column(6, ui.input_checkbox("doWinsor", "doWinsorize", value=True)),
-                                    ui.column(6, ui.input_action_button("apply_one", "Update channel", class_="btn btn-primary w-100")),
+
+                                # Panel 2 Thresholding
+                                ui.column(
+                                    3,
+                                    ui.card(
+                                        ui.card_header("Thresholding"),
+                                        ui.row(
+                                            ui.column(6, ui.input_slider("abs_threshold_val", "Absolute threshold (counts)", min=0.0, max=100.0, value=1, step=0.1)),
+                                            ui.column(6, ui.input_slider("thr_fraction_val", "Fraction of max (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
+                                        ),
+                                        ui.row(
+                                            ui.column(
+                                                3,
+                                                ui.tags.div(
+                                                    ui.input_checkbox("doAbsThreshold", "Do Abs thresholding", value=True),
+                                                ),
+                                            ),
+                                            ui.column(
+                                                3,
+                                                ui.tags.div(
+                                                    ui.input_checkbox("doThreshold", "Do Perc thresholding", value=False),
+                                                ),
+                                            ),
+                                            ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
+                                        ),
+                                    ),
+                                ),
+
+                                # Panel3 Sliding windows noise removal
+                                ui.column(
+                                    3,
+                                    ui.card(
+                                        ui.card_header("Sliding Window Noise Removal"),
+                                        ui.row(
+                                            ui.column(6, ui.input_slider("noise_strength", "Denoise strength (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
+                                            ui.column(6, ui.input_numeric("window_size", "Window size (odd)", value=3, min=1, step=2)),
+                                        ),
+                                        ui.row(
+                                            ui.column(6, ui.input_checkbox("doNoise", "Apply noise removal", value=True)),
+                                            ui.column(6, ui.input_action_button("apply_noise", "Update channel", class_="btn btn-primary w-100")),
+                                            ui.row(
+                                                ui.column(
+                                                    12,
+                                                    ui.output_ui("noise_tooltip"),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+
+                                # Panel4: Normalization and transformation
+                                ui.column(
+                                    3,
+                                    ui.card(
+                                        ui.card_header("Normalization and Transformation"),
+                                        ui.row(
+                                            ui.column(
+                                                7,
+                                                ui.tags.div(
+                                                    ui.input_checkbox("doNorm", "Normalize the channel?", value=True),
+                                                    class_="d-flex align-items-center mb-2",
+                                                ),
+                                                ui.input_radio_buttons(
+                                                    "norm_scope",
+                                                    "Normalize using",
+                                                    choices={
+                                                        "page":   "Per page (each sample seperate)",
+                                                        "global": "Global min/max across channel",
+                                                    },
+                                                    selected="page",
+                                                    inline=True,
+                                                ),
+                                                ui.output_ui("norm_scope_hint"),
+                                            ),
+                                            ui.column(
+                                                5,
+                                                ui.tags.div(
+                                                    ui.input_checkbox("doAsinh", "Arcsinh transform data", value=False),
+                                                    class_="d-flex align-items-center mb-2",
+                                                ),
+                                                ui.input_select(
+                                                    "asinh_cofactor",
+                                                    "Cofactor",
+                                                    choices=[str(i) for i in range(2, 11)],
+                                                    selected="5",
+                                                    width="100%",
+                                                ),
+                                                ui.input_action_button(
+                                                    "apply_norm",
+                                                    "Apply norm/transform",
+                                                    class_="btn btn-primary w-100 mt-2",
+                                                ),
+                                            ),
+                                            class_="align-items-start",
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
 
-                        #Panel 2 Thresholding
-                        ui.column(
-                            3,
-                            ui.card(
-                                ui.card_header("Thresholding"),
-                                ui.row(
-                                    ui.column(6, ui.input_slider("abs_threshold_val", "Absolute threshold (counts)", min=0.0, max=100.0, value=1, step=0.1)),
-                                    ui.column(6, ui.input_slider("thr_fraction_val", "Fraction of max (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
-                                ),
-                                ui.row(
-                                    ui.column(
-                                        3,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doAbsThreshold", "Do Abs thresholding", value=True),
+                        ui.nav_panel(
+                            "Image creator",
+                            ui.row(
+                                ui.column(
+                                    9,
+                                    ui.card(
+                                        ui.card_header("Composite channels (processed images)"),
+                                        ui.row(
+                                            ui.column(
+                                                6,
+                                                ui.row(
+                                                    ui.column(1, ui.tags.strong("On")),
+                                                    ui.column(6, ui.tags.strong("Channel")),
+                                                    ui.column(3, ui.tags.strong("Color")),
+                                                    ui.column(2, ui.tags.strong("Gain")),
+                                                    class_="mb-1",
+                                                ),
+                                                *[make_composite_slot(i) for i in range(1, 5)],
+                                            ),
+                                            ui.column(
+                                                6,
+                                                ui.row(
+                                                    ui.column(1, ui.tags.strong("On")),
+                                                    ui.column(6, ui.tags.strong("Channel")),
+                                                    ui.column(3, ui.tags.strong("Color")),
+                                                    ui.column(2, ui.tags.strong("Gain")),
+                                                    class_="mb-1",
+                                                ),
+                                                *[make_composite_slot(i) for i in range(5, 9)],
+                                            ),
                                         ),
                                     ),
-                                    ui.column(
-                                        3,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doThreshold", "Do Perc thresholding", value=False),
-                                        ),
-                                    ),
-                                    ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
                                 ),
-                            ),
-                        ),
-
-                        #Panel3 Sliding windows noise removal
-                        ui.column(
-                            3,
-                            ui.card(
-                                ui.card_header("Sliding Window Noise Removal"),
-                                ui.row(
-                                    ui.column(6, ui.input_slider("noise_strength", "Denoise strength (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
-                                    ui.column(6, ui.input_numeric("window_size", "Window size (odd)", value=3, min=1, step=2)),
-                                ),
-                                ui.row(
-                                    ui.column(6, ui.input_checkbox("doNoise", "Apply noise removal", value=True)),
-                                    ui.column(6, ui.input_action_button("apply_noise", "Update channel", class_="btn btn-primary w-100")),
-                                    ui.row(
-                                        ui.column(
-                                            12,
-                                            ui.output_ui("noise_tooltip"),
-                                        ),
+                                ui.column(
+                                    3,
+                                    ui.card(
+                                        ui.card_header("Composite export"),
+                                        ui.input_action_button("fill_composite_from_current", "Fill from first 8 channels", class_="btn btn-secondary w-100 mb-2"),
+                                        ui.input_action_button("save_composite_png", "Save composite PNG", class_="btn btn-primary w-100"),
+                                        ui.br(),
+                                        ui.br(),
+                                        ui.output_ui("composite_summary"),
                                     ),
                                 ),
                             ),
                         ),
 
-                        #Panel4: Nomalization and transformation
-                        ui.column(
-                            3,
-                            ui.card(
-                                ui.card_header("Normalization and Transformation"),
-                                ui.row(
-                                    #normalization controls
-                                    ui.column(
-                                        7,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doNorm", "Normalize the channel?", value=True),
-                                            class_="d-flex align-items-center mb-2",
-                                        ),
-                                        ui.input_radio_buttons(
-                                            "norm_scope",
-                                            "Normalize using",
-                                            choices={
-                                                "page":   "Per page (each sample seperate)",
-                                                "global": "Global min/max across channel",
-                                            },
-                                            selected="page",
-                                            inline=True,
-                                        ),
-                                        ui.output_ui("norm_scope_hint"),
-                                    ),
-
-                                    #arcsinh controls stacked, then Apply button
-                                    ui.column(
-                                        5,
-                                        ui.tags.div(
-                                            ui.input_checkbox("doAsinh", "Arcsinh transform data", value=False),
-                                            class_="d-flex align-items-center mb-2",
-                                        ),
-                                        ui.input_select(
-                                            "asinh_cofactor",
-                                            "Cofactor",
-                                            choices=[str(i) for i in range(2, 11)],
-                                            selected="5",
-                                            width="100%",
-                                        ),
-                                        ui.input_action_button(
-                                            "apply_norm",
-                                            "Apply norm/transform",
-                                            class_="btn btn-primary w-100 mt-2",
-                                        ),
-                                    ),
-                                    class_="align-items-start",
-                                ),
-                            ),
-                        ),
+                        id="viewer_mode",
                     ),
                     class_="controls-fixed",
                 ),
@@ -515,6 +643,206 @@ def server(input, output, session):
         _global_minmax_cache.set(cache)
         return result
 
+    def _get_channel_param_row(channelName: str):
+        df = params_df.get()
+        if df.empty or not channelName:
+            return None
+        m = (df["Channel"] == channelName)
+        if not m.any():
+            return None
+        return df.loc[m].iloc[0]
+
+    def _process_channel_from_table(sampleName: str, channelName: str) -> np.ndarray | None:
+        imgs = images.get()
+        chs = channels.get()
+
+        if not sampleName or not channelName or sampleName not in imgs:
+            return None
+
+        chlist = chs.get(sampleName, [])
+        if channelName not in chlist:
+            return None
+
+        idx = chlist.index(channelName)
+        img = imgs[sampleName][idx, :, :].astype(np.float32)
+
+        row = _get_channel_param_row(channelName)
+        if row is None:
+            return None
+
+        doWin = bool(row.get("DoWinsor", False))
+        low = float(row.get("Low", 0.0))
+        high = float(row.get("High", 1.0))
+
+        doAbsThr = bool(row.get("DoAbsThr", False))
+        absThrVal = float(row.get("AbsThrVal", 0.0))
+
+        doThr = bool(row.get("DoThr", False))
+        thrVal = float(row.get("ThrVal", 0.0))
+
+        doNoise = bool(row.get("Noise", False))
+        noiseStrength = float(row.get("NStr", 0.0))
+        winSz = int(row.get("WinSz", 3))
+
+        doNorm = bool(row.get("DoNorm", True))
+        normScope = str(row.get("NormScope", "page")).strip().lower()
+
+        doAsinh = bool(row.get("DoAsinh", False))
+        cofac = int(row.get("Cofac", 5))
+
+        normVmin = None
+        normVmax = None
+        if doNorm and normScope == "global":
+            gpair = _global_range_for_channel(
+                images.get(),
+                channels.get(),
+                channelName,
+                doWin,
+                low,
+                high,
+            )
+            if gpair is not None:
+                normVmin, normVmax = gpair
+
+        return process_image_pipeline(
+            img,
+            do_winsor=doWin,
+            winsor_low=low,
+            winsor_high=high,
+            do_abs_threshold=doAbsThr,
+            abs_threshold=absThrVal,
+            do_fraction_threshold=doThr,
+            thr_fraction=thrVal,
+            do_noise=doNoise,
+            noise_strength=noiseStrength,
+            window_size=winSz,
+            do_asinh=doAsinh,
+            asinh_cofactor=cofac,
+            do_norm=doNorm,
+            norm_vmin=normVmin,
+            norm_vmax=normVmax,
+            winsor_min_upper_bound=WINSOR_MIN_UPPER_BOUND,
+        )
+
+    def _build_composite_rgb() -> tuple[np.ndarray | None, list[tuple[str, str, float]]]:
+        sampleName = input.sample()
+        if not sampleName:
+            return None, []
+
+        rgb = None
+        used = []
+
+        for slotIdx in range(1, MAX_COMPOSITE_CHANNELS + 1):
+            enabled = bool(getattr(input, f"comp_enable_{slotIdx}")())
+            if not enabled:
+                continue
+
+            channelName = getattr(input, f"comp_channel_{slotIdx}")()
+            colorName = getattr(input, f"comp_color_{slotIdx}")()
+            gain = float(getattr(input, f"comp_gain_{slotIdx}")())
+
+            if not channelName:
+                continue
+
+            proc = _process_channel_from_table(sampleName, channelName)
+            if proc is None:
+                continue
+
+            if rgb is None:
+                h, w = proc.shape
+                rgb = np.zeros((h, w, 3), dtype=np.float32)
+
+            colorVec = np.asarray(COMPOSITE_PALETTE.get(colorName, (1.0, 1.0, 1.0)), dtype=np.float32)
+            rgb += proc[..., None] * gain * colorVec[None, None, :]
+            used.append((channelName, colorName, gain))
+
+        if rgb is None or len(used) == 0:   
+            return None, []
+
+        rgb = np.clip(np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0).astype(np.float32)
+        return rgb, used
+
+    def _sync_composite_channel_choices(sampleName: str, overwriteDefaults: bool = False) -> None:
+        if not sampleName:
+            return
+
+        chlistCurrent = channels.get().get(sampleName, [])
+        canon = canonical_channels.get() or []
+        ordered = order_by_canonical(canon, chlistCurrent)
+
+        choices = [""] + ordered
+
+        for slotIdx in range(1, MAX_COMPOSITE_CHANNELS + 1):
+            inputId = f"comp_channel_{slotIdx}"
+
+            currentVal = getattr(input, inputId)()
+            defaultVal = ordered[slotIdx - 1] if slotIdx <= len(ordered) else ""
+
+            if overwriteDefaults:
+                selectedVal = defaultVal
+            else:
+                selectedVal = currentVal if currentVal in ordered else defaultVal
+
+            ui.update_select(
+                inputId,
+                choices=choices,
+                selected=selectedVal,
+                session=session,
+            )
+
+    @reactive.Effect
+    @reactive.event(input.fill_composite_from_current)
+    def _fill_composite_from_current():
+        s = input.sample()
+        if not s:
+            return
+        _sync_composite_channel_choices(s, overwriteDefaults=True)
+
+    @output
+    @render.ui
+    def composite_summary():
+        rgb, used = _build_composite_rgb()
+        if not used:
+            return ui.tags.small("No channels selected for the composite.", class_="text-muted")
+
+        lines = [
+            ui.tags.li(f"{ch} — {col} × {gain:.1f}")
+            for ch, col, gain in used
+        ]
+        return ui.div(
+            ui.tags.small("Composite uses the stored per-channel processing settings.", class_="text-muted"),
+            ui.tags.ul(*lines, class_="mt-2 mb-0"),
+        )
+
+    @reactive.Effect
+    @reactive.event(input.save_composite_png)
+    def _save_composite_png():
+        rgb, used = _build_composite_rgb()
+        if rgb is None or len(used) == 0:
+            print("⚠️ No composite available to save.")
+            return
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        sampleName = input.sample() or "sample"
+        defaultName = f"{sampleName} Composite.png"
+
+        savePath = pick_save_png_dialog(
+            initialdir=initdir,
+            initialfile=defaultName,
+        )
+
+        if not savePath:
+            print("🛑 Save canceled.")
+            return
+
+        try:
+            plt.imsave(savePath, rgb)
+            print(f"✅ Saved composite PNG → {savePath}")
+        except Exception as e:
+            print(f"❌ Failed to save composite PNG: {e}")
+
     ##<--------load images module ---------->
     @reactive.Effect
     @reactive.event(input.load)
@@ -585,6 +913,8 @@ def server(input, output, session):
             finally:
                 setting_selects.set(False)
 
+            _sync_composite_channel_choices(first_sample, overwriteDefaults=True)
+
             if first_channel:
                 _sync_controls_from_table(first_channel)
 
@@ -654,6 +984,7 @@ def server(input, output, session):
         finally:
             setting_selects.set(False)
         _sync_controls_from_table(sel)
+        _sync_composite_channel_choices(s, overwriteDefaults=False)
 
     # ---------- react to channel change ----------
     ##Below reactive effect work the sample as their sample counterpart, check comments there on how they work
@@ -835,103 +1166,96 @@ def server(input, output, session):
     @output
     @render.plot
     def img_viewer():
-        #One image is plotted only; decent size/dpi so the browser has pixels to work with
-        #Make image 19:6 (padded) with 120dpi. So 1080x720. Which is around full res for IMC images. 
-        ##Image is just scaled to fit the container, using: ui.output_plot("img_viewer", fill=True, height="100%")
         fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
         try:
+            mode = input.viewer_mode() or "Single channel"
+
+            if mode == "Image creator":
+                rgb, used = _build_composite_rgb()
+                if rgb is None:
+                    ax.text(0.5, 0.5, "No composite channels selected", ha="center", va="center")
+                    ax.set_axis_off()
+                    return fig
+
+                ax.imshow(rgb)
+                ax.set_axis_off()
+
+                if used:
+                    labelLines = [f"{ch} — {col} × {gain:.1f}" for ch, col, gain in used]
+                    fig.text(
+                        0.01,
+                        0.99,
+                        "\n".join(labelLines),
+                        ha="left",
+                        va="top",
+                        fontsize=8,
+                        color="white",
+                        bbox=dict(facecolor="black", alpha=0.55, edgecolor="none", pad=4),
+                    )
+
+                plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+                return fig
+
+            # ---- original single-channel viewer branch ----
             imgs = images.get()
             s = input.sample()
             c = input.channel()
-            ##If there is no image or channel then display text below
+
             if not imgs or not s or not c or s not in imgs:
                 ax.text(0.5, 0.5, "No image", ha="center", va="center")
                 ax.set_axis_off()
                 return fig
-            ##array of images
+
             arr = imgs[s]
             chlist = channels.get().get(s, [])
-            ##Guards against the case where the next image doesn't have the current channel
             if c not in chlist:
                 ax.text(0.5, 0.5, f"Channel {c!r} not found", ha="center", va="center")
                 ax.set_axis_off()
                 return fig
-            ##Current index of the channels and turn the current image into an np.array
+
             idx = chlist.index(c)
-            img = arr[idx, :, :].astype(np.float32) ##this image (img) will go through th whole pipeline below
+            img = arr[idx, :, :].astype(np.float32)
 
-            # Step 1: winsorization
-            if input.doWinsor():
-                lo = clamp01(input.winsor_low())
-                hi = clamp01(input.winsor_high())
-                if hi > lo:
-                    img = apply_winsor(img, lo, hi, min_upper_bound=WINSOR_MIN_UPPER_BOUND)
+            normVmin = None
+            normVmax = None
+            if bool(input.doNorm()) and (input.norm_scope() or "page") == "global":
+                doW, lo, hi = _get_winsor_settings()
+                gpair = _global_range_for_channel(
+                    images.get(),
+                    channels.get(),
+                    c,
+                    doW,
+                    lo,
+                    hi,
+                )
+                if gpair is not None:
+                    normVmin, normVmax = gpair
 
-            # Step 2a: absolute threshold (raw counts)
-            if input.doAbsThreshold():
-                try:
-                    abs_thr = float(input.abs_threshold_val())
-                except Exception:
-                    abs_thr = 0.0
-                img = apply_threshold_absolute(img, abs_thr)
+            img = process_image_pipeline(
+                img,
+                do_winsor=bool(input.doWinsor()),
+                winsor_low=float(input.winsor_low()),
+                winsor_high=float(input.winsor_high()),
+                do_abs_threshold=bool(input.doAbsThreshold()),
+                abs_threshold=float(input.abs_threshold_val()),
+                do_fraction_threshold=bool(input.doThreshold()),
+                thr_fraction=float(input.thr_fraction_val()),
+                do_noise=bool(input.doNoise()),
+                noise_strength=float(input.noise_strength()),
+                window_size=int(input.window_size()),
+                do_asinh=bool(input.doAsinh()),
+                asinh_cofactor=int(float(input.asinh_cofactor() or 5)),
+                do_norm=bool(input.doNorm()),
+                norm_vmin=normVmin,
+                norm_vmax=normVmax,
+                winsor_min_upper_bound=WINSOR_MIN_UPPER_BOUND,
+            )
 
-            # Step 2b: global threshold (fraction of max)
-            if input.doThreshold():
-                thr = clamp01(input.thr_fraction_val())
-                img = apply_threshold_fraction_of_max(img, thr)
-
-            # Step 3: speckle suppression
-            if input.doNoise():
-                wsize = max(1, int(input.window_size()))
-                s_strength = float(input.noise_strength())
-                p = strength_to_percentile(s_strength)
-                img = apply_speckle_suppress(img, size=wsize, perc=p, neighbor_limit=2)
-
-            # Step 4: arcsinh transform
-            if input.doAsinh():
-                try:
-                    cof = int(float(input.asinh_cofactor() or 5))
-                except Exception:
-                    cof = 5
-                img = arcsinh_transform(img, cof)
-                        ##Step5 is normalization of the channel, either on an image basis or a channel basis.
-            ##No normalization? Skip this part
-            if bool(input.doNorm()):
-                ##Scope = global versus per image
-                scope = (input.norm_scope() or "page")
-                ##Pull the winsor settings (not to winsorize again)
-                do_w, lo, hi = _get_winsor_settings()
-                ##If the scope of the normalization is global, use this part. If not skip to local(per image) version
-                if scope == "global":
-                    #if winsor is enabled: global range from per-image winsor quantiles
-                    #if not, use the raw global min/max
-                    ##It now asks for the global post winso scores and caches them
-                    gpair = _global_range_for_channel(
-                        images.get(),
-                        channels.get(),
-                        c,
-                        do_w,
-                        lo,
-                        hi,
-                    )
-                    #If not cached 
-                    if gpair is not None:
-                        gmin, gmax = gpair
-                        img = normalize_minmax(img, vmin=gmin, vmax=gmax)
-                    else:
-                        img = normalize_minmax(img)
-
-                else:
-                    img = normalize_minmax(img)
-            ##else perform no normalization: use processed img as-is
-
-            ##Step 6 is to actually render the image
-            img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
             ax.imshow(img, cmap="gray")
             ax.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
             return fig
-        ##If anything goed wrong, catch the exception and display it
+
         except Exception as e:
             ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
             ax.set_axis_off()
@@ -1092,13 +1416,11 @@ def server(input, output, session):
  
     @reactive.Effect
     @reactive.event(input.import_params)
-    ##This is to load back all the parameters, however, this was made (as much as possible) rebust agains user error
     def _import_params():
-        ##Require a completed load (robust against stray/empty load clicks) of images, if not error
         if not data_loaded.get():
             print("⚠️ Load images before importing parameters.")
             return
-        ##Try to load csv in last know location, then current input, current working dir as fallback    
+
         folder = last_loaded_folder.get() or (input.path() or "").strip()
         initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
 
@@ -1107,16 +1429,16 @@ def server(input, output, session):
             print("🛑 Import canceled.")
             return
 
-        #Read the seleted csv, if fails cancel
         try:
             df_in = pd.read_csv(csv_path)
         except Exception as e:
             print(f"❌ Failed to read CSV: {e}")
             return
-        ##If there is no channel column, also abort. Everything is aligned on this one
+
         if "Channel" not in df_in.columns:
             print("❌ CSV missing required 'Channel' column.")
             return
+
         canon = list(canonical_channels.get() or [])
         try:
             df_in = validate_and_normalize_import(df_in, canon)
@@ -1124,13 +1446,16 @@ def server(input, output, session):
             print(f"❌ {e}")
             return
 
-        #Set to the params.df and sync to interface.
         params_df.set(df_in.reset_index(drop=True))
+
         sel = input.channel()
         if sel:
             _sync_controls_from_table(sel)
 
-        print(f"✅ Imported parameters from {csv_path}")
+        s = input.sample()
+        if s:
+            _sync_composite_channel_choices(s, overwriteDefaults=False)
 
+        print(f"✅ Imported parameters from {csv_path}")
 
 app = App(app_ui, server)

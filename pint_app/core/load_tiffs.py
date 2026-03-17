@@ -29,6 +29,7 @@ def _channel_names_from_page_tags(tif: tifffile.TiffFile):
         return [n if n else f"Channel{i+1}" for i, n in enumerate(names)]
     return None
 
+##Use the ome_xml is a fallback for the channel names. Often times the XML is missing a lot of data making this a longshot.
 def _channel_names_from_ome_xml(tif: tifffile.TiffFile):
     """
     Best-effort fallback: parse channel names from OME-XML (may be malformed).
@@ -38,7 +39,7 @@ def _channel_names_from_ome_xml(tif: tifffile.TiffFile):
         ome_xml = tif.ome_metadata
         if not ome_xml:
             return None
-        from ome_types import from_xml  # optional; only used if available
+        from ome_types import from_xml  #optional; only used if available
         ome = from_xml(ome_xml)
         chans = getattr(ome.images[0].pixels, "channels", None)
         if not chans:

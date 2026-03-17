@@ -1,4 +1,4 @@
-Current version 0.3.0
+Current version 0.5
 
 ##Install like this:
 

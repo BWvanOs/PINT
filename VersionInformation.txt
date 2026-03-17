@@ -1,4 +1,15 @@
 Version history
+New in version 0.5!
+Image creation tool that complements MCD viewer
+    -The tool uses the parameter table you created when denoising, so you can now use the thresholded/normalizated/denoised/transformed images as staining examples
+
+open problems
+    -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv.
+    -Winsorization floor value is not user adjustable.
+    -Unable to pick own color for channels
+    -No automated export function for all composit images
+
+
 0.4.1
 Added more comments to explaning the workings of the pipeline
 bugfixes:
@@ -10,9 +21,8 @@ bugfixes:
      Background of the Hyperion(XTi) is 3~3.5 so setting it to 5 should fix this. Temporary fix untill a better method is implemented
 
 open problems
-    -If global normalization for a given channels fails it's not fed back tot he user. It is stored in the resulting csv.
+    -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv.
     -Winsorization floor value is not user adjustable.
-
 
 0.4
 New version switches to absolute thresholding as a default, relative thresholding still available (percentile based) but by default off

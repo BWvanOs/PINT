@@ -305,3 +305,74 @@ def image_winsor_range(
 
     qhi = max(float(qhi), float(min_upper_bound))
     return float(qlo), float(qhi)
+
+def process_image_pipeline(
+    img: np.ndarray,
+    *,
+    do_winsor: bool = False,
+    winsor_low: float = 0.0,
+    winsor_high: float = 1.0,
+    do_abs_threshold: bool = False,
+    abs_threshold: float = 0.0,
+    do_fraction_threshold: bool = False,
+    thr_fraction: float = 0.0,
+    do_noise: bool = False,
+    noise_strength: float = 0.0,
+    window_size: int = 3,
+    do_asinh: bool = False,
+    asinh_cofactor: int | float = 5,
+    do_norm: bool = True,
+    norm_vmin: float | None = None,
+    norm_vmax: float | None = None,
+    winsor_min_upper_bound: float = 5.0,
+) -> np.ndarray:
+    """
+    Apply the same processing order used by the viewer/batch pipeline.
+
+    Order:
+      1) winsorize
+      2) absolute threshold
+      3) fraction-of-max threshold
+      4) speckle suppression
+      5) arcsinh
+      6) min-max normalization (optional)
+
+    If do_norm=True:
+      - norm_vmin/norm_vmax can be provided for global normalization
+      - if they are None, per-image min/max is used
+    """
+    out = img.astype(np.float32, copy=True)
+
+    if do_winsor:
+        lo = clamp01(winsor_low)
+        hi = clamp01(winsor_high)
+        if hi > lo:
+            out = apply_winsor(
+                out,
+                lo,
+                hi,
+                min_upper_bound=winsor_min_upper_bound,
+            )
+
+    if do_abs_threshold:
+        out = apply_threshold_absolute(out, abs_threshold)
+
+    if do_fraction_threshold:
+        thr_fraction = clamp01(thr_fraction)
+        if thr_fraction > 0.0:
+            out = apply_threshold_fraction_of_max(out, thr_fraction)
+
+    if do_noise:
+        wsize = max(1, int(window_size))
+        s = clamp01(noise_strength)
+        perc = strength_to_percentile(s)
+        out = apply_speckle_suppress(out, size=wsize, perc=perc, neighbor_limit=2)
+
+    if do_asinh:
+        cofac = sanitize_cofactor(asinh_cofactor)
+        out = arcsinh_transform(out, cofac)
+
+    if do_norm:
+        out = normalize_minmax(out, vmin=norm_vmin, vmax=norm_vmax)
+
+    return np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=0.0).astype(np.float32)
