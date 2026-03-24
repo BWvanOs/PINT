@@ -177,6 +177,66 @@ def pick_folder_dialog(title: str = "Select folder", initialdir: str | None = No
         print("[file dialog] tkinter fallback failed", file=sys.stderr)
         return ""
 
+def pick_save_tiff_dialog(
+    title: str = "Save composite TIFF",
+    initialdir: str | None = None,
+    initialfile: str = "composite.tiff",
+) -> str:
+    """Open a save-as dialog for a TIFF file."""
+    if _is_linux() and _zenity_available():
+        try:
+            start = initialdir or os.getcwd()
+            suggested = os.path.join(start, initialfile)
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                "--title", title,
+                "--filename", suggested,
+                "--file-filter=TIFF files | *.tif *.tiff",
+                "--file-filter=All files | *",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            out = res.stdout.strip() if res.returncode == 0 else ""
+            if out and not (out.lower().endswith(".tif") or out.lower().endswith(".tiff")):
+                out += ".tiff"
+            return out
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            dpi = root.winfo_fpixels("1i")
+            scale = max(1.0, float(dpi) / 96.0)
+            root.tk.call("tk", "scaling", scale)
+        except Exception:
+            pass
+
+        try:
+            root.wm_attributes("-topmost", 1)
+        except Exception:
+            pass
+
+        path = filedialog.asksaveasfilename(
+            title=title,
+            initialdir=initialdir or os.getcwd(),
+            initialfile=initialfile,
+            defaultextension=".tiff",
+            filetypes=[("TIFF files", "*.tif *.tiff"), ("All files", "*.*")],
+        )
+        root.destroy()
+        return path or ""
+    except Exception:
+        print("[file dialog] tkinter fallback failed", file=sys.stderr)
+        return ""
+
 def pick_save_png_dialog(
     title: str = "Save composite PNG",
     initialdir: str | None = None,

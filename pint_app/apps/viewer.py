@@ -10,6 +10,8 @@ import os, sys, subprocess
 import shutil
 import warnings
 
+from tifffile import imwrite
+
 from pint_app.core.load_tiffs import load_tiffs_raw
 from pint_app.core.formatting import fmt1
 from pint_app.core.dialogs import (
@@ -17,6 +19,7 @@ from pint_app.core.dialogs import (
     pick_open_csv_dialog,
     pick_save_csv_dialog,
     pick_save_png_dialog,
+    pick_save_tiff_dialog,
 )
 from pint_app.core.processing import (
     clamp01,
@@ -413,7 +416,8 @@ app_ui = ui.page_sidebar(
                                     ui.card(
                                         ui.card_header("Composite export"),
                                         ui.input_action_button("fill_composite_from_current", "Fill from first 8 channels", class_="btn btn-secondary w-100 mb-2"),
-                                        ui.input_action_button("save_composite_png", "Save composite PNG", class_="btn btn-primary w-100"),
+                                        ui.input_action_button("save_composite_tiff", "Save composite TIFF", class_="btn btn-primary w-100 mb-2"),
+                                        ui.input_action_button("export_creator_composites_all", "Export composite TIFF for all images", class_="btn btn-secondary w-100"),
                                         ui.br(),
                                         ui.br(),
                                         ui.output_ui("composite_summary"),
@@ -724,8 +728,9 @@ def server(input, output, session):
             winsor_min_upper_bound=WINSOR_MIN_UPPER_BOUND,
         )
 
-    def _build_composite_rgb() -> tuple[np.ndarray | None, list[tuple[str, str, float]]]:
-        sampleName = input.sample()
+    def _build_composite_rgb(sampleName: str | None = None):
+        if sampleName is None:
+            sampleName = input.sample()
         if not sampleName:
             return None, []
 
@@ -753,10 +758,14 @@ def server(input, output, session):
                 rgb = np.zeros((h, w, 3), dtype=np.float32)
 
             colorVec = np.asarray(COMPOSITE_PALETTE.get(colorName, (1.0, 1.0, 1.0)), dtype=np.float32)
-            rgb += proc[..., None] * gain * colorVec[None, None, :]
+            layer = np.clip(proc[..., None] * gain * colorVec[None, None, :], 0.0, 1.0)
+
+            # screen blend
+            rgb = 1.0 - (1.0 - rgb) * (1.0 - layer)
+
             used.append((channelName, colorName, gain))
 
-        if rgb is None or len(used) == 0:   
+        if rgb is None or len(used) == 0:
             return None, []
 
         rgb = np.clip(np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0).astype(np.float32)
@@ -789,6 +798,109 @@ def server(input, output, session):
                 selected=selectedVal,
                 session=session,
             )
+
+    def _get_selected_creator_channels():
+        selected = []
+        for slotIdx in range(1, MAX_COMPOSITE_CHANNELS + 1):
+            enabled = bool(getattr(input, f"comp_enable_{slotIdx}")())
+            if not enabled:
+                continue
+
+            channelName = getattr(input, f"comp_channel_{slotIdx}")()
+            if not channelName:
+                continue
+
+            colorName = getattr(input, f"comp_color_{slotIdx}")()
+            gain = float(getattr(input, f"comp_gain_{slotIdx}")())
+            selected.append((channelName, colorName, gain))
+
+        return selected
+
+    @reactive.Effect
+    @reactive.event(input.save_composite_tiff)
+    def _save_composite_tiff():
+        rgb, used = _build_composite_rgb()
+        if rgb is None or len(used) == 0:
+            print("⚠️ No composite available to save.")
+            return
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        sampleName = input.sample() or "sample"
+        defaultName = f"{sampleName} Composite.tiff"
+
+        savePath = pick_save_tiff_dialog(
+            initialdir=initdir,
+            initialfile=defaultName,
+        )
+
+        if not savePath:
+            print("🛑 Save canceled.")
+            return
+
+        try:
+            rgb_u16 = np.clip(np.round(rgb * 65535.0), 0, 65535).astype(np.uint16)
+            imwrite(
+                savePath,
+                rgb_u16,
+                dtype=np.uint16,
+                photometric="rgb",
+            )
+            print(f"✅ Saved composite TIFF → {savePath}")
+        except Exception as e:
+            print(f"❌ Failed to save composite TIFF: {e}")
+
+    @reactive.Effect
+    @reactive.event(input.export_creator_composites_all)
+    def _export_creator_composites_all():
+        imgs = images.get()
+        if not imgs:
+            print("⚠️ No images loaded.")
+            return
+
+        selected = _get_selected_creator_channels()
+        if len(selected) == 0:
+            print("⚠️ No creator channels selected.")
+            return
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        if not folder or not os.path.isdir(folder):
+            print("⚠️ Invalid input folder.")
+            return
+
+        out_dir = os.path.join(folder, "creator composite exports")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Save creator selection metadata for reproducibility
+        try:
+            creator_meta = pd.DataFrame(selected, columns=["Channel", "Color", "Gain"])
+            creator_meta.to_csv(os.path.join(out_dir, "creator_selection.csv"), index=False)
+        except Exception as e:
+            print(f"⚠️ Could not save creator_selection.csv: {e}")
+
+        for sampleName in imgs.keys():
+            rgb, used = _build_composite_rgb(sampleName=sampleName)
+
+            if rgb is None or len(used) == 0:
+                print(f"⚠️ Skipped {sampleName}: no selected creator channels were present.")
+                continue
+
+            out_path = os.path.join(out_dir, f"{sampleName} Composite.tiff")
+
+            try:
+                rgb_u16 = np.clip(np.round(rgb * 65535.0), 0, 65535).astype(np.uint16)
+                imwrite(
+                    out_path,
+                    rgb_u16,
+                    dtype=np.uint16,
+                    photometric="rgb",
+                )
+                print(f"✅ Exported composite TIFF → {out_path}")
+            except Exception as e:
+                print(f"❌ Failed for {sampleName}: {e}")
+
+        print("✅ Finished exporting composite TIFFs for all images.")
 
     @reactive.Effect
     @reactive.event(input.fill_composite_from_current)
