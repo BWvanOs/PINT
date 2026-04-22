@@ -1,10 +1,25 @@
 Version history
-New in version 0.5!
+New in version 0.6!
+Added a way to visualize cellmasks in the app
+    -Load a CSV that contain cellnames, clusternames, location and name of your masks, then load the masks. PINT will now show a visual of how the cells look in space
+    -next update will add nearest neighbor analysis and niche analysis
+Added automated export function that export selected channels for all images
+
+open issues
+    -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv, however.
+    -Winsorization floor value is not user adjustable.
+    -Unable to pick own color for channels
+
+
+
+
+
+0.5
 Image creation tool that complements MCD viewer
     -The tool uses the parameter table you created when denoising, so you can now use the thresholded/normalizated/denoised/transformed images as staining examples
 
-open problems
-    -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv.
+open issues
+    -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv, however.
     -Winsorization floor value is not user adjustable.
     -Unable to pick own color for channels
     -No automated export function for all composit images

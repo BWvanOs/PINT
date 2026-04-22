@@ -10,7 +10,7 @@ import os, sys, subprocess
 import shutil
 import warnings
 
-from tifffile import imwrite
+from tifffile import imwrite, imread
 
 from pint_app.core.load_tiffs import load_tiffs_raw
 from pint_app.core.formatting import fmt1
@@ -44,6 +44,22 @@ from pint_app.core.params import (
     validate_and_normalize_import,
 )
 
+from matplotlib.patches import Patch
+
+from pint_app.core.load_masks import (
+    validate_mask_input_table,
+    list_mask_files,
+    match_cellmask_names_to_files,
+    split_mask_matches,
+    get_cells_for_mask_name,
+    strip_known_mask_suffix,
+)
+
+from pint_app.core.mask_viz import (
+    read_mask_tiff,
+    match_mask_centroids_to_cells,
+    make_mask_plot_data,
+)
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
 
@@ -120,7 +136,7 @@ app_ui = ui.page_sidebar(
             :root{
                 /* You can tweak these two and nothing else! */
                 --controls-h: 350px;     /* total height of the top area (toolbar + panels) */
-                --controls-top-h: 170px; /* height of the toolbar row */
+                --controls-top-h: 100px; /* height of the toolbar row */
             }
 
             /* Page skeleton: fixed top area + growing viewer */
@@ -193,75 +209,79 @@ app_ui = ui.page_sidebar(
             ui.tags.div(
                 # Toolbar + panels (so essentially everything but the table)
                 ui.tags.div(
-                    #Top bar with path, load images, sample channel selector and export functions
-                    ui.row(
-                        ##Folder path and load images button
-                        ui.column(5, ui.input_text("path", "Folder path", value="", width="100%")),
-                        ##load images button
-                        ui.column(1, ui.input_action_button("load", "Load images", class_="w-100")),
-                        #Vertical spacer
-                        ui.column(1),
-                        # Sample + Channel selectors (stacked)
-                        ui.column(
-                            2,
-                            ui.row(
-                                ui.column(8, ui.input_select("sample", "Sample", choices=[], selected=None, width="100%")),
-                                ui.column(2, ui.input_action_button("prev_sample", "←", class_="btn-sm")),
-                                ui.column(2, ui.input_action_button("next_sample", "→", class_="btn-sm")),
-                                class_="align-items-center gy-0",
-                            ),
-                            ui.row(
-                                ui.column(8, ui.input_select("channel", "Channel", choices=[], selected=None, width="100%")),
-                                ui.column(2, ui.input_action_button("prev_channel", "←", class_="btn-sm")),
-                                ui.column(2, ui.input_action_button("next_channel", "→", class_="btn-sm")),
-                                class_="align-items-center gy-0",
-                            ),
-                        ),
-                        #Another spacers
-                        ##export import and process images buttons
-                        ui.column(
-                            1,
-                            ui.row(
-                                ui.div(
-                                    ui.input_action_button("export_params", "Export CSV", class_="btn btn-secondary w-100"),
-                                    class_="mb-1",
-                                ),
-                            ),
-                            ui.row(
-                                ui.div(
-                                    ui.input_action_button("import_params", "Import CSV", class_="btn btn-secondary w-100"),
-                                    class_="mb-1",
-                                ),
-                            ),
-                            ui.row(
-                                ui.div(
-                                    ui.input_action_button("perform_analysis", "Process Images",class_="btn btn-primary text-white w-100 h-100",
-                                    ),
-                                    class_="d-flex h-100 align-items-stretch",
-                                ),
-                            ),
-                        ),
-                        ui.column(1), ##spacer
-                        ui.column(
-                            1,
-                            ui.tags.a(
-                                "Neighborhood analysis",
-                                href="/neighborhood/",
-                                target="_blank",
-                                role="button",
-                                class_="btn btn-secondary w-100",
-                                style="pointer-events: auto;",
-                            ),
-                        ),
-                        #IMPORTANT: this is part of the SAME ui.row(...) call; note the comma! If you move this it will break everything
-                        class_="controls-top align-items-center gy-0",
-                    ),
+                    
                     ##line to seperate the UI elements
                     ui.hr(),
 
                     ui.navset_tab(
                         ui.nav_panel(
-                            "Single channel",
+                            "PINT",
+                            #Top bar with path, load images, sample channel selector and export functions
+                            ui.row(
+                                ## Folder path
+                                ui.column(
+                                    4,
+                                    ui.input_text("path", "Folder path", value="", width="100%"),
+                                ),
+                                ## Load button
+                                ui.column(
+                                    1,
+                                    ui.input_action_button("load", "Load images", class_="w-100"),
+                                ),
+                                ui.column(1),
+                                ## Sample selector
+                                ui.column(
+                                    2,
+                                    ui.row(
+                                        ui.column(
+                                            8,
+                                            ui.input_select("sample", "Sample", choices=[], selected=None, width="100%"),
+                                        ),
+                                        ui.column(2, ui.input_action_button("prev_sample", "←", class_="btn-sm w-100")),
+                                        ui.column(2, ui.input_action_button("next_sample", "→", class_="btn-sm w-100")),
+                                        class_="align-items-center gy-0",
+                                    ),
+                                ),
+
+                                ## Channel selector
+                                ui.column(
+                                    2,
+                                    ui.row(
+                                        ui.column(
+                                            8,
+                                            ui.input_select("channel", "Channel", choices=[], selected=None, width="100%"),
+                                        ),
+                                        ui.column(2, ui.input_action_button("prev_channel", "←", class_="btn-sm w-100")),
+                                        ui.column(2, ui.input_action_button("next_channel", "→", class_="btn-sm w-100")),
+                                        class_="align-items-center gy-0",
+                                    ),
+                                ),
+                                ## Export / import / process
+                                ui.column(
+                                    2,
+                                    ui.row(
+                                        ui.column(
+                                            4,
+                                            ui.input_action_button("export_params", "Export CSV", class_="btn btn-secondary w-100"),
+                                        ),
+                                        ui.column(
+                                            4,
+                                            ui.input_action_button("import_params", "Import CSV", class_="btn btn-secondary w-100"),
+                                        ),
+                                        ui.column(
+                                            4,
+                                            ui.input_action_button(
+                                                "perform_analysis",
+                                                "Process Images",
+                                                class_="btn btn-primary text-white w-100",
+                                            ),
+                                        ),
+                                        class_="align-items-end gy-0",
+                                    ),
+                                ),
+                                #IMPORTANT: this is part of the SAME ui.row(...) call; note the comma! If you move this it will break everything
+                                class_="controls-top align-items-end gy-0 mb-2",
+                            ),
                             ui.row(
                                 # Panel 1 winsorization
                                 ui.column(
@@ -426,16 +446,84 @@ app_ui = ui.page_sidebar(
                             ),
                         ),
 
+                        ui.nav_panel(
+                            "Mask visualization",
+                            ui.row(
+                                ui.column(
+                                    4,
+                                    ui.card(
+                                        ui.card_header("Mask input"),
+                                        ui.input_text("mask_csv_path", "Cell table CSV", value="", width="100%"),
+                                        ui.row(
+                                            ui.column(6, ui.input_action_button("browse_mask_csv", "Browse CSV", class_="btn btn-secondary w-100")),
+                                            ui.column(6, ui.input_action_button("load_mask_csv", "Load cell table", class_="btn btn-primary w-100")),
+                                        ),
+                                        ui.br(),
+                                        ui.input_text("mask_path", "Mask folder", value="", width="100%"),
+                                        ui.row(
+                                            ui.column(6, ui.input_action_button("browse_mask_path", "Browse folder", class_="btn btn-secondary w-100")),
+                                            ui.column(6, ui.input_action_button("match_masks", "Match masks", class_="btn btn-primary w-100")),
+                                        ),
+                                        ui.br(),
+                                        ui.input_select("mask_cell_id_col", "Cell ID column", choices=[], selected=None, width="100%"),
+                                        ui.input_select("mask_x_col", "X coordinate column", choices=[], selected=None, width="100%"),
+                                        ui.input_select("mask_y_col", "Y coordinate column", choices=[], selected=None, width="100%"),
+                                        ui.input_select("mask_name_col", "Mask name column", choices=[], selected=None, width="100%"),
+                                        ui.input_select("mask_cluster_col", "Cluster column", choices=[], selected=None, width="100%"),
+                                        ui.input_select("mask_condition_col", "Condition column", choices=[], selected=None, width="100%"),
+                                        ui.input_select("mask_sample_col", "SampleNumber column", choices=[], selected=None, width="100%"),
+                                        ui.input_numeric("mask_scale_factor", "Scale factor", value=5, min=1, max=20, step=1),
+                                    ),
+                                    ui.br(),
+                                    ui.card(
+                                        ui.card_header("Matched masks"),
+                                        ui.output_ui("mask_table_summary"),
+                                        ui.output_ui("mask_match_summary"),
+                                        ui.input_select("selected_mask_name", "Select mask", choices=[], selected=None, width="100%"),
+                                        ui.output_ui("selected_mask_summary"),
+                                    ),
+                                ),
+                                ui.column(
+                                    8,
+                                    ui.card(
+                                        ui.card_header("Visualization"),
+                                        ui.div(
+                                            ui.output_plot("mask_viewer", fill=True, height="100%"),
+                                            style="height: 75vh;"
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+
+                        ui.nav_panel(
+                            "Neigborhood",
+                            ui.row(
+                                ui.column(
+                                    2,
+                                    ui.card(
+                                        ui.card_header("Neighborhood analysis"),
+                                        ui.tags.a(
+                                            "Open neighborhood analysis",
+                                            href="/neighborhood/",
+                                            target="_blank",
+                                            role="button",
+                                            class_="btn btn-secondary w-100",
+                                            style="pointer-events: auto;",
+                                        ),
+                                    ),
+                                ),
+                                ui.column(10),
+                            ),
+                        ),
+
                         id="viewer_mode",
                     ),
                     class_="controls-fixed",
                 ),
 
                 ##Main plot area --> here images will be rendered
-                ui.tags.div(
-                    ui.output_plot("img_viewer", fill=True, height="100%"),
-                    class_="viewer-fill",
-                ),
+                ui.output_ui("main_viewer_ui"),
                 class_="flex-col",
             ),
         ),
@@ -463,7 +551,14 @@ def server(input, output, session):
     setting_selects = reactive.Value(False)
     syncing_controls = reactive.Value(False)
     data_loaded = reactive.Value(False)
-    last_loaded_folder = reactive.Value("") #This stores the last path used to load images so saving throws them into the same folder
+    last_loaded_folder = reactive.Value("")  #This stores the last path used to load images so saving throws them into the same folder update here If you want this to cahnge
+    mask_input_df = reactive.Value(pd.DataFrame())
+    mask_files_df = reactive.Value(pd.DataFrame())
+    mask_match_df = reactive.Value(pd.DataFrame())
+    matched_masks_df = reactive.Value(pd.DataFrame())
+    missing_masks_df = reactive.Value(pd.DataFrame())
+    selected_mask_match = reactive.Value(pd.DataFrame())
+   
     
     ## <----------------> Helper functions <-------------------> ##
     def _get_winsor_settings():
@@ -1034,8 +1129,6 @@ def server(input, output, session):
             data_loaded.set(True)
             last_loaded_folder.set(folder)
 
-            print(">>> Post-load selected:", first_sample, first_channel)
-
         finally:
             loading.set(False)
 
@@ -1274,15 +1367,28 @@ def server(input, output, session):
         )
 
     # <---------- plot ---------->
+    @output
+    @render.ui
+    def main_viewer_ui():
+        mode = input.viewer_mode() or "PINT"
+
+        if mode in ["PINT", "Image creator"]:
+            return ui.tags.div(
+                ui.output_plot("img_viewer", fill=True, height="100%"),
+                class_="viewer-fill",
+            )
+
+        return ui.tags.div()
+    
     ##Below is the actual img viewer where the image is rendered and all the different thresholding stept are visualized.
     @output
     @render.plot
     def img_viewer():
-        fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
         try:
-            mode = input.viewer_mode() or "Single channel"
-
+            mode = input.viewer_mode() or "PINT"
+            ## -------------------- IMAGE CREATOR --------------------
             if mode == "Image creator":
+                fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
                 rgb, used = _build_composite_rgb()
                 if rgb is None:
                     ax.text(0.5, 0.5, "No composite channels selected", ha="center", va="center")
@@ -1308,7 +1414,9 @@ def server(input, output, session):
                 plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
                 return fig
 
-            # ---- original single-channel viewer branch ----
+            ## -------------------- DEFAULT PINT SINGLE-CHANNEL VIEWER --------------------
+            fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+
             imgs = images.get()
             s = input.sample()
             c = input.channel()
@@ -1369,10 +1477,216 @@ def server(input, output, session):
             return fig
 
         except Exception as e:
+            fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
             ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
             ax.set_axis_off()
             return fig
-            
+        
+
+    def _sync_mask_column_choices(df: pd.DataFrame) -> None:
+        if df is None or df.empty:
+            return
+
+        colNames = list(df.columns)
+
+        def pick_first(existingNames: list[str], fallback=None):
+            for name in existingNames:
+                if name in colNames:
+                    return name
+            return fallback
+
+        default = colNames[0] if colNames else None
+
+        ui.update_select(
+            "mask_cell_id_col",
+            choices=colNames,
+            selected=pick_first(["CellName", "ObjectNumber", "Identifier"], default),
+            session=session,
+        )
+        ui.update_select(
+            "mask_x_col",
+            choices=colNames,
+            selected=pick_first(["Location_Center_X", "Center_X", "X"], default),
+            session=session,
+        )
+        ui.update_select(
+            "mask_y_col",
+            choices=colNames,
+            selected=pick_first(["Location_Center_Y", "Center_Y", "Y"], default),
+            session=session,
+        )
+        ui.update_select(
+            "mask_name_col",
+            choices=colNames,
+            selected=pick_first(["CellMaskName", "ROIName", "MaskName"], default),
+            session=session,
+        )
+        ui.update_select(
+            "mask_cluster_col",
+            choices=colNames,
+            selected=pick_first(
+                ["MergedSublineage", "MergedSubsetNames", "CellClusterNames", "Cluster", "ClusterName"],
+                default,
+            ),
+            session=session,
+        )
+        ui.update_select(
+            "mask_condition_col",
+            choices=colNames,
+            selected=pick_first(["Condition"], default),
+            session=session,
+        )
+        ui.update_select(
+            "mask_sample_col",
+            choices=colNames,
+            selected=pick_first(["SampleNumber", "SampleName"], default),
+            session=session,
+        )
+
+
+    @output
+    @render.plot
+    def mask_viewer():
+        fig = plt.figure(figsize=(12, 8), dpi=120)
+
+        try:
+            sel = selected_mask_match.get()
+            inputDf = mask_input_df.get()
+
+            gs = fig.add_gridspec(1, 2, width_ratios=[4, 1], wspace=0.02)
+            axImg = fig.add_subplot(gs[0, 0])
+            axLeg = fig.add_subplot(gs[0, 1])
+
+            if sel is None or sel.empty:
+                axImg.text(0.5, 0.5, "No matched mask selected", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            if inputDf is None or inputDf.empty:
+                axImg.text(0.5, 0.5, "No cell table loaded", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            maskNameCol = input.mask_name_col() or "CellMaskName"
+            xCol = input.mask_x_col()
+            yCol = input.mask_y_col()
+            clusterCol = input.mask_cluster_col()
+            scaleFactor = int(input.mask_scale_factor() or 5)
+
+            if not xCol or not yCol or not clusterCol or not maskNameCol:
+                axImg.text(0.5, 0.5, "Please select mask, X, Y and cluster columns", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            if clusterCol not in inputDf.columns:
+                axImg.text(0.5, 0.5, f"Cluster column '{clusterCol}' not found", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            row = sel.iloc[0]
+            maskName = str(row[maskNameCol])
+            maskPath = row.get("MaskPath", None)
+
+            if not maskPath or pd.isna(maskPath):
+                axImg.text(0.5, 0.5, "Selected mask has no valid file path", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            try:
+                cellMask = read_mask_tiff(maskPath)
+            except Exception as e:
+                axImg.text(0.5, 0.5, f"Failed to read mask:\n{e}", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            matchingData = get_cells_for_mask_name(
+                inputDf,
+                mask_name=maskName,
+                mask_name_col=maskNameCol,
+            )
+
+            if matchingData.empty:
+                axImg.text(0.5, 0.5, "No cell rows found for selected mask", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            try:
+                matchedData = match_mask_centroids_to_cells(
+                    cellMask=cellMask,
+                    matchingData=matchingData,
+                    xCol=xCol,
+                    yCol=yCol,
+                )
+            except Exception as e:
+                axImg.text(0.5, 0.5, f"Matching failed:\n{e}", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            try:
+                plotData = make_mask_plot_data(
+                    cellMask=cellMask,
+                    matchedData=matchedData,
+                    clusterCol=clusterCol,
+                    scaleFactor=scaleFactor,
+                    background="white",
+                    borderColor="white",
+                    missingColor="#808080",
+                )
+            except Exception as e:
+                axImg.text(0.5, 0.5, f"Plot construction failed:\n{e}", ha="center", va="center")
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
+            axImg.imshow(plotData["colorMat"], interpolation="nearest")
+            axImg.set_axis_off()
+
+            clusterColors = plotData["clusterColors"]
+            handles = [
+                Patch(facecolor=clusterColors[name], edgecolor="none", label=name)
+                for name in sorted(clusterColors.keys())
+            ]
+
+            axLeg.set_axis_off()
+
+            if len(handles) > 0:
+                legendFontSize = 8
+                if len(handles) <= 12:
+                    legendFontSize = 10
+                elif len(handles) >= 30:
+                    legendFontSize = 6
+
+                axLeg.legend(
+                    handles=handles,
+                    loc="upper left",
+                    frameon=False,
+                    fontsize=legendFontSize,
+                    borderaxespad=0.0,
+                )
+
+            fig.suptitle(
+                f"{maskName} | {matchedData.shape[0]} masks matched",
+                fontsize=10,
+                y=0.995,
+            )
+            plt.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.01)
+            return fig
+
+        except Exception as e:
+            ax = fig.add_subplot(111)
+            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
+            ax.set_axis_off()
+            return fig
+
+
     @output
     @render.ui
     ##This is the small tooltip that gived information about how the normalization actually workd
@@ -1569,5 +1883,224 @@ def server(input, output, session):
             _sync_composite_channel_choices(s, overwriteDefaults=False)
 
         print(f"✅ Imported parameters from {csv_path}")
+
+    @reactive.Effect
+    @reactive.event(input.browse_mask_path)
+    def _browse_mask_path():
+        try:
+            folder = pick_folder_dialog()
+        except Exception:
+            folder = ""
+
+        if not folder:
+            return
+
+        session.send_input_message("mask_path", {"value": folder})
+
+    @reactive.Effect
+    @reactive.event(input.match_masks)
+    def _match_masks():
+        df = mask_input_df.get()
+
+        if df is None or df.empty:
+            print("⚠️ No cell table available for mask matching. Load a mask CSV first.")
+            mask_files_df.set(pd.DataFrame())
+            mask_match_df.set(pd.DataFrame())
+            matched_masks_df.set(pd.DataFrame())
+            missing_masks_df.set(pd.DataFrame())
+            return
+
+        mask_dir = (input.mask_path() or "").strip()
+        if not mask_dir or not os.path.isdir(mask_dir):
+            print("⚠️ Invalid mask folder.")
+            mask_files_df.set(pd.DataFrame())
+            mask_match_df.set(pd.DataFrame())
+            matched_masks_df.set(pd.DataFrame())
+            missing_masks_df.set(pd.DataFrame())
+            return
+
+        cell_id_col = input.mask_cell_id_col()
+        x_col = input.mask_x_col()
+        y_col = input.mask_y_col()
+        mask_name_col = input.mask_name_col()
+
+        try:
+            df_valid = validate_mask_input_table(
+                df,
+                cell_id_col=cell_id_col,
+                x_col=x_col,
+                y_col=y_col,
+                mask_name_col=mask_name_col,
+            )
+
+            files_df = list_mask_files(mask_dir)
+            match_df = match_cellmask_names_to_files(
+                df_valid,
+                files_df,
+                mask_name_col=mask_name_col,
+            )
+            matched_df, missing_df = split_mask_matches(match_df)
+
+        except Exception as e:
+            print(f"❌ Mask matching failed: {e}")
+            mask_files_df.set(pd.DataFrame())
+            mask_match_df.set(pd.DataFrame())
+            matched_masks_df.set(pd.DataFrame())
+            missing_masks_df.set(pd.DataFrame())
+            return
+
+        mask_input_df.set(df_valid)
+        mask_files_df.set(files_df)
+        mask_match_df.set(match_df)
+        matched_masks_df.set(matched_df)
+        missing_masks_df.set(missing_df)
+
+        selected_choices = list(matched_df[mask_name_col].astype(str)) if not matched_df.empty else []
+        selected_default = selected_choices[0] if selected_choices else None
+
+        ui.update_select(
+            "selected_mask_name",
+            choices=selected_choices,
+            selected=selected_default,
+            session=session,
+        )
+
+        print(f"✅ Mask matching complete: {len(matched_df)} matched, {len(missing_df)} missing.")
+
+    @reactive.Effect
+    @reactive.event(input.browse_mask_csv)
+    def _browse_mask_csv():
+        csv_path = pick_open_csv_dialog(initialdir=os.getcwd())
+        if not csv_path:
+            return
+        session.send_input_message("mask_csv_path", {"value": csv_path})
+
+    @reactive.Effect
+    @reactive.event(input.load_mask_csv)
+    def _load_mask_csv():
+        csv_path = (input.mask_csv_path() or "").strip()
+
+        if not csv_path or not os.path.isfile(csv_path):
+            print("⚠️ Invalid mask CSV path.")
+            mask_input_df.set(pd.DataFrame())
+            return
+
+        try:
+            df_mask = pd.read_csv(csv_path, index_col=0)
+        except Exception as e:
+            print(f"❌ Failed to read mask CSV: {e}")
+            mask_input_df.set(pd.DataFrame())
+            return
+
+        if df_mask.empty:
+            print("⚠️ Mask CSV is empty.")
+            mask_input_df.set(pd.DataFrame())
+            return
+
+        mask_input_df.set(df_mask)
+        _sync_mask_column_choices(df_mask)
+        print(f"✅ Loaded mask cell table → {csv_path}")
+
+    @output
+    @render.ui
+    def selected_mask_summary():
+        sel = selected_mask_match.get()
+        df = mask_input_df.get()
+
+        if sel is None or sel.empty:
+            return ui.tags.small("No matched mask selected.", class_="text-muted")
+
+        row = sel.iloc[0]
+        maskNameCol = input.mask_name_col() or "CellMaskName"
+        clusterCol = input.mask_cluster_col()
+
+        maskName = str(row[maskNameCol])
+        nCells = 0
+        nClusters = 0
+
+        if df is not None and not df.empty and maskNameCol in df.columns:
+            tempDf = df.loc[df[maskNameCol].astype(str) == maskName].copy()
+            nCells = tempDf.shape[0]
+            if clusterCol and clusterCol in tempDf.columns:
+                nClusters = tempDf[clusterCol].astype(str).nunique()
+
+        return ui.div(
+            ui.tags.p(f"Selected mask: {maskName}"),
+            ui.tags.p(f"Mask file: {row.get('MaskFile', '—')}"),
+            ui.tags.p(f"Rows in cell table: {nCells}"),
+            ui.tags.p(f"Clusters present: {nClusters}"),
+        )
+
+    @output
+    @render.ui
+    def mask_table_summary():
+        df = mask_input_df.get()
+
+        if df is None or df.empty:
+            return ui.tags.small("No cell table loaded yet.", class_="text-muted")
+
+        return ui.div(
+            ui.tags.p(f"Rows in cell table: {len(df)}"),
+            ui.tags.p(f"Columns in cell table: {len(df.columns)}"),
+        )
+
+    @output
+    @render.ui
+    def mask_match_summary():
+        match_df = mask_match_df.get()
+        matched_df = matched_masks_df.get()
+        missing_df = missing_masks_df.get()
+
+        if match_df is None or match_df.empty:
+            return ui.tags.small("No mask matching performed yet.", class_="text-muted")
+
+        return ui.div(
+            ui.tags.p(f"Unique mask names in table: {len(match_df)}"),
+            ui.tags.p(f"Matched mask files: {len(matched_df)}"),
+            ui.tags.p(f"Missing mask files: {len(missing_df)}"),
+        )
+
+    @output
+    @render.table
+    def mask_match_table():
+        df = mask_match_df.get()
+
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["CellMaskName", "MaskFile", "MaskExists"])
+
+        return df
+    
+    @reactive.Effect
+    @reactive.event(input.selected_mask_name)
+    def _on_selected_mask_name():
+        selected_name = input.selected_mask_name()
+        match_df = matched_masks_df.get()
+
+        if match_df is None or match_df.empty or not selected_name:
+            selected_mask_match.set(pd.DataFrame())
+            return
+
+        mask_name_col = input.mask_name_col() or "CellMaskName"
+        sel = match_df.loc[match_df[mask_name_col].astype(str) == str(selected_name)].copy()
+        selected_mask_match.set(sel)
+
+    @output
+    @render.ui
+    def mask_visualization_placeholder():
+        sel = selected_mask_match.get()
+
+        if sel is None or sel.empty:
+            return ui.tags.div(
+                ui.tags.p("No matched mask selected."),
+                class_="text-muted"
+            )
+
+        row = sel.iloc[0]
+        return ui.tags.div(
+            ui.tags.p("Visualization area reserved for mask rendering."),
+            ui.tags.p(f"Selected file: {row.get('MaskFile', '—')}"),
+            class_="text-muted"
+        )
+
 
 app = App(app_ui, server)
