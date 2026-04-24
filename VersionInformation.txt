@@ -2,8 +2,9 @@ Version history
 New in version 0.6!
 Added a way to visualize cellmasks in the app
     -Load a CSV that contain cellnames, clusternames, location and name of your masks, then load the masks. PINT will now show a visual of how the cells look in space
-    -next update will add nearest neighbor analysis and niche analysis
+    -Nearest neighbor analysis was added including statistical test
 Added automated export function that export selected channels for all images
+Fixed viewer bug that would render the images under the mask visualization tab 
 
 open issues
     -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv, however.
