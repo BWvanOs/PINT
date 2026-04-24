@@ -3,17 +3,23 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import pandas as pd
+
 from shiny import App, ui, render, reactive
-from scipy.ndimage import grey_opening, uniform_filter
+from shiny.types import SilentException
+
+from scipy.ndimage import grey_opening, uniform_filter, median_filter
 import os, sys, subprocess
 import shutil
 import warnings
+from datetime import datetime
 
 from tifffile import imwrite, imread
 
 from pint_app.core.load_tiffs import load_tiffs_raw
 from pint_app.core.formatting import fmt1
+from pint_app.core.mask_neighbors import build_touching_edges_for_pushed_dataset
 from pint_app.core.dialogs import (
     pick_folder_dialog,
     pick_open_csv_dialog,
@@ -36,6 +42,7 @@ from pint_app.core.processing import (
     process_image_pipeline,
 )
 from pint_app.core.selection import cycle_list, order_by_canonical
+
 from pint_app.core.params import (
     PARAM_COLUMNS,
     make_params_df,
@@ -43,8 +50,6 @@ from pint_app.core.params import (
     format_for_display,
     validate_and_normalize_import,
 )
-
-from matplotlib.patches import Patch
 
 from pint_app.core.load_masks import (
     validate_mask_input_table,
@@ -59,6 +64,13 @@ from pint_app.core.mask_viz import (
     read_mask_tiff,
     match_mask_centroids_to_cells,
     make_mask_plot_data,
+)
+
+from pint_app.core.mask_neighbors_stats import (
+    chance_correct_touching_interactions,
+    make_sample_interaction_matrix,
+    permanova_one_factor,
+    aggregate_interaction_matrix,
 )
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
@@ -198,7 +210,32 @@ app_ui = ui.page_sidebar(
             .controls-top .shiny-input-container { margin-bottom: 0 !important; }
             .controls-top .row { --bs-gutter-y: 0; margin-bottom: 0; }
             .controls-top .col { padding-left: 0; padding-right: 0; }
-            .controls-fixed hr { margin: 6px 0; }"""
+            .controls-fixed hr { margin: 6px 0; }
+
+            .mask-section-title {
+                font-weight: 700;
+                margin-top: 0.25rem;
+                margin-bottom: 0.35rem;
+            }
+
+            .mask-divider {
+                margin-top: 0.6rem;
+                margin-bottom: 0.6rem;
+            }
+
+            .compact-stack p {
+                margin-bottom: 0.2rem;
+            }
+
+            .compact-stack .shiny-input-container {
+                margin-bottom: 0.4rem !important;
+            }
+
+            .compact-small-line {
+                margin-bottom: 0.15rem;
+                line-height: 1.2;
+            }                    
+            """
         )
     ), 
 
@@ -396,6 +433,7 @@ app_ui = ui.page_sidebar(
                                     ),
                                 ),
                             ),
+                            value="pint",
                         ),
 
                         ui.nav_panel(
@@ -444,13 +482,14 @@ app_ui = ui.page_sidebar(
                                     ),
                                 ),
                             ),
+                            value="creator",
                         ),
 
                         ui.nav_panel(
                             "Mask visualization",
                             ui.row(
                                 ui.column(
-                                    4,
+                                    3,
                                     ui.card(
                                         ui.card_header("Mask input"),
                                         ui.input_text("mask_csv_path", "Cell table CSV", value="", width="100%"),
@@ -472,58 +511,128 @@ app_ui = ui.page_sidebar(
                                         ui.input_select("mask_cluster_col", "Cluster column", choices=[], selected=None, width="100%"),
                                         ui.input_select("mask_condition_col", "Condition column", choices=[], selected=None, width="100%"),
                                         ui.input_select("mask_sample_col", "SampleNumber column", choices=[], selected=None, width="100%"),
-                                        ui.input_numeric("mask_scale_factor", "Scale factor", value=5, min=1, max=20, step=1),
+                                        ui.input_numeric("mask_scale_factor", "Scale factor", value=2, min=1, max=20, step=1),
                                     ),
                                     ui.br(),
                                     ui.card(
                                         ui.card_header("Matched masks"),
-                                        ui.output_ui("mask_table_summary"),
-                                        ui.output_ui("mask_match_summary"),
-                                        ui.input_select("selected_mask_name", "Select mask", choices=[], selected=None, width="100%"),
-                                        ui.output_ui("selected_mask_summary"),
+                                        ui.div(
+                                            ui.tags.div("Selection / visualization", class_="mask-section-title"),
+                                            ui.output_ui("mask_table_summary"),
+                                            ui.output_ui("mask_match_summary"),
+                                            ui.input_select("selected_mask_name", "Select mask", choices=[], selected=None, width="100%"),
+                                            ui.output_ui("selected_mask_summary"),
+
+                                            ui.hr(class_="mask-divider"),
+
+                                            ui.tags.div("Manual matching for unmatched masks", class_="mask-section-title"),
+                                            ui.output_ui("manual_mask_match_ui"),
+                                            ui.input_action_button(
+                                                "apply_manual_mask_matches",
+                                                "Apply manual matches",
+                                                class_="btn btn-secondary w-100 mt-2",
+                                            ),
+                                            ui.hr(class_="mask-divider"),
+                                            ui.input_action_button(
+                                                "export_all_mask_visualizations",
+                                                "Export all matched mask visualizations",
+                                                class_="btn btn-secondary w-100 mt-2",
+                                            ),
+                                            ui.hr(class_="mask-divider"),
+                                            ui.input_action_button(
+                                                "push_to_neighborhood",
+                                                "Push to neighborhood",
+                                                class_="btn btn-primary w-100 mt-2",
+                                                ),
+                                            ),
+                                            class_="compact-stack",
+                                        ),
+                                ),
+                                ui.column(
+                                    9,
+                                    ui.card(
+                                        ui.card_header("Visualization"),
+                                        ui.div(
+                                            ui.output_plot("mask_viewer", fill=True, height="100%"),
+                                            style="height: 75vh;",
+                                        ),
+                                    ),
+                                ),
+                            ),
+                            value="mask",
+                        ),
+
+                        ui.nav_panel(
+                            "Neigborhood Analysis",
+                            ui.row(
+                                ui.column(
+                                    4,
+                                    ui.card(
+                                        ui.card_header("Neighborhood input"),
+                                        ui.output_ui("neighborhood_input_summary"),
+                                        ui.input_numeric("touching_n_perm", "N permutations", value=1000, min=0, step=100),
+                                        ui.input_select(
+                                            "analysis_unit_col",
+                                            "Final comparison unit",
+                                            choices=[],
+                                            selected=None,
+                                            width="100%",
+                                        ),
+                                        ui.input_checkbox("save_mask_copy_on_analysis", "Save matched mask TIFF copies", value=False),
+                                        ui.input_action_button(
+                                            "run_touching_analysis",
+                                            "Run touching analysis",
+                                            class_="btn btn-primary w-100 mt-2",
+                                        ),
+                                        ui.hr(),
+                                        ui.tags.div("Fallback: kernel/radius-based analysis", class_="mask-section-title"),
+                                        ui.tags.a(
+                                            "Open legacy neighborhood analysis",
+                                            href="/neighborhood/",
+                                            target="_blank",
+                                            role="button",
+                                            class_="btn btn-secondary w-100 mt-2",
+                                            style="pointer-events: auto;",
+                                        ),
+                                    )
+                                ),
+                                ui.column(
+                                    8,
+                                    ui.card(
+                                        ui.card_header("Neighborhood status"),
+                                        ui.output_text_verbatim("neighborhood_status_text"),
+                                        ui.output_ui("neighborhood_touching_summary"),
+                                    ),
+                                ),
+                            ),
+                            ui.br(),
+                            ui.row(
+                                ui.column(
+                                    4,
+                                    ui.card(
+                                        ui.card_header("PERMANOVA"),
+                                        ui.output_ui("permanova_summary"),
                                     ),
                                 ),
                                 ui.column(
                                     8,
                                     ui.card(
-                                        ui.card_header("Visualization"),
-                                        ui.div(
-                                            ui.output_plot("mask_viewer", fill=True, height="100%"),
-                                            style="height: 75vh;"
-                                        ),
+                                        ui.card_header("Touching interaction results"),
+                                        ui.output_data_frame("touching_results_preview"),
                                     ),
                                 ),
                             ),
+                            value="neighborhood",
                         ),
-
-                        ui.nav_panel(
-                            "Neigborhood",
-                            ui.row(
-                                ui.column(
-                                    2,
-                                    ui.card(
-                                        ui.card_header("Neighborhood analysis"),
-                                        ui.tags.a(
-                                            "Open neighborhood analysis",
-                                            href="/neighborhood/",
-                                            target="_blank",
-                                            role="button",
-                                            class_="btn btn-secondary w-100",
-                                            style="pointer-events: auto;",
-                                        ),
-                                    ),
-                                ),
-                                ui.column(10),
-                            ),
-                        ),
-
                         id="viewer_mode",
                     ),
                     class_="controls-fixed",
                 ),
-
                 ##Main plot area --> here images will be rendered
-                ui.output_ui("main_viewer_ui"),
+                ui.tags.div(
+                    ui.output_ui("main_viewer_ui"),
+                    class_="viewer-fill",
+                ),
                 class_="flex-col",
             ),
         ),
@@ -536,9 +645,6 @@ app_ui = ui.page_sidebar(
 
 
 ## <----------------> SERVER! <-------------------> ##
-from scipy.ndimage import median_filter
-
-
 def server(input, output, session):
     #Make all the reactive states of the app, will be filled later
     images = reactive.Value({})                  #Dictionary of images, will be filled by tiffloader
@@ -558,8 +664,16 @@ def server(input, output, session):
     matched_masks_df = reactive.Value(pd.DataFrame())
     missing_masks_df = reactive.Value(pd.DataFrame())
     selected_mask_match = reactive.Value(pd.DataFrame())
-   
-    
+    manual_mask_match_df = reactive.Value(pd.DataFrame())
+    final_mask_match_df = reactive.Value(pd.DataFrame())
+    neighborhood_input_data = reactive.Value(None)
+    neighborhood_status_msg = reactive.Value("No mask dataset pushed yet.")
+    neighborhood_touching_edges = reactive.Value(pd.DataFrame())
+    neighborhood_matched_cells = reactive.Value(pd.DataFrame())
+    neighborhood_touching_results = reactive.Value(pd.DataFrame())
+    neighborhood_sample_matrix = reactive.Value(pd.DataFrame())
+    neighborhood_permanova_results = reactive.Value(pd.DataFrame())
+        
     ## <----------------> Helper functions <-------------------> ##
     def _get_winsor_settings():
         """
@@ -910,6 +1024,106 @@ def server(input, output, session):
             selected.append((channelName, colorName, gain))
 
         return selected
+
+    def _build_mask_visualization_figure(
+        maskPath: str,
+        maskName: str,
+        matchingData: pd.DataFrame,
+        clusterCol: str,
+        xCol: str,
+        yCol: str,
+        scaleFactor: int,
+    ):
+        cellMask = read_mask_tiff(maskPath)
+
+        matchedData = match_mask_centroids_to_cells(
+            cellMask=cellMask,
+            matchingData=matchingData,
+            xCol=xCol,
+            yCol=yCol,
+        )
+
+        plotData = make_mask_plot_data(
+            cellMask=cellMask,
+            matchedData=matchedData,
+            clusterCol=clusterCol,
+            scaleFactor=scaleFactor,
+            background="white",
+            borderColor="white",
+            missingColor="#808080",
+        )
+
+        colorMat = plotData["colorMat"]
+        clusterColors = plotData["clusterColors"]
+
+        imgH, imgW = colorMat.shape[:2]
+        imgRatio = imgW / imgH if imgH > 0 else 1.0
+
+        # Keep image ratio intact while reserving a readable legend column.
+        imagePanelHeight = 8.0
+        imagePanelWidth = imagePanelHeight * imgRatio
+
+        legendPanelWidth = 3.2
+        figWidth = imagePanelWidth + legendPanelWidth
+        figHeight = imagePanelHeight
+
+        fig = plt.figure(figsize=(figWidth, figHeight), dpi=200)
+        gs = fig.add_gridspec(
+            1, 2,
+            width_ratios=[imagePanelWidth, legendPanelWidth],
+            wspace=0.02,
+        )
+
+        axImg = fig.add_subplot(gs[0, 0])
+        axLeg = fig.add_subplot(gs[0, 1])
+
+        axImg.imshow(colorMat, interpolation="nearest")
+        axImg.set_axis_off()
+
+        handles = [
+            Patch(facecolor=clusterColors[name], edgecolor="none", label=name)
+            for name in sorted(clusterColors.keys())
+        ]
+
+        axLeg.set_axis_off()
+
+        if len(handles) > 0:
+            legendFontSize = 8
+            if len(handles) <= 12:
+                legendFontSize = 10
+            elif len(handles) >= 30:
+                legendFontSize = 6
+
+            axLeg.legend(
+                handles=handles,
+                loc="upper left",
+                frameon=False,
+                fontsize=legendFontSize,
+                borderaxespad=0.0,
+            )
+
+        fig.suptitle(
+            f"{maskName} | {matchedData.shape[0]} masks matched",
+            fontsize=10,
+            y=0.995,
+        )
+        plt.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.01)
+
+        return fig, matchedData
+
+
+    def _get_neighborhood_output_dir():
+        obj = neighborhood_input_data.get()
+        if obj is None:
+            return None
+
+        maskFolder = obj.get("mask_folder", None)
+        if not maskFolder:
+            return None
+
+        outDir = Path(maskFolder) / "Neigborhood results"
+        outDir.mkdir(parents=True, exist_ok=True)
+        return outDir
 
     @reactive.Effect
     @reactive.event(input.save_composite_tiff)
@@ -1366,33 +1580,264 @@ def server(input, output, session):
             )
         )
 
-    # <---------- plot ---------->
-    @output
-    @render.ui
-    def main_viewer_ui():
-        mode = input.viewer_mode() or "PINT"
+    @reactive.Effect
+    @reactive.event(input.export_all_mask_visualizations)
+    def _confirm_export_all_mask_visualizations():
+        finalDf = final_mask_match_df.get()
 
-        if mode in ["PINT", "Image creator"]:
-            return ui.tags.div(
-                ui.output_plot("img_viewer", fill=True, height="100%"),
-                class_="viewer-fill",
+        if finalDf is None or finalDf.empty:
+            print("⚠️ No matched masks available to export.")
+            return
+
+        nMasks = int(finalDf["MaskExists"].sum()) if "MaskExists" in finalDf.columns else len(finalDf)
+
+        m = ui.modal(
+            ui.p(
+                f"You are about to export {nMasks:,} rendered mask visualizations as TIFF files."
+            ),
+            ui.p(
+                "This can take substantial time and disk space because each output includes the image and a readable legend."
+            ),
+            ui.tags.small("Continue?"),
+            title="Confirm export of all matched mask visualizations",
+            easy_close=True,
+            footer=ui.div(
+                ui.modal_button("Cancel", class_="btn btn-secondary"),
+                ui.input_action_button(
+                    "confirm_export_all_mask_visualizations",
+                    "Export",
+                    class_="btn btn-primary ms-2",
+                ),
+            ),
+        )
+        ui.modal_show(m, session=session)
+
+    @reactive.Effect
+    @reactive.event(input.run_touching_analysis)
+    def _run_touching_analysis():
+        obj = neighborhood_input_data.get()
+
+        if obj is None:
+            neighborhood_status_msg.set("No pushed neighborhood dataset available.")
+            neighborhood_matched_cells.set(pd.DataFrame())
+            neighborhood_touching_edges.set(pd.DataFrame())
+            neighborhood_touching_results.set(pd.DataFrame())
+            neighborhood_sample_matrix.set(pd.DataFrame())
+            neighborhood_permanova_results.set(pd.DataFrame())
+            return
+
+        matchTable = obj.get("mask_match_table", pd.DataFrame())
+        nMasks = len(matchTable) if matchTable is not None else 0
+        nPerm = int(input.touching_n_perm() or 0)
+
+        sampleCol = obj["column_map"].get("sample_col", None)
+        clusterCol = obj["column_map"].get("cluster_col", None)
+        conditionCol = obj["column_map"].get("condition_col", None)
+
+        if not sampleCol or not clusterCol:
+            neighborhood_status_msg.set("Sample and cluster columns must be selected before running analysis.")
+            return
+
+        with ui.Progress(min=0, max=max(nMasks + 3, 1), session=session) as p:
+            step = 0
+
+            def progress(msg: str) -> None:
+                nonlocal step
+                if (
+                    "Building touching graph for" in msg or
+                    "Done " in msg or
+                    "Summarizing observed touching interactions" in msg or
+                    "Computing permutation expectation on fixed touching graph" in msg
+                ):
+                    step = min(step + 1, max(nMasks + 3, 1))
+                p.set(step, message=msg)
+
+            p.set(0, message="Starting touching analysis...")
+
+            try:
+                matchedData, touchingEdges = build_touching_edges_for_pushed_dataset(
+                    obj,
+                    progress=progress,
+                )
+            except Exception as e:
+                neighborhood_matched_cells.set(pd.DataFrame())
+                neighborhood_touching_edges.set(pd.DataFrame())
+                neighborhood_touching_results.set(pd.DataFrame())
+                neighborhood_sample_matrix.set(pd.DataFrame())
+                neighborhood_permanova_results.set(pd.DataFrame())
+                neighborhood_status_msg.set(f"Touching analysis failed: {e}")
+                return
+
+            neighborhood_matched_cells.set(matchedData)
+            neighborhood_touching_edges.set(touchingEdges)
+
+            # Optional TIFF copy export
+            outDir = _get_neighborhood_output_dir()
+            if bool(input.save_mask_copy_on_analysis()) and outDir is not None and matchTable is not None and not matchTable.empty:
+                maskCopyDir = outDir / "matched_mask_tiff_copies"
+                maskCopyDir.mkdir(parents=True, exist_ok=True)
+
+                for _, row in matchTable.iterrows():
+                    maskPath = row.get("MaskPath", None)
+                    if maskPath and not pd.isna(maskPath):
+                        src = Path(str(maskPath))
+                        if src.exists():
+                            dst = maskCopyDir / src.name
+                            if not dst.exists():
+                                dst.write_bytes(src.read_bytes())
+
+            try:
+                resultsDf = chance_correct_touching_interactions(
+                    edgeDf=touchingEdges,
+                    matchedDf=matchedData,
+                    sample_col=sampleCol,
+                    cluster_col=clusterCol,
+                    n_perm=nPerm,
+                    random_seed=1,
+                    progress=progress,
+                )
+            except Exception as e:
+                neighborhood_touching_results.set(pd.DataFrame())
+                neighborhood_sample_matrix.set(pd.DataFrame())
+                neighborhood_permanova_results.set(pd.DataFrame())
+                neighborhood_status_msg.set(f"Touching graph built, but chance correction failed: {e}")
+                return
+
+            neighborhood_touching_results.set(resultsDf)
+
+            sampleMatrixDf = make_sample_interaction_matrix(
+                resultsDf,
+                sample_col=sampleCol,
+                value_col="ChanceCorrectedInteraction",
             )
 
-        return ui.tags.div()
-    
+            analysisUnitCol = input.analysis_unit_col()
+
+            if not analysisUnitCol or analysisUnitCol not in matchedData.columns:
+                neighborhood_touching_results.set(resultsDf)
+                neighborhood_sample_matrix.set(pd.DataFrame())
+                neighborhood_permanova_results.set(pd.DataFrame())
+                neighborhood_status_msg.set(
+                    f"Final comparison unit column '{analysisUnitCol}' is not available."
+                )
+                return
+
+            if analysisUnitCol == sampleCol:
+                finalMatrixDf = sampleMatrixDf.copy()
+                finalMetaDf = matchedData[[sampleCol, conditionCol]].drop_duplicates().copy()
+                permanovaSampleCol = sampleCol
+            else:
+                metaDf = matchedData[[sampleCol, analysisUnitCol, conditionCol]].drop_duplicates().copy()
+
+                finalMatrixDf, finalMetaDf = aggregate_interaction_matrix(
+                    matrixDf=sampleMatrixDf,
+                    metadataDf=metaDf,
+                    sample_col=sampleCol,
+                    aggregate_col=analysisUnitCol,
+                    group_col=conditionCol,
+                )
+                permanovaSampleCol = analysisUnitCol
+
+            neighborhood_sample_matrix.set(finalMatrixDf)
+
+            if conditionCol and conditionCol in finalMetaDf.columns and not finalMatrixDf.empty:
+                permanovaDf = permanova_one_factor(
+                    matrixDf=finalMatrixDf,
+                    metadataDf=finalMetaDf,
+                    sample_col=permanovaSampleCol,
+                    group_col=conditionCol,
+                    n_perm=999,
+                    random_seed=1,
+                )
+                if not permanovaDf.empty:
+                    permanovaDf["AnalysisUnit"] = str(analysisUnitCol)
+                    permanovaDf["Status"] = "OK"
+            else:
+                permanovaDf = pd.DataFrame()
+
+            neighborhood_permanova_results.set(permanovaDf)
+
+            # Save outputs
+            if outDir is not None:
+                if not touchingEdges.empty:
+                    touchingEdges.to_csv(outDir / "touching_edges_annotated.csv", index=False)
+                if not matchedData.empty:
+                    matchedData.to_csv(outDir / "matched_cells_for_touching_analysis.csv", index=False)
+                if not resultsDf.empty:
+                    resultsDf.to_csv(outDir / "touching_interactions_with_empirical_pvalues.csv", index=False)
+                if not finalMatrixDf.empty:
+                    finalMatrixDf.to_csv(outDir / "touching_interaction_final_matrix.csv", index=False)
+                if not permanovaDf.empty:
+                    permanovaDf.to_csv(outDir / "touching_interaction_permanova.csv", index=False)
+                if not finalMetaDf.empty:
+                    finalMetaDf.to_csv(outDir / "touching_interaction_final_metadata.csv", index=False)
+
+            neighborhood_status_msg.set(
+                f"Touching analysis complete: {len(touchingEdges):,} touching edges across {nMasks} masks. "
+                f"Results saved to: {outDir if outDir is not None else 'no output folder'}"
+            )
+            p.set(max(nMasks + 3, 1), message="Touching analysis complete.")
+
+    @reactive.Effect
+    def _sync_analysis_unit_col_choices():
+        obj = neighborhood_input_data.get()
+
+        if obj is None:
+            ui.update_select("analysis_unit_col", choices=[], selected=None, session=session)
+            return
+
+        df = obj.get("cell_table", pd.DataFrame())
+        if df is None or df.empty:
+            ui.update_select("analysis_unit_col", choices=[], selected=None, session=session)
+            return
+
+        colNames = list(df.columns)
+
+        def pick_first(existingNames: list[str], fallback=None):
+            for name in existingNames:
+                if name in colNames:
+                    return name
+            return fallback
+
+        default = pick_first(
+            ["ROIName", "CellMaskName", "SampleNumber", "PatientID"],
+            colNames[0] if colNames else None,
+        )
+
+        ui.update_select(
+            "analysis_unit_col",
+            choices=colNames,
+            selected=default,
+            session=session,
+        )
+
+    # <---------- plot ---------->
     ##Below is the actual img viewer where the image is rendered and all the different thresholding stept are visualized.
     @output
     @render.plot
     def img_viewer():
         try:
-            mode = input.viewer_mode() or "PINT"
-            ## -------------------- IMAGE CREATOR --------------------
-            if mode == "Image creator":
+            try:
+                mode = input.viewer_mode()
+            except Exception:
+                mode = "pint"
+
+            mode = mode or "pint"
+
+            if mode not in ["pint", "creator"]:
                 fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+                ax.set_axis_off()
+                plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+                return fig
+
+            if mode == "creator":
+                fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+
                 rgb, used = _build_composite_rgb()
                 if rgb is None:
                     ax.text(0.5, 0.5, "No composite channels selected", ha="center", va="center")
                     ax.set_axis_off()
+                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
                     return fig
 
                 ax.imshow(rgb)
@@ -1414,7 +1859,6 @@ def server(input, output, session):
                 plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
                 return fig
 
-            ## -------------------- DEFAULT PINT SINGLE-CHANNEL VIEWER --------------------
             fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
 
             imgs = images.get()
@@ -1424,13 +1868,16 @@ def server(input, output, session):
             if not imgs or not s or not c or s not in imgs:
                 ax.text(0.5, 0.5, "No image", ha="center", va="center")
                 ax.set_axis_off()
+                plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
                 return fig
 
             arr = imgs[s]
             chlist = channels.get().get(s, [])
+
             if c not in chlist:
                 ax.text(0.5, 0.5, f"Channel {c!r} not found", ha="center", va="center")
                 ax.set_axis_off()
+                plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
                 return fig
 
             idx = chlist.index(c)
@@ -1476,12 +1923,67 @@ def server(input, output, session):
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
             return fig
 
+        except SilentException:
+            raise
         except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            err = str(e).strip() or repr(e)
+
             fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
-            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
+            ax.text(0.01, 0.98, f"Plot error: {err}", ha="left", va="top")
             ax.set_axis_off()
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
             return fig
         
+    @output
+    @render.ui
+    def neighborhood_input_summary():
+        obj = neighborhood_input_data.get()
+
+        if obj is None:
+            return ui.tags.small("No dataset pushed from mask visualization yet.", class_="text-muted")
+
+        df = obj["cell_table"]
+        colMap = obj["column_map"]
+
+        nClusters = 0
+        clusterCol = colMap.get("cluster_col", None)
+        if clusterCol and clusterCol in df.columns:
+            nClusters = df[clusterCol].astype(str).nunique()
+
+        return ui.div(
+            ui.tags.div(f"Masks pushed: {obj['n_masks']}"),
+            ui.tags.div(f"Rows: {len(df):,}"),
+            ui.tags.div(f"Clusters: {nClusters}"),
+            ui.tags.div(f"Mask folder: {obj['mask_folder'] or '—'}"),
+            ui.tags.div(f"Pushed at: {obj['pushed_at']}"),
+        )
+
+    @output
+    @render.text
+    def neighborhood_status_text():
+        return neighborhood_status_msg.get()
+
+
+    @output
+    @render.ui
+    def main_viewer_ui():
+        try:
+            mode = input.viewer_mode()
+        except SilentException:
+            mode = "pint"
+        except Exception:
+            mode = "pint"
+
+        mode = mode or "pint"
+
+        if mode in ["pint", "creator"]:
+            return ui.output_plot("img_viewer", fill=True, height="100%")
+
+        return ui.tags.div()
+
 
     def _sync_mask_column_choices(df: pd.DataFrame) -> None:
         if df is None or df.empty:
@@ -1714,6 +2216,118 @@ def server(input, output, session):
     def param_table():
         return format_for_display(params_df.get())
     
+    @output
+    @render.ui
+    def neighborhood_touching_summary():
+        edgeDf = neighborhood_touching_edges.get()
+        matchedDf = neighborhood_matched_cells.get()
+        resultsDf = neighborhood_touching_results.get()
+
+        if edgeDf is None or edgeDf.empty:
+            return ui.tags.small("No touching-edge results yet.", class_="text-muted")
+
+        nCells = 0 if matchedDf is None or matchedDf.empty else len(matchedDf)
+
+        nClusters = 0
+        if "cell_cluster" in edgeDf.columns:
+            nClusters = pd.unique(
+                pd.concat(
+                    [
+                        edgeDf["cell_cluster"].astype(str),
+                        edgeDf["neighbor_cluster"].astype(str),
+                    ],
+                    ignore_index=True,
+                )
+            ).size
+
+        nInteractions = 0 if resultsDf is None or resultsDf.empty else len(resultsDf)
+
+        return ui.div(
+            ui.tags.div(f"Matched cells: {nCells:,}"),
+            ui.tags.div(f"Touching edges: {len(edgeDf):,}"),
+            ui.tags.div(f"Clusters observed: {nClusters:,}"),
+            ui.tags.div(f"Chance-corrected interaction rows: {nInteractions:,}"),
+        )
+    
+    @output
+    @render.data_frame
+    def touching_results_preview():
+        df = neighborhood_touching_results.get()
+
+        expectedCols = [
+            "cell_cluster", "neighbor_cluster",
+            "n_interactions", "n_cells",
+            "normalized", "normalized_expected", "ChanceCorrectedInteraction",
+            "observed", "expected", "perm_sd",
+            "p_gt", "p_lt", "p_two_sided",
+            "p_adj_gt", "p_adj_lt", "p_adj_two_sided",
+            "Direction",
+        ]
+
+        if df is None or df.empty:
+            empty = pd.DataFrame(columns=expectedCols)
+            return render.DataGrid(empty, height="350px")
+
+        show = df.copy()
+
+        ## add missing columns if upstream result does not have them yet
+        for col in expectedCols:
+            if col not in show.columns:
+                show[col] = np.nan
+
+        ## order columns nicely, then keep any extras at the end
+        extraCols = [c for c in show.columns if c not in expectedCols]
+        show = show[expectedCols + extraCols]
+
+        ## only show first 200 rows
+        show = show.head(200).copy()
+
+        ## round numeric columns
+        numCols = show.select_dtypes(include=["number"]).columns
+        show[numCols] = show[numCols].round(3)
+
+        return render.DataGrid(show, height="350px")
+
+
+    @output
+    @render.ui
+    def permanova_summary():
+        df = neighborhood_permanova_results.get()
+
+        if df is None or df.empty:
+            return ui.tags.small("No PERMANOVA results available.", class_="text-muted")
+
+        row = df.iloc[0]
+
+        parts = []
+
+        if "AnalysisUnit" in row.index:
+            parts.append(ui.tags.div(f"Analysis unit: {row['AnalysisUnit']}"))
+
+        if "Status" in row.index and pd.notna(row["Status"]):
+            parts.append(ui.tags.div(f"Status: {row['Status']}"))
+
+        if pd.notna(row.get("N", np.nan)):
+            parts.append(ui.tags.div(f"N observations: {int(row['N'])}"))
+
+        if pd.notna(row.get("Groups", np.nan)):
+            parts.append(ui.tags.div(f"N groups: {int(row['Groups'])}"))
+
+        if pd.notna(row.get("PseudoF", np.nan)):
+            parts.append(ui.tags.div(f"Pseudo-F: {row['PseudoF']:.4f}"))
+        else:
+            parts.append(ui.tags.div("Pseudo-F: NA"))
+
+        if pd.notna(row.get("PValue", np.nan)):
+            parts.append(ui.tags.div(f"P-value: {row['PValue']:.4g}"))
+        else:
+            parts.append(ui.tags.div("P-value: NA"))
+
+        if pd.notna(row.get("Permutations", np.nan)):
+            parts.append(ui.tags.div(f"Permutations: {int(row['Permutations'])}"))
+
+        return ui.div(*parts)
+
     @reactive.Effect
     @reactive.event(input.perform_analysis)
     ##The moment you hit "analyze" this will popup to give the user a chance to cancel if it was by accident
@@ -1955,7 +2569,11 @@ def server(input, output, session):
         matched_masks_df.set(matched_df)
         missing_masks_df.set(missing_df)
 
-        selected_choices = list(matched_df[mask_name_col].astype(str)) if not matched_df.empty else []
+        final_df = match_df.loc[match_df["MaskExists"]].copy()
+        final_mask_match_df.set(final_df)
+        manual_mask_match_df.set(pd.DataFrame())
+
+        selected_choices = list(final_df[mask_name_col].astype(str)) if not final_df.empty else []
         selected_default = selected_choices[0] if selected_choices else None
 
         ui.update_select(
@@ -1966,6 +2584,111 @@ def server(input, output, session):
         )
 
         print(f"✅ Mask matching complete: {len(matched_df)} matched, {len(missing_df)} missing.")
+
+    @reactive.Effect
+    @reactive.event(input.confirm_export_all_mask_visualizations)
+    def _export_all_mask_visualizations():
+        ui.modal_remove(session=session)
+
+        finalDf = final_mask_match_df.get()
+        inputDf = mask_input_df.get()
+
+        if finalDf is None or finalDf.empty:
+            print("⚠️ No matched masks available to export.")
+            return
+
+        if inputDf is None or inputDf.empty:
+            print("⚠️ No cell table loaded.")
+            return
+
+        maskNameCol = input.mask_name_col() or "CellMaskName"
+        xCol = input.mask_x_col()
+        yCol = input.mask_y_col()
+        clusterCol = input.mask_cluster_col()
+        scaleFactor = int(input.mask_scale_factor() or 2)
+
+        if not xCol or not yCol or not clusterCol or not maskNameCol:
+            print("⚠️ Mask name, X, Y, and cluster columns must be selected.")
+            return
+
+        exportDf = finalDf.loc[finalDf["MaskExists"]].copy()
+        if exportDf.empty:
+            print("⚠️ No valid matched masks available to export.")
+            return
+
+        maskDir = (input.mask_path() or "").strip()
+        if not maskDir:
+            # fallback from first valid mask path
+            if "MaskPath" in exportDf.columns and not exportDf["MaskPath"].isna().all():
+                maskDir = str(Path(exportDf["MaskPath"].dropna().iloc[0]).parent)
+
+        if not maskDir:
+            print("⚠️ Could not determine mask folder.")
+            return
+
+        outDir = Path(maskDir) / "Exported mask visualizations"
+        outDir.mkdir(parents=True, exist_ok=True)
+
+        nMasks = len(exportDf)
+
+        with ui.Progress(min=0, max=nMasks, session=session) as p:
+            done = 0
+
+            for _, row in exportDf.iterrows():
+                maskName = str(row[maskNameCol])
+                maskPath = row.get("MaskPath", None)
+
+                if not maskPath or pd.isna(maskPath):
+                    done += 1
+                    p.set(done, message=f"Skipping {maskName}: no valid mask path")
+                    continue
+
+                try:
+                    matchingData = get_cells_for_mask_name(
+                        inputDf,
+                        mask_name=maskName,
+                        mask_name_col=maskNameCol,
+                    )
+
+                    if matchingData.empty:
+                        done += 1
+                        p.set(done, message=f"Skipping {maskName}: no rows in cell table")
+                        continue
+
+                    fig, matchedData = _build_mask_visualization_figure(
+                        maskPath=str(maskPath),
+                        maskName=maskName,
+                        matchingData=matchingData,
+                        clusterCol=clusterCol,
+                        xCol=xCol,
+                        yCol=yCol,
+                        scaleFactor=scaleFactor,
+                    )
+
+                    safeName = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in maskName)
+                    outPath = outDir / f"{safeName}.tiff"
+
+                    fig.savefig(
+                        outPath,
+                        format="tiff",
+                        dpi=200,
+                        bbox_inches="tight",
+                        pil_kwargs={"compression": "tiff_lzw"},
+                    )
+                    plt.close(fig)
+
+                    done += 1
+                    p.set(done, message=f"Exported {maskName} ({matchedData.shape[0]:,} cells)")
+
+                except Exception as e:
+                    try:
+                        plt.close("all")
+                    except Exception:
+                        pass
+                    done += 1
+                    p.set(done, message=f"Failed {maskName}: {e}")
+
+        print(f"✅ Exported {nMasks:,} matched mask visualizations to {outDir}")
 
     @reactive.Effect
     @reactive.event(input.browse_mask_csv)
@@ -2001,6 +2724,25 @@ def server(input, output, session):
         _sync_mask_column_choices(df_mask)
         print(f"✅ Loaded mask cell table → {csv_path}")
 
+    ##Push data from mask to neigborhood
+    @reactive.Effect
+    @reactive.event(input.push_to_neighborhood)
+    def _push_to_neighborhood():
+        try:
+            pushed = _build_neighborhood_input_object()
+            neighborhood_input_data.set(pushed)
+
+            nRows = len(pushed["cell_table"])
+            nMasks = int(pushed["n_masks"])
+            neighborhood_status_msg.set(
+                f"Pushed {nMasks} matched masks to neighborhood analysis ({nRows:,} rows)."
+            )
+
+            ui.update_navs("viewer_mode", selected="neighborhood", session=session)
+
+        except Exception as e:
+            neighborhood_status_msg.set(f"Failed to push dataset: {e}")
+
     @output
     @render.ui
     def selected_mask_summary():
@@ -2024,11 +2766,14 @@ def server(input, output, session):
             if clusterCol and clusterCol in tempDf.columns:
                 nClusters = tempDf[clusterCol].astype(str).nunique()
 
+        matchType = "Manual" if bool(row.get("ManualMatch", False)) else "Automatic"
+
         return ui.div(
-            ui.tags.p(f"Selected mask: {maskName}"),
-            ui.tags.p(f"Mask file: {row.get('MaskFile', '—')}"),
-            ui.tags.p(f"Rows in cell table: {nCells}"),
-            ui.tags.p(f"Clusters present: {nClusters}"),
+            ui.tags.div(f"Selected mask: {maskName}", class_="compact-small-line"),
+            ui.tags.div(f"Mask file: {row.get('MaskFile', '—')}", class_="compact-small-line"),
+            ui.tags.div(f"Match type: {matchType}", class_="compact-small-line"),
+            ui.tags.div(f"Rows in cell table: {nCells}", class_="compact-small-line"),
+            ui.tags.div(f"Clusters present: {nClusters}", class_="compact-small-line"),
         )
 
     @output
@@ -2040,26 +2785,33 @@ def server(input, output, session):
             return ui.tags.small("No cell table loaded yet.", class_="text-muted")
 
         return ui.div(
-            ui.tags.p(f"Rows in cell table: {len(df)}"),
-            ui.tags.p(f"Columns in cell table: {len(df.columns)}"),
+            ui.tags.div(f"Rows in cell table: {len(df)}", class_="compact-small-line"),
+            ui.tags.div(f"Columns in cell table: {len(df.columns)}", class_="compact-small-line"),
         )
 
     @output
     @render.ui
     def mask_match_summary():
         match_df = mask_match_df.get()
-        matched_df = matched_masks_df.get()
-        missing_df = missing_masks_df.get()
+        final_df = final_mask_match_df.get()
+        manual_df = manual_mask_match_df.get()
 
         if match_df is None or match_df.empty:
             return ui.tags.small("No mask matching performed yet.", class_="text-muted")
 
-        return ui.div(
-            ui.tags.p(f"Unique mask names in table: {len(match_df)}"),
-            ui.tags.p(f"Matched mask files: {len(matched_df)}"),
-            ui.tags.p(f"Missing mask files: {len(missing_df)}"),
-        )
+        autoMatched = int(match_df["MaskExists"].sum())
+        total = len(match_df)
+        manualMatched = 0 if manual_df is None or manual_df.empty else len(manual_df)
+        finalMatched = 0 if final_df is None or final_df.empty else int(final_df["MaskExists"].sum())
 
+        return ui.div(
+            ui.tags.div(f"Unique mask names in table: {total}", class_="compact-small-line"),
+            ui.tags.div(f"Automatic matches: {autoMatched}", class_="compact-small-line"),
+            ui.tags.div(f"Manual matches: {manualMatched}", class_="compact-small-line"),
+            ui.tags.div(f"Final matched masks: {finalMatched}", class_="compact-small-line"),
+            ui.tags.div(f"Still unmatched: {total - finalMatched}", class_="compact-small-line"),
+        )
+    
     @output
     @render.table
     def mask_match_table():
@@ -2074,7 +2826,7 @@ def server(input, output, session):
     @reactive.event(input.selected_mask_name)
     def _on_selected_mask_name():
         selected_name = input.selected_mask_name()
-        match_df = matched_masks_df.get()
+        match_df = final_mask_match_df.get()
 
         if match_df is None or match_df.empty or not selected_name:
             selected_mask_match.set(pd.DataFrame())
@@ -2101,6 +2853,181 @@ def server(input, output, session):
             ui.tags.p(f"Selected file: {row.get('MaskFile', '—')}"),
             class_="text-muted"
         )
+    
+    ##Handlers for unmatched masks
+    @output
+    @render.ui
+    def manual_mask_match_ui():
+        match_df = mask_match_df.get()
+        files_df = mask_files_df.get()
 
+        if match_df is None or match_df.empty:
+            return ui.tags.small("No mask matching performed yet.", class_="text-muted")
+
+        unmatched_df = match_df.loc[~match_df["MaskExists"]].copy()
+        if unmatched_df.empty:
+            return ui.tags.small("All masks matched automatically.", class_="text-muted")
+
+        if files_df is None or files_df.empty:
+            return ui.tags.small("No mask files available for manual matching.", class_="text-muted")
+
+        fileChoices = [""] + list(files_df["MaskFile"].astype(str))
+
+        rows = [
+            ui.tags.small(
+                "Only unmatched mask names are shown here. Select a file manually and click 'Apply manual matches'.",
+                class_="text-muted"
+            )
+        ]
+        for i, (_, row) in enumerate(unmatched_df.iterrows()):
+            maskName = str(row[input.mask_name_col() or "CellMaskName"])
+            rows.append(
+                ui.input_select(
+                    f"manual_mask_match_{i}",
+                    label=maskName,
+                    choices=fileChoices,
+                    selected="",
+                    width="100%",
+                )
+            )
+
+        return ui.div(*rows)
+
+    @reactive.Effect
+    @reactive.event(input.apply_manual_mask_matches)
+    def _apply_manual_mask_matches():
+        match_df = mask_match_df.get()
+        files_df = mask_files_df.get()
+
+        if match_df is None or match_df.empty:
+            print("⚠️ No automatic mask matching available.")
+            manual_mask_match_df.set(pd.DataFrame())
+            final_mask_match_df.set(pd.DataFrame())
+            return
+
+        unmatched_df = match_df.loc[~match_df["MaskExists"]].copy()
+        if unmatched_df.empty:
+            manual_mask_match_df.set(pd.DataFrame())
+            final_mask_match_df.set(match_df.copy())
+            print("✅ No manual matches needed.")
+            return
+
+        mask_name_col = input.mask_name_col() or "CellMaskName"
+        manualRows = []
+
+        for i, (_, row) in enumerate(unmatched_df.iterrows()):
+            selectedFile = getattr(input, f"manual_mask_match_{i}")()
+            if not selectedFile:
+                continue
+
+            fileRow = files_df.loc[files_df["MaskFile"].astype(str) == str(selectedFile)].copy()
+            if fileRow.empty:
+                continue
+
+            fileRow = fileRow.iloc[0]
+
+            manualRows.append(
+                {
+                    mask_name_col: row[mask_name_col],
+                    "MaskFile": fileRow["MaskFile"],
+                    "MaskPath": fileRow["MaskPath"],
+                    "CellMaskName_file": fileRow["CellMaskName"],
+                    "MaskExists": True,
+                    "ManualMatch": True,
+                }
+            )
+
+        manual_df = pd.DataFrame(manualRows)
+        manual_mask_match_df.set(manual_df)
+
+        auto_df = match_df.copy()
+        auto_df["ManualMatch"] = False
+
+        if not manual_df.empty:
+            matched_names = set(manual_df[mask_name_col].astype(str))
+            auto_df = auto_df.loc[~auto_df[mask_name_col].astype(str).isin(matched_names)].copy()
+
+            final_df = pd.concat([auto_df, manual_df], ignore_index=True)
+        else:
+            final_df = auto_df
+
+        final_mask_match_df.set(final_df)
+
+        selected_choices = list(final_df.loc[final_df["MaskExists"], mask_name_col].astype(str)) if not final_df.empty else []
+        current_selected = input.selected_mask_name()
+        selected_default = current_selected if current_selected in selected_choices else (selected_choices[0] if selected_choices else None)
+
+        ui.update_select(
+            "selected_mask_name",
+            choices=selected_choices,
+            selected=selected_default,
+            session=session,
+        )
+
+        nManual = len(manual_df)
+        print(f"✅ Applied {nManual} manual mask match(es).")
+
+
+##Helper to push the data to the neigborhood analysis tab
+    def _build_neighborhood_input_object():
+        matchDf = final_mask_match_df.get()
+        inputDf = mask_input_df.get()
+
+        if matchDf is None or matchDf.empty:
+            raise ValueError("No matched masks available.")
+
+        if inputDf is None or inputDf.empty:
+            raise ValueError("No cell table loaded.")
+
+        maskNameCol = input.mask_name_col() or "CellMaskName"
+        xCol = input.mask_x_col()
+        yCol = input.mask_y_col()
+        clusterCol = input.mask_cluster_col()
+        conditionCol = input.mask_condition_col()
+        sampleCol = input.mask_sample_col()
+
+        if not xCol or not yCol or not clusterCol or not maskNameCol:
+            raise ValueError("Mask name, X, Y, and cluster columns must be selected.")
+
+        validMatchDf = matchDf.loc[matchDf["MaskExists"]].copy()
+        if validMatchDf.empty:
+            raise ValueError("No valid matched masks available.")
+
+        maskNames = set(validMatchDf[maskNameCol].astype(str))
+        pushedCellTable = inputDf.loc[inputDf[maskNameCol].astype(str).isin(maskNames)].copy()
+
+        if pushedCellTable.empty:
+            raise ValueError("No cell-table rows found for the matched masks.")
+
+        # Keep only the needed mask-match rows
+        validMatchDf = validMatchDf.drop_duplicates(subset=[maskNameCol]).copy()
+
+        # Attach mask path onto each cell-table row
+        pushedCellTable = pushedCellTable.merge(
+            validMatchDf[[maskNameCol, "MaskFile", "MaskPath", "MaskExists"]].copy(),
+            on=maskNameCol,
+            how="left",
+        )
+
+        maskFolder = None
+        if "MaskPath" in validMatchDf.columns and not validMatchDf["MaskPath"].isna().all():
+            firstPath = validMatchDf["MaskPath"].dropna().iloc[0]
+            maskFolder = str(Path(firstPath).parent)
+
+        return {
+            "pushed_at": datetime.now().isoformat(timespec="seconds"),
+            "n_masks": int(validMatchDf.shape[0]),
+            "mask_match_table": validMatchDf.copy(),
+            "cell_table": pushedCellTable.copy(),
+            "mask_folder": maskFolder,
+            "column_map": {
+                "mask_name_col": maskNameCol,
+                "x_col": xCol,
+                "y_col": yCol,
+                "cluster_col": clusterCol,
+                "condition_col": conditionCol,
+                "sample_col": sampleCol,
+            },
+        }
 
 app = App(app_ui, server)

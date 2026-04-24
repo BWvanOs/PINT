@@ -145,7 +145,7 @@ def make_mask_plot_data(
     cellMask: np.ndarray,
     matchedData: pd.DataFrame,
     clusterCol: str,
-    scaleFactor: int = 3,
+    scaleFactor: int = 2,
     background: str = "white",
     borderColor: str = "white",
     missingColor: str = "#808080",
@@ -187,11 +187,10 @@ def make_mask_plot_data(
     missingIdx = (cellMask != 0) & (~np.isin(cellMask, assignedMaskValues))
     colorMat[missingIdx] = missingRgb
 
-    borderMask = get_cell_borders(cellMask)
-
+    cellMaskBig = upscale_matrix(cellMask, scaleFactor=scaleFactor)
     colorMatBig = upscale_matrix(colorMat, scaleFactor=scaleFactor)
-    borderMaskBig = upscale_matrix(borderMask, scaleFactor=scaleFactor)
 
+    borderMaskBig = get_cell_borders(cellMaskBig)
     colorMatBig[borderMaskBig] = borderRgb
 
     return {
