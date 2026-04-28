@@ -327,7 +327,7 @@ app_ui = ui.page_sidebar(
                                         ui.card_header("Winsorization"),
                                         ui.row(
                                             ui.column(6, ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01)),
-                                            ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.0, max=1.0, value=0.99, step=0.01)),
+                                            ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.9, max=1.0, value=0.990, step=0.001)),
                                         ),
                                         ui.row(
                                             ui.column(6, ui.input_checkbox("doWinsor", "doWinsorize", value=True)),

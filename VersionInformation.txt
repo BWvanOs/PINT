@@ -11,8 +11,11 @@ open issues
     -Winsorization floor value is not user adjustable.
     -Unable to pick own color for channels
 
-added in version 0.6.0.1
+0.6.0.1
     -Started with manual (readme.md) on how to use it
+0.6.0.2
+    -Changed winsorization upper quantile behavious (0.001 steps, min 0.9)
+
 
 
 

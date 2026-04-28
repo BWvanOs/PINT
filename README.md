@@ -1,4 +1,4 @@
-![PINT banner](Screenshots/)
+![PINT banner](Screenshots/Logo.png)
 
 # PINT
 
@@ -23,7 +23,7 @@ sudo apt install git / brew install git
 git clone https://github.com/BWvanOs/PINT.git
 ```
 
-#### Go to the folder you downloaded pint into and install it:
+Go to the folder you downloaded pint into and install it:
 
 ```
 cd PINT
