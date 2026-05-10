@@ -88,22 +88,19 @@ COMPOSITE_PALETTE = {
 
 COMPOSITE_COLOR_CHOICES = list(COMPOSITE_PALETTE.keys())
 MAX_COMPOSITE_CHANNELS = 8
-
+COMPOSITE_EMPTY_CHOICE = ">> Leave blank <<"
 
 def make_composite_slot(slotIdx: int):
     defaultColor = COMPOSITE_COLOR_CHOICES[(slotIdx - 1) % len(COMPOSITE_COLOR_CHOICES)]
+
     return ui.row(
         ui.column(
-            1,
-            ui.input_checkbox(f"comp_enable_{slotIdx}", "", value=(slotIdx <= 3)),
-        ),
-        ui.column(
-            6,
+            7,
             ui.input_select(
                 f"comp_channel_{slotIdx}",
                 "",
-                choices=[],
-                selected=None,
+                choices=[COMPOSITE_EMPTY_CHOICE],
+                selected=COMPOSITE_EMPTY_CHOICE,
                 width="100%",
             ),
         ),
@@ -119,16 +116,17 @@ def make_composite_slot(slotIdx: int):
         ),
         ui.column(
             2,
-            ui.input_slider(
+            ui.input_numeric(
                 f"comp_gain_{slotIdx}",
                 "",
-                min=0.1,
-                max=3.0,
                 value=1.0,
+                min=0.0,
+                max=20.0,
                 step=0.1,
+                width="100%",
             ),
         ),
-        class_="align-items-end gy-0",
+        class_="align-items-end gy-0 creator-slot-row",
     )
 
 app_ui = ui.page_sidebar(
@@ -145,53 +143,134 @@ app_ui = ui.page_sidebar(
     # This is CSS to fix scaling issues with the viewer. Not that this is made by chatgpt, so edit at your own risk.
     ui.head_content(
         ui.tags.style("""
-            :root{
-                /* You can tweak these two and nothing else! */
-                --controls-h: 350px;     /* total height of the top area (toolbar + panels) */
-                --controls-top-h: 100px; /* height of the toolbar row */
+            .controls-left .card {
+                border: 1px solid #8f8f8f;
+                box-shadow: 0 0.15rem 0.45rem rgba(0, 0, 0, 0.18);
+            }
+                      
+            .pint-main-layout {
+                display: flex;
+                gap: 0.75rem;
+                width: 100%;
+                height: calc(100vh - 120px);
+                min-height: 0;
             }
 
-            /* Page skeleton: fixed top area + growing viewer */
-            .flex-col { display:flex; flex-direction:column; height:100vh; }
+            .controls-left {
+                flex: 0 0 500px;
+                width: 500px;
+                max-width: 500px;
+                height: 100%;
+                overflow-y: auto;
+                padding-right: 0.25rem;
+            }
 
-            .controls-fixed {
+            .controls-left .card-header {
+                border-bottom: 1px solid #8f8f8f;
+                background-color: #e9ecef;
+            }          
+
+            .controls-left hr {
+                border: 0;
+                border-top: 1px solid #8f8f8f;
+                opacity: 1;
+                margin: 0.6rem 0;
+            }
+
+            .viewer-navigator {
                 flex: 0 0 auto;
-                min-height: var(--controls-h);
+                margin-bottom: 0.4rem;
+            }
+                      
+            .viewer-main {
+                flex: 1 1 auto;
+                min-width: 0;
+                height: 100%;
+                overflow: hidden;
                 display: flex;
                 flex-direction: column;
-                overflow: visible;
             }
-            .controls-top  {
-                flex: 0 0 auto;
-                min-height: var(--controls-top-h);
-                overflow: visible;
+
+            .viewer-navigator .shiny-input-container {
+                margin-bottom: 0 !important;
             }
-            /* No CSS layout for the second row (panels) —
-                sizes/spacing come only from your Python row/column props. */
 
-            /* Viewer grows to fill remaining space */
-            .viewer-fill { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+            .viewer-navigator label {
+                margin-bottom: 0.15rem;
+                font-size: 0.85rem;
+                font-weight: 600;
+            }
 
-            /* Sidebar & parameter table (unchanged, lightweight) */
-            .sidebar-col { display:flex; flex-direction:column; height:100%; }
+            .viewer-navigator .btn {
+                margin-bottom: 0 !important;
+            }
+
+            .viewer-plot-fill {
+                flex: 1 1 auto;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+            }
+            
+            .creator-header-row {
+                padding-left: 0.15rem;
+                padding-right: 0.15rem;
+            }
+
+            .creator-slot-row {
+                margin-bottom: 0.15rem;
+            }
+
+            .creator-slot-row .shiny-input-container {
+                margin-bottom: 0.2rem !important;
+            }
+
+            .creator-slot-row select,
+            .creator-slot-row input {
+                min-height: 32px;
+            }
+                      
+            .viewer-plot-fill .shiny-plot-output {
+                flex: 1 1 auto;
+                height: 100% !important;
+            }
+                      
+            /* Sidebar & parameter table */
+            .sidebar-col {
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+            }
+
             .param-table-wrap table {
                 font-size: 12px;
                 width: 100% !important;
                 table-layout: auto;
                 border-collapse: collapse;
             }
-            .param-table-wrap td, .param-table-wrap th {
+
+            .param-table-wrap td,
+            .param-table-wrap th {
                 padding: 2px 4px;
                 white-space: nowrap;
                 text-overflow: ellipsis;
                 overflow: hidden;
                 text-align: left;
             }
-            .param-table-wrap th { font-weight: 750; text-align: left; }
+
+            .param-table-wrap th {
+                font-weight: 750;
+                text-align: left;
+            }
 
             /* Make sure the sidebar overlays other content when open */
-            .bslib-sidebar-layout > .bslib-sidebar { z-index: 1050; }
-            .bslib-sidebar-layout .bslib-sidebar-toggle { z-index: 1060; }
+            .bslib-sidebar-layout > .bslib-sidebar {
+                z-index: 1050;
+            }
+
+            .bslib-sidebar-layout .bslib-sidebar-toggle {
+                z-index: 1060;
+            }
 
             .nav-tabs {
                 margin-bottom: 10px;
@@ -204,13 +283,7 @@ app_ui = ui.page_sidebar(
             .nav-tabs .nav-link.active {
                 background-color: #f8f9fa;
                 border-color: #dee2e6 #dee2e6 #fff;
-            }          
-
-            /* Tighten the toolbar only (kills the “ghost row”) */
-            .controls-top .shiny-input-container { margin-bottom: 0 !important; }
-            .controls-top .row { --bs-gutter-y: 0; margin-bottom: 0; }
-            .controls-top .col { padding-left: 0; padding-right: 0; }
-            .controls-fixed hr { margin: 6px 0; }
+            }
 
             .mask-section-title {
                 font-weight: 700;
@@ -234,10 +307,9 @@ app_ui = ui.page_sidebar(
             .compact-small-line {
                 margin-bottom: 0.15rem;
                 line-height: 1.2;
-            }                    
-            """
-        )
-    ), 
+            }
+        """)
+    ),
 
     # This is the main content of the image handler and normalization settings tools
     ui.row(
@@ -246,175 +318,260 @@ app_ui = ui.page_sidebar(
             ui.tags.div(
                 # Toolbar + panels (so essentially everything but the table)
                 ui.tags.div(
-                    
-                    ##line to seperate the UI elements
-                    ui.hr(),
-
                     ui.navset_tab(
                         ui.nav_panel(
-                            "PINT",
-                            #Top bar with path, load images, sample channel selector and export functions
-                            ui.row(
-                                ## Folder path
-                                ui.column(
-                                    4,
-                                    ui.input_text("path", "Folder path", value="", width="100%"),
-                                ),
-                                ## Load button
-                                ui.column(
-                                    1,
-                                    ui.input_action_button("load", "Load images", class_="w-100"),
-                                ),
-                                ui.column(1),
-                                ## Sample selector
-                                ui.column(
-                                    2,
-                                    ui.row(
-                                        ui.column(
-                                            8,
-                                            ui.input_select("sample", "Sample", choices=[], selected=None, width="100%"),
-                                        ),
-                                        ui.column(2, ui.input_action_button("prev_sample", "←", class_="btn-sm w-100")),
-                                        ui.column(2, ui.input_action_button("next_sample", "→", class_="btn-sm w-100")),
-                                        class_="align-items-center gy-0",
-                                    ),
-                                ),
+                        "PINT",
+                            ui.tags.div(
+                                # ============================================================
+                                # LEFT CONTROL COLUMN
+                                # ============================================================
+                                ui.tags.div(
+                                     # ----------------------------
+                                    # Loading / selection / export
+                                    # ----------------------------
+                                    ui.card(
+                                        ui.card_header("Image selection"),
 
-                                ## Channel selector
-                                ui.column(
-                                    2,
-                                    ui.row(
-                                        ui.column(
-                                            8,
-                                            ui.input_select("channel", "Channel", choices=[], selected=None, width="100%"),
+                                        ui.input_text(
+                                            "path",
+                                            "Folder path",
+                                            value="",
+                                            width="100%",
                                         ),
-                                        ui.column(2, ui.input_action_button("prev_channel", "←", class_="btn-sm w-100")),
-                                        ui.column(2, ui.input_action_button("next_channel", "→", class_="btn-sm w-100")),
-                                        class_="align-items-center gy-0",
-                                    ),
-                                ),
-                                ## Export / import / process
-                                ui.column(
-                                    2,
-                                    ui.row(
-                                        ui.column(
-                                            4,
-                                            ui.input_action_button("export_params", "Export CSV", class_="btn btn-secondary w-100"),
+
+                                        ui.input_action_button(
+                                            "load",
+                                            "Load images",
+                                            class_="btn btn-primary w-100 mb-2",
                                         ),
-                                        ui.column(
-                                            4,
-                                            ui.input_action_button("import_params", "Import CSV", class_="btn btn-secondary w-100"),
-                                        ),
-                                        ui.column(
-                                            4,
-                                            ui.input_action_button(
-                                                "perform_analysis",
-                                                "Process Images",
-                                                class_="btn btn-primary text-white w-100",
+
+                                        ui.tags.hr(class_="pint-divider"),
+
+                                        ui.row(
+                                            ui.column(
+                                                6,
+                                                ui.input_action_button(
+                                                    "export_params",
+                                                    "Export CSV",
+                                                    class_="btn btn-secondary w-100",
+                                                ),
                                             ),
+                                            ui.column(
+                                                6,
+                                                ui.input_action_button(
+                                                    "import_params",
+                                                    "Import CSV",
+                                                    class_="btn btn-secondary w-100",
+                                                ),
+                                            ),
+                                            class_="gy-1 mb-2",
                                         ),
-                                        class_="align-items-end gy-0",
+
+                                        ui.input_action_button(
+                                            "perform_analysis",
+                                            "Process Images",
+                                            class_="btn btn-primary text-white w-100",
+                                        ),
+
+                                        class_="mb-2",
                                     ),
-                                ),
-                                #IMPORTANT: this is part of the SAME ui.row(...) call; note the comma! If you move this it will break everything
-                                class_="controls-top align-items-end gy-0 mb-2",
-                            ),
-                            ui.row(
-                                # Panel 1 winsorization
-                                ui.column(
-                                    3,
+
+                                    # ----------------------------
+                                    # Winsorization
+                                    # ----------------------------
                                     ui.card(
                                         ui.card_header("Winsorization"),
-                                        ui.row(
-                                            ui.column(6, ui.input_slider("winsor_low", "Lower quantile (0–1)", min=0.0, max=1.0, value=0.00, step=0.01)),
-                                            ui.column(6, ui.input_slider("winsor_high", "Upper quantile (0–1)", min=0.9, max=1.0, value=0.990, step=0.001)),
-                                        ),
-                                        ui.row(
-                                            ui.column(6, ui.input_checkbox("doWinsor", "doWinsorize", value=True)),
-                                            ui.column(6, ui.input_action_button("apply_one", "Update channel", class_="btn btn-primary w-100")),
-                                        ),
-                                    ),
-                                ),
 
-                                # Panel 2 Thresholding
-                                ui.column(
-                                    3,
+                                        ui.row(
+                                            ui.column(
+                                                6,
+                                                ui.input_numeric(
+                                                    "winsor_low",
+                                                    "Lower quantile",
+                                                    value=0.00,
+                                                    min=0.0,
+                                                    max=1.0,
+                                                    step=0.01,
+                                                    width="100%",
+                                                ),
+                                            ),
+                                            ui.column(
+                                                6,
+                                                ui.input_numeric(
+                                                    "winsor_high",
+                                                    "Upper quantile",
+                                                    value=0.990,
+                                                    min=0.9,
+                                                    max=1.0,
+                                                    step=0.001,
+                                                    width="100%",
+                                                ),
+                                            ),
+                                            class_="gy-1",
+                                        ),
+
+                                        ui.row(
+                                            ui.column(
+                                                6,
+                                                ui.input_checkbox(
+                                                    "doWinsor",
+                                                    "Apply winsorization",
+                                                    value=True,
+                                                ),
+                                            ),
+                                            ui.column(
+                                                6,
+                                                ui.input_action_button(
+                                                    "apply_one",
+                                                    "Update channel",
+                                                    class_="btn btn-primary w-100",
+                                                ),
+                                            ),
+                                            class_="align-items-end gy-1",
+                                        ),
+
+                                        class_="mb-2",
+                                    ),
+
+                                    # ----------------------------
+                                    # Thresholding
+                                    # ----------------------------
                                     ui.card(
                                         ui.card_header("Thresholding"),
-                                        ui.row(
-                                            ui.column(6, ui.input_slider("abs_threshold_val", "Absolute threshold (counts)", min=0.0, max=100.0, value=1, step=0.1)),
-                                            ui.column(6, ui.input_slider("thr_fraction_val", "Fraction of max (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
-                                        ),
-                                        ui.row(
-                                            ui.column(
-                                                3,
-                                                ui.tags.div(
-                                                    ui.input_checkbox("doAbsThreshold", "Do Abs thresholding", value=True),
-                                                ),
-                                            ),
-                                            ui.column(
-                                                3,
-                                                ui.tags.div(
-                                                    ui.input_checkbox("doThreshold", "Do Perc thresholding", value=False),
-                                                ),
-                                            ),
-                                            ui.column(6, ui.input_action_button("apply_threshold", "Update channel", class_="btn btn-primary w-100")),
-                                        ),
-                                    ),
-                                ),
 
-                                # Panel3 Sliding windows noise removal
-                                ui.column(
-                                    3,
-                                    ui.card(
-                                        ui.card_header("Sliding Window Noise Removal"),
-                                        ui.row(
-                                            ui.column(6, ui.input_slider("noise_strength", "Denoise strength (0–1)", min=0.0, max=1.0, value=0.1, step=0.01)),
-                                            ui.column(6, ui.input_numeric("window_size", "Window size (odd)", value=3, min=1, step=2)),
-                                        ),
-                                        ui.row(
-                                            ui.column(6, ui.input_checkbox("doNoise", "Apply noise removal", value=True)),
-                                            ui.column(6, ui.input_action_button("apply_noise", "Update channel", class_="btn btn-primary w-100")),
-                                            ui.row(
-                                                ui.column(
-                                                    12,
-                                                    ui.output_ui("noise_tooltip"),
-                                                ),
-                                            ),
-                                        ),
-                                    ),
-                                ),
-
-                                # Panel4: Normalization and transformation
-                                ui.column(
-                                    3,
-                                    ui.card(
-                                        ui.card_header("Normalization and Transformation"),
                                         ui.row(
                                             ui.column(
                                                 7,
-                                                ui.tags.div(
-                                                    ui.input_checkbox("doNorm", "Normalize the channel?", value=True),
-                                                    class_="d-flex align-items-center mb-2",
+                                                ui.input_numeric(
+                                                    "abs_threshold_val",
+                                                    "Absolute threshold",
+                                                    value=1,
+                                                    min=0.0,
+                                                    max=100.0,
+                                                    step=0.1,
+                                                    width="100%",
                                                 ),
-                                                ui.input_radio_buttons(
-                                                    "norm_scope",
-                                                    "Normalize using",
-                                                    choices={
-                                                        "page":   "Per page (each sample seperate)",
-                                                        "global": "Global min/max across channel",
-                                                    },
-                                                    selected="page",
-                                                    inline=True,
-                                                ),
-                                                ui.output_ui("norm_scope_hint"),
                                             ),
                                             ui.column(
                                                 5,
-                                                ui.tags.div(
-                                                    ui.input_checkbox("doAsinh", "Arcsinh transform data", value=False),
-                                                    class_="d-flex align-items-center mb-2",
+                                                ui.input_checkbox(
+                                                    "doAbsThreshold",
+                                                    "Apply",
+                                                    value=True,
                                                 ),
+                                            ),
+                                            class_="align-items-end gy-1",
+                                        ),
+
+                                        ui.row(
+                                            ui.column(
+                                                7,
+                                                ui.input_numeric(
+                                                    "thr_fraction_val",
+                                                    "Fraction of max",
+                                                    value=0.1,
+                                                    min=0.0,
+                                                    max=1.0,
+                                                    step=0.01,
+                                                    width="100%",
+                                                ),
+                                            ),
+                                            ui.column(
+                                                5,
+                                                ui.input_checkbox(
+                                                    "doThreshold",
+                                                    "Apply",
+                                                    value=False,
+                                                ),
+                                            ),
+                                            class_="align-items-end gy-1",
+                                        ),
+
+                                        ui.input_action_button(
+                                            "apply_threshold",
+                                            "Update channel",
+                                            class_="btn btn-primary w-100",
+                                        ),
+
+                                        class_="mb-2",
+                                    ),
+
+                                    # ----------------------------
+                                    # Sliding window noise removal
+                                    # ----------------------------
+                                    ui.card(
+                                        ui.card_header("Sliding Window Noise Removal"),
+
+                                        ui.row(
+                                            ui.column(
+                                                6,
+                                                ui.input_numeric(
+                                                    "noise_strength",
+                                                    "Denoise strength",
+                                                    value=0.1,
+                                                    min=0.0,
+                                                    max=1.0,
+                                                    step=0.01,
+                                                    width="100%",
+                                                ),
+                                            ),
+                                            ui.column(
+                                                6,
+                                                ui.input_numeric(
+                                                    "window_size",
+                                                    "Window size",
+                                                    value=3,
+                                                    min=1,
+                                                    step=2,
+                                                    width="100%",
+                                                ),
+                                            ),
+                                            class_="gy-1",
+                                        ),
+
+                                        ui.row(
+                                            ui.column(
+                                                6,
+                                                ui.input_checkbox(
+                                                    "doNoise",
+                                                    "Apply noise removal",
+                                                    value=True,
+                                                ),
+                                            ),
+                                            ui.column(
+                                                6,
+                                                ui.input_action_button(
+                                                    "apply_noise",
+                                                    "Update channel",
+                                                    class_="btn btn-primary w-100",
+                                                ),
+                                            ),
+                                            class_="align-items-end gy-1",
+                                        ),
+
+                                        ui.output_ui("noise_tooltip"),
+
+                                        class_="mb-2",
+                                    ),
+
+                                    # ----------------------------
+                                    # Transformation and normalization
+                                    # ----------------------------
+                                    ui.card(
+                                        ui.card_header("Transformation and normalization"),
+
+                                        # First transform
+                                        ui.row(
+                                            ui.column(
+                                                6,
+                                                ui.input_checkbox(
+                                                    "doAsinh",
+                                                    "Arcsinh transform",
+                                                    value=False,
+                                                ),
+                                            ),
+                                            ui.column(
+                                                6,
                                                 ui.input_select(
                                                     "asinh_cofactor",
                                                     "Cofactor",
@@ -422,65 +579,194 @@ app_ui = ui.page_sidebar(
                                                     selected="5",
                                                     width="100%",
                                                 ),
-                                                ui.input_action_button(
-                                                    "apply_norm",
-                                                    "Apply norm/transform",
-                                                    class_="btn btn-primary w-100 mt-2",
+                                            ),
+                                            class_="align-items-end gy-1",
+                                        ),
+
+                                        ui.tags.hr(class_="pint-divider"),
+
+                                        # Then normalize
+                                        ui.input_checkbox(
+                                            "doNorm",
+                                            "Normalize channel",
+                                            value=True,
+                                        ),
+
+                                        ui.input_radio_buttons(
+                                            "norm_scope",
+                                            "Normalize using",
+                                            choices={
+                                                "page": "Per page",
+                                                "global": "Global min/max",
+                                            },
+                                            selected="page",
+                                            inline=True,
+                                        ),
+
+                                        ui.output_ui("norm_scope_hint"),
+
+                                        ui.input_action_button(
+                                            "apply_norm",
+                                            "Apply transform/norm",
+                                            class_="btn btn-primary w-100 mt-2",
+                                        ),
+
+                                        class_="mb-2",
+                                    ),
+
+                                    class_="controls-left",
+                                ),
+
+                                # ============================================================
+                                # RIGHT VIEWER COLUMN
+                                # ============================================================
+                                ui.tags.div(
+                                    ui.tags.div(
+                                        ui.row(
+                                            # Sample selector: 3
+                                            ui.column(
+                                                3,
+                                                ui.input_select(
+                                                    "sample",
+                                                    "Sample",
+                                                    choices=[],
+                                                    selected=None,
+                                                    width="100%",
                                                 ),
                                             ),
-                                            class_="align-items-start",
+
+                                            # Previous sample: 1
+                                            ui.column(
+                                                1,
+                                                ui.input_action_button(
+                                                    "prev_sample",
+                                                    "←",
+                                                    class_="btn-sm w-100",
+                                                ),
+                                            ),
+
+                                            # Next sample: 1
+                                            ui.column(
+                                                1,
+                                                ui.input_action_button(
+                                                    "next_sample",
+                                                    "→",
+                                                    class_="btn-sm w-100",
+                                                ),
+                                            ),
+
+                                            # Empty spacer: 1
+                                            ui.column(1),
+
+                                            # Channel selector: 3
+                                            ui.column(
+                                                3,
+                                                ui.input_select(
+                                                    "channel",
+                                                    "Channel",
+                                                    choices=[],
+                                                    selected=None,
+                                                    width="100%",
+                                                ),
+                                            ),
+
+                                            # Previous channel: 1
+                                            ui.column(
+                                                1,
+                                                ui.input_action_button(
+                                                    "prev_channel",
+                                                    "←",
+                                                    class_="btn-sm w-100",
+                                                ),
+                                            ),
+
+                                            # Next channel: 1
+                                            ui.column(
+                                                1,
+                                                ui.input_action_button(
+                                                    "next_channel",
+                                                    "→",
+                                                    class_="btn-sm w-100",
+                                                ),
+                                            ),
+
+                                            class_="align-items-end gy-0 gx-1 viewer-navigator-row",
                                         ),
+                                        class_="viewer-navigator",
                                     ),
+
+                                    ui.tags.div(
+                                        ui.output_plot("pint_viewer", fill=True, height="100%"),
+                                        class_="viewer-plot-fill",
+                                    ),
+
+                                    class_="viewer-main",
                                 ),
+
+                                class_="pint-main-layout",
                             ),
+
                             value="pint",
                         ),
 
                         ui.nav_panel(
                             "Image creator",
-                            ui.row(
-                                ui.column(
-                                    9,
+                            ui.tags.div(
+                                ui.tags.div(
                                     ui.card(
                                         ui.card_header("Composite channels (processed images)"),
+
                                         ui.row(
-                                            ui.column(
-                                                6,
-                                                ui.row(
-                                                    ui.column(1, ui.tags.strong("On")),
-                                                    ui.column(6, ui.tags.strong("Channel")),
-                                                    ui.column(3, ui.tags.strong("Color")),
-                                                    ui.column(2, ui.tags.strong("Gain")),
-                                                    class_="mb-1",
-                                                ),
-                                                *[make_composite_slot(i) for i in range(1, 5)],
-                                            ),
-                                            ui.column(
-                                                6,
-                                                ui.row(
-                                                    ui.column(1, ui.tags.strong("On")),
-                                                    ui.column(6, ui.tags.strong("Channel")),
-                                                    ui.column(3, ui.tags.strong("Color")),
-                                                    ui.column(2, ui.tags.strong("Gain")),
-                                                    class_="mb-1",
-                                                ),
-                                                *[make_composite_slot(i) for i in range(5, 9)],
-                                            ),
+                                            ui.column(7, ui.tags.strong("Channel")),
+                                            ui.column(3, ui.tags.strong("Color")),
+                                            ui.column(2, ui.tags.strong("Gain")),
+                                            class_="mb-1 creator-header-row",
                                         ),
+
+                                        *[make_composite_slot(i) for i in range(1, 9)],
+
+                                        class_="mb-2",
                                     ),
-                                ),
-                                ui.column(
-                                    3,
+
                                     ui.card(
                                         ui.card_header("Composite export"),
-                                        ui.input_action_button("fill_composite_from_current", "Fill from first 8 channels", class_="btn btn-secondary w-100 mb-2"),
-                                        ui.input_action_button("save_composite_tiff", "Save composite TIFF", class_="btn btn-primary w-100 mb-2"),
-                                        ui.input_action_button("export_creator_composites_all", "Export composite TIFF for all images", class_="btn btn-secondary w-100"),
+
+                                        ui.input_action_button(
+                                            "fill_composite_from_current",
+                                            "Fill from first 8 channels",
+                                            class_="btn btn-secondary w-100 mb-2",
+                                        ),
+
+                                        ui.input_action_button(
+                                            "save_composite_tiff",
+                                            "Save composite TIFF",
+                                            class_="btn btn-primary w-100 mb-2",
+                                        ),
+
+                                        ui.input_action_button(
+                                            "export_creator_composites_all",
+                                            "Export composite TIFF for all images",
+                                            class_="btn btn-secondary w-100",
+                                        ),
+
                                         ui.br(),
                                         ui.br(),
                                         ui.output_ui("composite_summary"),
+
+                                        class_="mb-2",
                                     ),
+
+                                    class_="controls-left",
                                 ),
+                                ui.tags.div(
+                                    ui.tags.div(
+                                        ui.output_plot("creator_viewer", fill=True, height="100%"),
+                                        class_="viewer-plot-fill",
+                                    ),
+                                    class_="viewer-main",
+                                ),
+
+                                class_="pint-main-layout",
                             ),
                             value="creator",
                         ),
@@ -626,14 +912,7 @@ app_ui = ui.page_sidebar(
                         ),
                         id="viewer_mode",
                     ),
-                    class_="controls-fixed",
                 ),
-                ##Main plot area --> here images will be rendered
-                ui.tags.div(
-                    ui.output_ui("main_viewer_ui"),
-                    class_="viewer-fill",
-                ),
-                class_="flex-col",
             ),
         ),
     ),
@@ -947,15 +1226,12 @@ def server(input, output, session):
         used = []
 
         for slotIdx in range(1, MAX_COMPOSITE_CHANNELS + 1):
-            enabled = bool(getattr(input, f"comp_enable_{slotIdx}")())
-            if not enabled:
-                continue
 
             channelName = getattr(input, f"comp_channel_{slotIdx}")()
             colorName = getattr(input, f"comp_color_{slotIdx}")()
             gain = float(getattr(input, f"comp_gain_{slotIdx}")())
 
-            if not channelName:
+            if not channelName or channelName == COMPOSITE_EMPTY_CHOICE:
                 continue
 
             proc = _process_channel_from_table(sampleName, channelName)
@@ -988,13 +1264,20 @@ def server(input, output, session):
         canon = canonical_channels.get() or []
         ordered = order_by_canonical(canon, chlistCurrent)
 
-        choices = [""] + ordered
+        choices = [COMPOSITE_EMPTY_CHOICE] + ordered
+
+        # Default to the 3rd channel because the first 2 are usually Argon/Krypton.
+        # If fewer than 3 channels exist, fall back to the first real channel.
+        firstDefault = ordered[2] if len(ordered) >= 3 else (ordered[0] if ordered else COMPOSITE_EMPTY_CHOICE)
 
         for slotIdx in range(1, MAX_COMPOSITE_CHANNELS + 1):
             inputId = f"comp_channel_{slotIdx}"
-
             currentVal = getattr(input, inputId)()
-            defaultVal = ordered[slotIdx - 1] if slotIdx <= len(ordered) else ""
+
+            if slotIdx == 1:
+                defaultVal = firstDefault
+            else:
+                defaultVal = COMPOSITE_EMPTY_CHOICE
 
             if overwriteDefaults:
                 selectedVal = defaultVal
@@ -1011,12 +1294,9 @@ def server(input, output, session):
     def _get_selected_creator_channels():
         selected = []
         for slotIdx in range(1, MAX_COMPOSITE_CHANNELS + 1):
-            enabled = bool(getattr(input, f"comp_enable_{slotIdx}")())
-            if not enabled:
-                continue
-
             channelName = getattr(input, f"comp_channel_{slotIdx}")()
-            if not channelName:
+
+            if not channelName or channelName == COMPOSITE_EMPTY_CHOICE:
                 continue
 
             colorName = getattr(input, f"comp_color_{slotIdx}")()
@@ -1604,9 +1884,9 @@ def server(input, output, session):
             footer=ui.div(
                 ui.modal_button("Cancel", class_="btn btn-secondary"),
                 ui.input_action_button(
-                    "confirm_export_all_mask_visualizations",
-                    "Export",
-                    class_="btn btn-primary ms-2",
+                    "fill_composite_from_current",
+                    "Reset creator channels",
+                    class_="btn btn-secondary w-100 mb-2",
                 ),
             ),
         )
@@ -1814,51 +2094,99 @@ def server(input, output, session):
     # <---------- plot ---------->
     ##Below is the actual img viewer where the image is rendered and all the different thresholding stept are visualized.
     @output
+    @render.ui
+    def neighborhood_input_summary():
+        obj = neighborhood_input_data.get()
+
+        if obj is None:
+            return ui.tags.small("No dataset pushed from mask visualization yet.", class_="text-muted")
+
+        df = obj["cell_table"]
+        colMap = obj["column_map"]
+
+        nClusters = 0
+        clusterCol = colMap.get("cluster_col", None)
+        if clusterCol and clusterCol in df.columns:
+            nClusters = df[clusterCol].astype(str).nunique()
+
+        return ui.div(
+            ui.tags.div(f"Masks pushed: {obj['n_masks']}"),
+            ui.tags.div(f"Rows: {len(df):,}"),
+            ui.tags.div(f"Clusters: {nClusters}"),
+            ui.tags.div(f"Mask folder: {obj['mask_folder'] or '—'}"),
+            ui.tags.div(f"Pushed at: {obj['pushed_at']}"),
+        )
+
+    @output
+    @render.text
+    def neighborhood_status_text():
+        return neighborhood_status_msg.get()
+
+    @output
     @render.plot
-    def img_viewer():
+    def creator_viewer():
         try:
-            try:
-                mode = input.viewer_mode()
-            except Exception:
-                mode = "pint"
+            fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
 
-            mode = mode or "pint"
+            rgb, used = _build_composite_rgb()
 
-            if mode not in ["pint", "creator"]:
-                fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+            if rgb is None:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No composite channels selected",
+                    ha="center",
+                    va="center",
+                )
                 ax.set_axis_off()
                 plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
                 return fig
 
-            if mode == "creator":
-                fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+            ax.imshow(rgb)
+            ax.set_axis_off()
 
-                rgb, used = _build_composite_rgb()
-                if rgb is None:
-                    ax.text(0.5, 0.5, "No composite channels selected", ha="center", va="center")
-                    ax.set_axis_off()
-                    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-                    return fig
+            if used:
+                labelLines = [
+                    f"{ch} — {col} × {gain:.1f}"
+                    for ch, col, gain in used
+                ]
 
-                ax.imshow(rgb)
-                ax.set_axis_off()
+                fig.text(
+                    0.01,
+                    0.99,
+                    "\n".join(labelLines),
+                    ha="left",
+                    va="top",
+                    fontsize=8,
+                    color="white",
+                    bbox=dict(
+                        facecolor="black",
+                        alpha=0.55,
+                        edgecolor="none",
+                        pad=4,
+                    ),
+                )
 
-                if used:
-                    labelLines = [f"{ch} — {col} × {gain:.1f}" for ch, col, gain in used]
-                    fig.text(
-                        0.01,
-                        0.99,
-                        "\n".join(labelLines),
-                        ha="left",
-                        va="top",
-                        fontsize=8,
-                        color="white",
-                        bbox=dict(facecolor="black", alpha=0.55, edgecolor="none", pad=4),
-                    )
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            return fig
 
-                plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-                return fig
+        except SilentException:
+            raise
 
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
+            ax.set_axis_off()
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            return fig
+
+    @output
+    @render.plot
+    def pint_viewer():
+        try:
             fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
 
             imgs = images.get()
@@ -1885,6 +2213,7 @@ def server(input, output, session):
 
             normVmin = None
             normVmax = None
+
             if bool(input.doNorm()) and (input.norm_scope() or "page") == "global":
                 doW, lo, hi = _get_winsor_settings()
                 gpair = _global_range_for_channel(
@@ -1925,65 +2254,16 @@ def server(input, output, session):
 
         except SilentException:
             raise
+
         except Exception as e:
             import traceback
             traceback.print_exc()
 
-            err = str(e).strip() or repr(e)
-
             fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
-            ax.text(0.01, 0.98, f"Plot error: {err}", ha="left", va="top")
+            ax.text(0.01, 0.98, f"Plot error: {e}", ha="left", va="top")
             ax.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
             return fig
-        
-    @output
-    @render.ui
-    def neighborhood_input_summary():
-        obj = neighborhood_input_data.get()
-
-        if obj is None:
-            return ui.tags.small("No dataset pushed from mask visualization yet.", class_="text-muted")
-
-        df = obj["cell_table"]
-        colMap = obj["column_map"]
-
-        nClusters = 0
-        clusterCol = colMap.get("cluster_col", None)
-        if clusterCol and clusterCol in df.columns:
-            nClusters = df[clusterCol].astype(str).nunique()
-
-        return ui.div(
-            ui.tags.div(f"Masks pushed: {obj['n_masks']}"),
-            ui.tags.div(f"Rows: {len(df):,}"),
-            ui.tags.div(f"Clusters: {nClusters}"),
-            ui.tags.div(f"Mask folder: {obj['mask_folder'] or '—'}"),
-            ui.tags.div(f"Pushed at: {obj['pushed_at']}"),
-        )
-
-    @output
-    @render.text
-    def neighborhood_status_text():
-        return neighborhood_status_msg.get()
-
-
-    @output
-    @render.ui
-    def main_viewer_ui():
-        try:
-            mode = input.viewer_mode()
-        except SilentException:
-            mode = "pint"
-        except Exception:
-            mode = "pint"
-
-        mode = mode or "pint"
-
-        if mode in ["pint", "creator"]:
-            return ui.output_plot("img_viewer", fill=True, height="100%")
-
-        return ui.tags.div()
-
 
     def _sync_mask_column_choices(df: pd.DataFrame) -> None:
         if df is None or df.empty:

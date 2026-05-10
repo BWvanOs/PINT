@@ -11,7 +11,11 @@ def main():
     if not script.exists():
         print(f"[pint] Could not find {script}", file=sys.stderr)
         raise SystemExit(2)
-    raise SystemExit(subprocess.call([sys.executable, str(script), *sys.argv[1:]]))
+    try:
+        raise SystemExit(subprocess.call([sys.executable, str(script), *sys.argv[1:]]))
+    except KeyboardInterrupt:
+        print("\nPINT stopped by user.")
+        raise SystemExit(130)
 
 def viewer():
     """Run the (mounted) Shiny server (viewer at /, neighborhood at /neighborhood)."""
