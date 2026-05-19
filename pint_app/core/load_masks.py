@@ -49,7 +49,7 @@ def list_mask_files(mask_dir: str | Path, suffix: str = ".tiff") -> pd.DataFrame
         {
             "MaskFile": [f.name for f in files],
             "MaskPath": [str(f) for f in files],
-            "CellMaskName": [strip_known_mask_suffix(f.stem) for f in files],
+            "CellMaskName": [_strip_known_mask_suffix(f.stem) for f in files],
         }
     )
 
@@ -91,7 +91,7 @@ def get_cells_for_mask_name(
     """
     return df.loc[df[mask_name_col].astype(str) == str(mask_name)].copy()
 
-def strip_known_mask_suffix(name: str) -> str:
+def _strip_known_mask_suffix(name: str) -> str:
     return (
         str(name)
         .removesuffix(" Normalized 32bit_UNIT16")

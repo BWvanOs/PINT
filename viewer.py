@@ -11,8 +11,8 @@ This shim keeps old imports working, will be removed in the future!:
 from pint_app.apps.viewer import app  # re-export
 
 if __name__ == "__main__":
-    # Running this file directly isn't the recommended path anymore,
-    # but keep it functional for convenience.
+    ##Running this file directly isn't the recommended path anymore,
+    ##but keep it functional for convenience. Will be removed
     import subprocess, sys
     subprocess.run([
         sys.executable, "-m", "uvicorn", "pint_app.asgi:app",

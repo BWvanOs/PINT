@@ -325,7 +325,10 @@ def main():
             processed.astype(np.float32),
             dtype=np.float32,
             ome=True,
-            metadata={"axes": "CYX"},
+            metadata={
+                "axes": "CYX",
+                "Channel": {"Name": [str(ch) for ch in chlist]},
+            },
         )
 
         ##16-bit:
@@ -337,7 +340,10 @@ def main():
             u16,
             dtype=np.uint16,
             ome=True,
-            metadata={"axes": "CYX"},
+            metadata={
+                "axes": "CYX",
+                "Channel": {"Name": [str(ch) for ch in chlist]},
+            },
         )
 
         print(f"✓ Wrote: {out16.name}, {out32.name}")
@@ -349,7 +355,6 @@ def main():
     print(f"✓ Saved: {results_csv.name}")
 
     print("All done.")
-
 
 if __name__ == "__main__":
     main()

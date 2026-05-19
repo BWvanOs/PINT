@@ -29,18 +29,13 @@ from pint_app.core.dialogs import (
 )
 from pint_app.core.processing import (
     clamp01,
-    apply_winsor,
-    apply_threshold_absolute,
-    apply_threshold_fraction_of_max,
-    arcsinh_transform,
-    apply_speckle_suppress,
     strength_to_percentile,
-    normalize_minmax,
     global_minmax_for_channel as compute_global_minmax_for_channel,
     global_winsor_range_for_channel as compute_global_winsor_range_for_channel,
     image_winsor_range as compute_image_winsor_range,
     process_image_pipeline,
 )
+
 from pint_app.core.selection import cycle_list, order_by_canonical
 
 from pint_app.core.params import (
@@ -57,7 +52,6 @@ from pint_app.core.load_masks import (
     match_cellmask_names_to_files,
     split_mask_matches,
     get_cells_for_mask_name,
-    strip_known_mask_suffix,
 )
 
 from pint_app.core.mask_viz import (
@@ -73,61 +67,30 @@ from pint_app.core.mask_neighbors_stats import (
     aggregate_interaction_matrix,
 )
 
+from pint_app.core.composites import (
+    MAX_COMPOSITE_CHANNELS,
+    COMPOSITE_EMPTY_CHOICE,
+    screen_blend_layer,
+)
+
+from pint_app.core.mesmer_backend import (
+    DEFAULT_MESMER_ENV_NAME,
+    check_mesmer_backend,
+    get_mesmer_install_commands,
+    install_mesmer_backend,
+)
+
+##Import of the UI modules
+##CSS UI module
+from pint_app.shiny_ui.styles import app_styles
+##Rest of the ui panels
+from pint_app.shiny_ui.creator_ui import creator_panel
+from pint_app.shiny_ui.PINT_ui import pint_panel
+from pint_app.shiny_ui.segmentation_ui import segmentation_panel
+from pint_app.shiny_ui.mask_visualization_ui import mask_visualization_panel
+from pint_app.shiny_ui.neighborhood_ui import neighborhood_panel
+
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
-
-COMPOSITE_PALETTE = {
-    "Cyan":    (0.00, 1.00, 1.00),
-    "Magenta": (1.00, 0.00, 1.00),
-    "Yellow":  (1.00, 1.00, 0.00),
-    "Green":   (0.00, 1.00, 0.00),
-    "Red":     (1.00, 0.00, 0.00),
-    "Blue":    (0.00, 0.40, 1.00),
-    "Orange":  (1.00, 0.55, 0.00),
-    "White":   (1.00, 1.00, 1.00),
-}
-
-COMPOSITE_COLOR_CHOICES = list(COMPOSITE_PALETTE.keys())
-MAX_COMPOSITE_CHANNELS = 8
-COMPOSITE_EMPTY_CHOICE = ">> Leave blank <<"
-
-def make_composite_slot(slotIdx: int):
-    defaultColor = COMPOSITE_COLOR_CHOICES[(slotIdx - 1) % len(COMPOSITE_COLOR_CHOICES)]
-
-    return ui.row(
-        ui.column(
-            7,
-            ui.input_select(
-                f"comp_channel_{slotIdx}",
-                "",
-                choices=[COMPOSITE_EMPTY_CHOICE],
-                selected=COMPOSITE_EMPTY_CHOICE,
-                width="100%",
-            ),
-        ),
-        ui.column(
-            3,
-            ui.input_select(
-                f"comp_color_{slotIdx}",
-                "",
-                choices=COMPOSITE_COLOR_CHOICES,
-                selected=defaultColor,
-                width="100%",
-            ),
-        ),
-        ui.column(
-            2,
-            ui.input_numeric(
-                f"comp_gain_{slotIdx}",
-                "",
-                value=1.0,
-                min=0.0,
-                max=20.0,
-                step=0.1,
-                width="100%",
-            ),
-        ),
-        class_="align-items-end gy-0 creator-slot-row",
-    )
 
 app_ui = ui.page_sidebar(
     # This is the right side of the window that collapses when opening the sidebar.
@@ -140,176 +103,8 @@ app_ui = ui.page_sidebar(
         width="850px",          # tweak as needed
     ),
 
-    # This is CSS to fix scaling issues with the viewer. Not that this is made by chatgpt, so edit at your own risk.
-    ui.head_content(
-        ui.tags.style("""
-            .controls-left .card {
-                border: 1px solid #8f8f8f;
-                box-shadow: 0 0.15rem 0.45rem rgba(0, 0, 0, 0.18);
-            }
-                      
-            .pint-main-layout {
-                display: flex;
-                gap: 0.75rem;
-                width: 100%;
-                height: calc(100vh - 120px);
-                min-height: 0;
-            }
-
-            .controls-left {
-                flex: 0 0 500px;
-                width: 500px;
-                max-width: 500px;
-                height: 100%;
-                overflow-y: auto;
-                padding-right: 0.25rem;
-            }
-
-            .controls-left .card-header {
-                border-bottom: 1px solid #8f8f8f;
-                background-color: #e9ecef;
-            }          
-
-            .controls-left hr {
-                border: 0;
-                border-top: 1px solid #8f8f8f;
-                opacity: 1;
-                margin: 0.6rem 0;
-            }
-
-            .viewer-navigator {
-                flex: 0 0 auto;
-                margin-bottom: 0.4rem;
-            }
-                      
-            .viewer-main {
-                flex: 1 1 auto;
-                min-width: 0;
-                height: 100%;
-                overflow: hidden;
-                display: flex;
-                flex-direction: column;
-            }
-
-            .viewer-navigator .shiny-input-container {
-                margin-bottom: 0 !important;
-            }
-
-            .viewer-navigator label {
-                margin-bottom: 0.15rem;
-                font-size: 0.85rem;
-                font-weight: 600;
-            }
-
-            .viewer-navigator .btn {
-                margin-bottom: 0 !important;
-            }
-
-            .viewer-plot-fill {
-                flex: 1 1 auto;
-                min-height: 0;
-                display: flex;
-                flex-direction: column;
-            }
-            
-            .creator-header-row {
-                padding-left: 0.15rem;
-                padding-right: 0.15rem;
-            }
-
-            .creator-slot-row {
-                margin-bottom: 0.15rem;
-            }
-
-            .creator-slot-row .shiny-input-container {
-                margin-bottom: 0.2rem !important;
-            }
-
-            .creator-slot-row select,
-            .creator-slot-row input {
-                min-height: 32px;
-            }
-                      
-            .viewer-plot-fill .shiny-plot-output {
-                flex: 1 1 auto;
-                height: 100% !important;
-            }
-                      
-            /* Sidebar & parameter table */
-            .sidebar-col {
-                display: flex;
-                flex-direction: column;
-                height: 100%;
-            }
-
-            .param-table-wrap table {
-                font-size: 12px;
-                width: 100% !important;
-                table-layout: auto;
-                border-collapse: collapse;
-            }
-
-            .param-table-wrap td,
-            .param-table-wrap th {
-                padding: 2px 4px;
-                white-space: nowrap;
-                text-overflow: ellipsis;
-                overflow: hidden;
-                text-align: left;
-            }
-
-            .param-table-wrap th {
-                font-weight: 750;
-                text-align: left;
-            }
-
-            /* Make sure the sidebar overlays other content when open */
-            .bslib-sidebar-layout > .bslib-sidebar {
-                z-index: 1050;
-            }
-
-            .bslib-sidebar-layout .bslib-sidebar-toggle {
-                z-index: 1060;
-            }
-
-            .nav-tabs {
-                margin-bottom: 10px;
-            }
-
-            .nav-tabs .nav-link {
-                font-weight: 600;
-            }
-
-            .nav-tabs .nav-link.active {
-                background-color: #f8f9fa;
-                border-color: #dee2e6 #dee2e6 #fff;
-            }
-
-            .mask-section-title {
-                font-weight: 700;
-                margin-top: 0.25rem;
-                margin-bottom: 0.35rem;
-            }
-
-            .mask-divider {
-                margin-top: 0.6rem;
-                margin-bottom: 0.6rem;
-            }
-
-            .compact-stack p {
-                margin-bottom: 0.2rem;
-            }
-
-            .compact-stack .shiny-input-container {
-                margin-bottom: 0.4rem !important;
-            }
-
-            .compact-small-line {
-                margin-bottom: 0.15rem;
-                line-height: 1.2;
-            }
-        """)
-    ),
+    # This is CSS to fix scaling issues with the viewer. Not that this is 100% made by codex, so edit at your own risk.
+    app_styles(),
 
     # This is the main content of the image handler and normalization settings tools
     ui.row(
@@ -319,597 +114,20 @@ app_ui = ui.page_sidebar(
                 # Toolbar + panels (so essentially everything but the table)
                 ui.tags.div(
                     ui.navset_tab(
-                        ui.nav_panel(
-                        "PINT",
-                            ui.tags.div(
-                                # ============================================================
-                                # LEFT CONTROL COLUMN
-                                # ============================================================
-                                ui.tags.div(
-                                     # ----------------------------
-                                    # Loading / selection / export
-                                    # ----------------------------
-                                    ui.card(
-                                        ui.card_header("Image selection"),
+                        ##------->PINT panel of the shiny app<------##
+                        pint_panel(),
 
-                                        ui.input_text(
-                                            "path",
-                                            "Folder path",
-                                            value="",
-                                            width="100%",
-                                        ),
+                        ##------->Creator panel of the shiny app<------##
+                        creator_panel(),
 
-                                        ui.input_action_button(
-                                            "load",
-                                            "Load images",
-                                            class_="btn btn-primary w-100 mb-2",
-                                        ),
+                        ##------->MESMER segmentation panel of the shiny app<------##
+                        segmentation_panel(),
+                        
+                        ##------->Mask visulaization and niegborhood preperation panel of the shiny app<------##
+                        mask_visualization_panel(),
 
-                                        ui.tags.hr(class_="pint-divider"),
-
-                                        ui.row(
-                                            ui.column(
-                                                6,
-                                                ui.input_action_button(
-                                                    "export_params",
-                                                    "Export CSV",
-                                                    class_="btn btn-secondary w-100",
-                                                ),
-                                            ),
-                                            ui.column(
-                                                6,
-                                                ui.input_action_button(
-                                                    "import_params",
-                                                    "Import CSV",
-                                                    class_="btn btn-secondary w-100",
-                                                ),
-                                            ),
-                                            class_="gy-1 mb-2",
-                                        ),
-
-                                        ui.input_action_button(
-                                            "perform_analysis",
-                                            "Process Images",
-                                            class_="btn btn-primary text-white w-100",
-                                        ),
-
-                                        class_="mb-2",
-                                    ),
-
-                                    # ----------------------------
-                                    # Winsorization
-                                    # ----------------------------
-                                    ui.card(
-                                        ui.card_header("Winsorization"),
-
-                                        ui.row(
-                                            ui.column(
-                                                6,
-                                                ui.input_numeric(
-                                                    "winsor_low",
-                                                    "Lower quantile",
-                                                    value=0.00,
-                                                    min=0.0,
-                                                    max=1.0,
-                                                    step=0.01,
-                                                    width="100%",
-                                                ),
-                                            ),
-                                            ui.column(
-                                                6,
-                                                ui.input_numeric(
-                                                    "winsor_high",
-                                                    "Upper quantile",
-                                                    value=0.990,
-                                                    min=0.9,
-                                                    max=1.0,
-                                                    step=0.001,
-                                                    width="100%",
-                                                ),
-                                            ),
-                                            class_="gy-1",
-                                        ),
-
-                                        ui.row(
-                                            ui.column(
-                                                6,
-                                                ui.input_checkbox(
-                                                    "doWinsor",
-                                                    "Apply winsorization",
-                                                    value=True,
-                                                ),
-                                            ),
-                                            ui.column(
-                                                6,
-                                                ui.input_action_button(
-                                                    "apply_one",
-                                                    "Update channel",
-                                                    class_="btn btn-primary w-100",
-                                                ),
-                                            ),
-                                            class_="align-items-end gy-1",
-                                        ),
-
-                                        class_="mb-2",
-                                    ),
-
-                                    # ----------------------------
-                                    # Thresholding
-                                    # ----------------------------
-                                    ui.card(
-                                        ui.card_header("Thresholding"),
-
-                                        ui.row(
-                                            ui.column(
-                                                7,
-                                                ui.input_numeric(
-                                                    "abs_threshold_val",
-                                                    "Absolute threshold",
-                                                    value=1,
-                                                    min=0.0,
-                                                    max=100.0,
-                                                    step=0.1,
-                                                    width="100%",
-                                                ),
-                                            ),
-                                            ui.column(
-                                                5,
-                                                ui.input_checkbox(
-                                                    "doAbsThreshold",
-                                                    "Apply",
-                                                    value=True,
-                                                ),
-                                            ),
-                                            class_="align-items-end gy-1",
-                                        ),
-
-                                        ui.row(
-                                            ui.column(
-                                                7,
-                                                ui.input_numeric(
-                                                    "thr_fraction_val",
-                                                    "Fraction of max",
-                                                    value=0.1,
-                                                    min=0.0,
-                                                    max=1.0,
-                                                    step=0.01,
-                                                    width="100%",
-                                                ),
-                                            ),
-                                            ui.column(
-                                                5,
-                                                ui.input_checkbox(
-                                                    "doThreshold",
-                                                    "Apply",
-                                                    value=False,
-                                                ),
-                                            ),
-                                            class_="align-items-end gy-1",
-                                        ),
-
-                                        ui.input_action_button(
-                                            "apply_threshold",
-                                            "Update channel",
-                                            class_="btn btn-primary w-100",
-                                        ),
-
-                                        class_="mb-2",
-                                    ),
-
-                                    # ----------------------------
-                                    # Sliding window noise removal
-                                    # ----------------------------
-                                    ui.card(
-                                        ui.card_header("Sliding Window Noise Removal"),
-
-                                        ui.row(
-                                            ui.column(
-                                                6,
-                                                ui.input_numeric(
-                                                    "noise_strength",
-                                                    "Denoise strength",
-                                                    value=0.1,
-                                                    min=0.0,
-                                                    max=1.0,
-                                                    step=0.01,
-                                                    width="100%",
-                                                ),
-                                            ),
-                                            ui.column(
-                                                6,
-                                                ui.input_numeric(
-                                                    "window_size",
-                                                    "Window size",
-                                                    value=3,
-                                                    min=1,
-                                                    step=2,
-                                                    width="100%",
-                                                ),
-                                            ),
-                                            class_="gy-1",
-                                        ),
-
-                                        ui.row(
-                                            ui.column(
-                                                6,
-                                                ui.input_checkbox(
-                                                    "doNoise",
-                                                    "Apply noise removal",
-                                                    value=True,
-                                                ),
-                                            ),
-                                            ui.column(
-                                                6,
-                                                ui.input_action_button(
-                                                    "apply_noise",
-                                                    "Update channel",
-                                                    class_="btn btn-primary w-100",
-                                                ),
-                                            ),
-                                            class_="align-items-end gy-1",
-                                        ),
-
-                                        ui.output_ui("noise_tooltip"),
-
-                                        class_="mb-2",
-                                    ),
-
-                                    # ----------------------------
-                                    # Transformation and normalization
-                                    # ----------------------------
-                                    ui.card(
-                                        ui.card_header("Transformation and normalization"),
-
-                                        # First transform
-                                        ui.row(
-                                            ui.column(
-                                                6,
-                                                ui.input_checkbox(
-                                                    "doAsinh",
-                                                    "Arcsinh transform",
-                                                    value=False,
-                                                ),
-                                            ),
-                                            ui.column(
-                                                6,
-                                                ui.input_select(
-                                                    "asinh_cofactor",
-                                                    "Cofactor",
-                                                    choices=[str(i) for i in range(2, 11)],
-                                                    selected="5",
-                                                    width="100%",
-                                                ),
-                                            ),
-                                            class_="align-items-end gy-1",
-                                        ),
-
-                                        ui.tags.hr(class_="pint-divider"),
-
-                                        # Then normalize
-                                        ui.input_checkbox(
-                                            "doNorm",
-                                            "Normalize channel",
-                                            value=True,
-                                        ),
-
-                                        ui.input_radio_buttons(
-                                            "norm_scope",
-                                            "Normalize using",
-                                            choices={
-                                                "page": "Per page",
-                                                "global": "Global min/max",
-                                            },
-                                            selected="page",
-                                            inline=True,
-                                        ),
-
-                                        ui.output_ui("norm_scope_hint"),
-
-                                        ui.input_action_button(
-                                            "apply_norm",
-                                            "Apply transform/norm",
-                                            class_="btn btn-primary w-100 mt-2",
-                                        ),
-
-                                        class_="mb-2",
-                                    ),
-
-                                    class_="controls-left",
-                                ),
-
-                                # ============================================================
-                                # RIGHT VIEWER COLUMN
-                                # ============================================================
-                                ui.tags.div(
-                                    ui.tags.div(
-                                        ui.row(
-                                            # Sample selector: 3
-                                            ui.column(
-                                                3,
-                                                ui.input_select(
-                                                    "sample",
-                                                    "Sample",
-                                                    choices=[],
-                                                    selected=None,
-                                                    width="100%",
-                                                ),
-                                            ),
-
-                                            # Previous sample: 1
-                                            ui.column(
-                                                1,
-                                                ui.input_action_button(
-                                                    "prev_sample",
-                                                    "←",
-                                                    class_="btn-sm w-100",
-                                                ),
-                                            ),
-
-                                            # Next sample: 1
-                                            ui.column(
-                                                1,
-                                                ui.input_action_button(
-                                                    "next_sample",
-                                                    "→",
-                                                    class_="btn-sm w-100",
-                                                ),
-                                            ),
-
-                                            # Empty spacer: 1
-                                            ui.column(1),
-
-                                            # Channel selector: 3
-                                            ui.column(
-                                                3,
-                                                ui.input_select(
-                                                    "channel",
-                                                    "Channel",
-                                                    choices=[],
-                                                    selected=None,
-                                                    width="100%",
-                                                ),
-                                            ),
-
-                                            # Previous channel: 1
-                                            ui.column(
-                                                1,
-                                                ui.input_action_button(
-                                                    "prev_channel",
-                                                    "←",
-                                                    class_="btn-sm w-100",
-                                                ),
-                                            ),
-
-                                            # Next channel: 1
-                                            ui.column(
-                                                1,
-                                                ui.input_action_button(
-                                                    "next_channel",
-                                                    "→",
-                                                    class_="btn-sm w-100",
-                                                ),
-                                            ),
-
-                                            class_="align-items-end gy-0 gx-1 viewer-navigator-row",
-                                        ),
-                                        class_="viewer-navigator",
-                                    ),
-
-                                    ui.tags.div(
-                                        ui.output_plot("pint_viewer", fill=True, height="100%"),
-                                        class_="viewer-plot-fill",
-                                    ),
-
-                                    class_="viewer-main",
-                                ),
-
-                                class_="pint-main-layout",
-                            ),
-
-                            value="pint",
-                        ),
-
-                        ui.nav_panel(
-                            "Image creator",
-                            ui.tags.div(
-                                ui.tags.div(
-                                    ui.card(
-                                        ui.card_header("Composite channels (processed images)"),
-
-                                        ui.row(
-                                            ui.column(7, ui.tags.strong("Channel")),
-                                            ui.column(3, ui.tags.strong("Color")),
-                                            ui.column(2, ui.tags.strong("Gain")),
-                                            class_="mb-1 creator-header-row",
-                                        ),
-
-                                        *[make_composite_slot(i) for i in range(1, 9)],
-
-                                        class_="mb-2",
-                                    ),
-
-                                    ui.card(
-                                        ui.card_header("Composite export"),
-
-                                        ui.input_action_button(
-                                            "fill_composite_from_current",
-                                            "Fill from first 8 channels",
-                                            class_="btn btn-secondary w-100 mb-2",
-                                        ),
-
-                                        ui.input_action_button(
-                                            "save_composite_tiff",
-                                            "Save composite TIFF",
-                                            class_="btn btn-primary w-100 mb-2",
-                                        ),
-
-                                        ui.input_action_button(
-                                            "export_creator_composites_all",
-                                            "Export composite TIFF for all images",
-                                            class_="btn btn-secondary w-100",
-                                        ),
-
-                                        ui.br(),
-                                        ui.br(),
-                                        ui.output_ui("composite_summary"),
-
-                                        class_="mb-2",
-                                    ),
-
-                                    class_="controls-left",
-                                ),
-                                ui.tags.div(
-                                    ui.tags.div(
-                                        ui.output_plot("creator_viewer", fill=True, height="100%"),
-                                        class_="viewer-plot-fill",
-                                    ),
-                                    class_="viewer-main",
-                                ),
-
-                                class_="pint-main-layout",
-                            ),
-                            value="creator",
-                        ),
-
-                        ui.nav_panel(
-                            "Mask visualization",
-                            ui.row(
-                                ui.column(
-                                    3,
-                                    ui.card(
-                                        ui.card_header("Mask input"),
-                                        ui.input_text("mask_csv_path", "Cell table CSV", value="", width="100%"),
-                                        ui.row(
-                                            ui.column(6, ui.input_action_button("browse_mask_csv", "Browse CSV", class_="btn btn-secondary w-100")),
-                                            ui.column(6, ui.input_action_button("load_mask_csv", "Load cell table", class_="btn btn-primary w-100")),
-                                        ),
-                                        ui.br(),
-                                        ui.input_text("mask_path", "Mask folder", value="", width="100%"),
-                                        ui.row(
-                                            ui.column(6, ui.input_action_button("browse_mask_path", "Browse folder", class_="btn btn-secondary w-100")),
-                                            ui.column(6, ui.input_action_button("match_masks", "Match masks", class_="btn btn-primary w-100")),
-                                        ),
-                                        ui.br(),
-                                        ui.input_select("mask_cell_id_col", "Cell ID column", choices=[], selected=None, width="100%"),
-                                        ui.input_select("mask_x_col", "X coordinate column", choices=[], selected=None, width="100%"),
-                                        ui.input_select("mask_y_col", "Y coordinate column", choices=[], selected=None, width="100%"),
-                                        ui.input_select("mask_name_col", "Mask name column", choices=[], selected=None, width="100%"),
-                                        ui.input_select("mask_cluster_col", "Cluster column", choices=[], selected=None, width="100%"),
-                                        ui.input_select("mask_condition_col", "Condition column", choices=[], selected=None, width="100%"),
-                                        ui.input_select("mask_sample_col", "SampleNumber column", choices=[], selected=None, width="100%"),
-                                        ui.input_numeric("mask_scale_factor", "Scale factor", value=2, min=1, max=20, step=1),
-                                    ),
-                                    ui.br(),
-                                    ui.card(
-                                        ui.card_header("Matched masks"),
-                                        ui.div(
-                                            ui.tags.div("Selection / visualization", class_="mask-section-title"),
-                                            ui.output_ui("mask_table_summary"),
-                                            ui.output_ui("mask_match_summary"),
-                                            ui.input_select("selected_mask_name", "Select mask", choices=[], selected=None, width="100%"),
-                                            ui.output_ui("selected_mask_summary"),
-
-                                            ui.hr(class_="mask-divider"),
-
-                                            ui.tags.div("Manual matching for unmatched masks", class_="mask-section-title"),
-                                            ui.output_ui("manual_mask_match_ui"),
-                                            ui.input_action_button(
-                                                "apply_manual_mask_matches",
-                                                "Apply manual matches",
-                                                class_="btn btn-secondary w-100 mt-2",
-                                            ),
-                                            ui.hr(class_="mask-divider"),
-                                            ui.input_action_button(
-                                                "export_all_mask_visualizations",
-                                                "Export all matched mask visualizations",
-                                                class_="btn btn-secondary w-100 mt-2",
-                                            ),
-                                            ui.hr(class_="mask-divider"),
-                                            ui.input_action_button(
-                                                "push_to_neighborhood",
-                                                "Push to neighborhood",
-                                                class_="btn btn-primary w-100 mt-2",
-                                                ),
-                                            ),
-                                            class_="compact-stack",
-                                        ),
-                                ),
-                                ui.column(
-                                    9,
-                                    ui.card(
-                                        ui.card_header("Visualization"),
-                                        ui.div(
-                                            ui.output_plot("mask_viewer", fill=True, height="100%"),
-                                            style="height: 75vh;",
-                                        ),
-                                    ),
-                                ),
-                            ),
-                            value="mask",
-                        ),
-
-                        ui.nav_panel(
-                            "Neigborhood Analysis",
-                            ui.row(
-                                ui.column(
-                                    4,
-                                    ui.card(
-                                        ui.card_header("Neighborhood input"),
-                                        ui.output_ui("neighborhood_input_summary"),
-                                        ui.input_numeric("touching_n_perm", "N permutations", value=1000, min=0, step=100),
-                                        ui.input_select(
-                                            "analysis_unit_col",
-                                            "Final comparison unit",
-                                            choices=[],
-                                            selected=None,
-                                            width="100%",
-                                        ),
-                                        ui.input_checkbox("save_mask_copy_on_analysis", "Save matched mask TIFF copies", value=False),
-                                        ui.input_action_button(
-                                            "run_touching_analysis",
-                                            "Run touching analysis",
-                                            class_="btn btn-primary w-100 mt-2",
-                                        ),
-                                        ui.hr(),
-                                        ui.tags.div("Fallback: kernel/radius-based analysis", class_="mask-section-title"),
-                                        ui.tags.a(
-                                            "Open legacy neighborhood analysis",
-                                            href="/neighborhood/",
-                                            target="_blank",
-                                            role="button",
-                                            class_="btn btn-secondary w-100 mt-2",
-                                            style="pointer-events: auto;",
-                                        ),
-                                    )
-                                ),
-                                ui.column(
-                                    8,
-                                    ui.card(
-                                        ui.card_header("Neighborhood status"),
-                                        ui.output_text_verbatim("neighborhood_status_text"),
-                                        ui.output_ui("neighborhood_touching_summary"),
-                                    ),
-                                ),
-                            ),
-                            ui.br(),
-                            ui.row(
-                                ui.column(
-                                    4,
-                                    ui.card(
-                                        ui.card_header("PERMANOVA"),
-                                        ui.output_ui("permanova_summary"),
-                                    ),
-                                ),
-                                ui.column(
-                                    8,
-                                    ui.card(
-                                        ui.card_header("Touching interaction results"),
-                                        ui.output_data_frame("touching_results_preview"),
-                                    ),
-                                ),
-                            ),
-                            value="neighborhood",
-                        ),
+                        ##------->Touching neigborhood panel of the shiny app<------##
+                        neighborhood_panel(),
                         id="viewer_mode",
                     ),
                 ),
@@ -937,6 +155,7 @@ def server(input, output, session):
     syncing_controls = reactive.Value(False)
     data_loaded = reactive.Value(False)
     last_loaded_folder = reactive.Value("")  #This stores the last path used to load images so saving throws them into the same folder update here If you want this to cahnge
+    
     mask_input_df = reactive.Value(pd.DataFrame())
     mask_files_df = reactive.Value(pd.DataFrame())
     mask_match_df = reactive.Value(pd.DataFrame())
@@ -952,6 +171,12 @@ def server(input, output, session):
     neighborhood_touching_results = reactive.Value(pd.DataFrame())
     neighborhood_sample_matrix = reactive.Value(pd.DataFrame())
     neighborhood_permanova_results = reactive.Value(pd.DataFrame())
+
+    mesmer_backend_status = reactive.Value(None)
+    mesmer_backend_detail_text = reactive.Value(
+        "Mesmer backend has not been checked yet.\n\n"
+        "This Alpha tab currently only manages optional Mesmer/DeepCell installation."
+    )  
         
     ## <----------------> Helper functions <-------------------> ##
     def _get_winsor_settings():
@@ -1092,19 +317,8 @@ def server(input, output, session):
 
     WINSOR_MIN_UPPER_BOUND = 5.0
 
-    def _apply_winsor(cur: np.ndarray, lo_q: float, hi_q: float) -> np.ndarray:
-        return apply_winsor(cur, lo_q, hi_q, min_upper_bound=WINSOR_MIN_UPPER_BOUND)
-
     def _strength_to_percentile(s: float, eps: float = 0.005) -> float:
         return strength_to_percentile(s, eps=eps)
-
-    def _apply_speckle_suppress(
-        img: np.ndarray,
-        size: int,
-        perc: float,
-        neighbor_limit: int = 2,
-    ) -> np.ndarray:
-        return apply_speckle_suppress(img, size=size, perc=perc, neighbor_limit=neighbor_limit)
 
     ##Cache for global min/max per channel (invalidated on load)
     ##Also stored previous values so moving back and forth is cached
@@ -1242,11 +456,7 @@ def server(input, output, session):
                 h, w = proc.shape
                 rgb = np.zeros((h, w, 3), dtype=np.float32)
 
-            colorVec = np.asarray(COMPOSITE_PALETTE.get(colorName, (1.0, 1.0, 1.0)), dtype=np.float32)
-            layer = np.clip(proc[..., None] * gain * colorVec[None, None, :], 0.0, 1.0)
-
-            # screen blend
-            rgb = 1.0 - (1.0 - rgb) * (1.0 - layer)
+            rgb = screen_blend_layer(rgb, proc, colorName, gain)
 
             used.append((channelName, colorName, gain))
 
@@ -1609,6 +819,13 @@ def server(input, output, session):
             setting_selects.set(True)
             try:
                 ui.update_select("sample", choices=samples, selected=first_sample, session=session)
+
+                ui.update_select(
+                    "creator_sample_display",
+                    choices=samples,
+                    selected=first_sample,
+                    session=session,
+                )
                 if first_channel:
                     ui.update_select("channel", choices=first_chlist, selected=first_channel, session=session)
             finally:
@@ -1657,31 +874,82 @@ def server(input, output, session):
         if prv:
             ui.update_select("sample", choices=samples, selected=prv, session=session)
 
+    @reactive.Effect
+    @reactive.event(input.creator_next_sample)
+    def _creator_next_sample():
+        if loading.get() or not images.get():
+            return
+
+        samples = list(images.get().keys())
+        cur = input.sample() or input.creator_sample_display() or (samples[0] if samples else None)
+        nxt = _cycle(samples, cur, +1)
+
+        if nxt:
+            ui.update_select("sample", choices=samples, selected=nxt, session=session)
+            ui.update_select("creator_sample_display", choices=samples, selected=nxt, session=session)
+
+
+    @reactive.Effect
+    @reactive.event(input.creator_prev_sample)
+    def _creator_prev_sample():
+        if loading.get() or not images.get():
+            return
+
+        samples = list(images.get().keys())
+        cur = input.sample() or input.creator_sample_display() or (samples[0] if samples else None)
+        prv = _cycle(samples, cur, -1)
+
+        if prv:
+            ui.update_select("sample", choices=samples, selected=prv, session=session)
+            ui.update_select("creator_sample_display", choices=samples, selected=prv, session=session)
+
+    @reactive.Effect
+    @reactive.event(input.creator_sample_display)
+    def _on_creator_sample_display_change():
+        if loading.get() or setting_selects.get():
+            return
+
+        s = input.creator_sample_display()
+        if not s:
+            return
+
+        if s != input.sample():
+            ui.update_select("sample", selected=s, session=session)
 
     @reactive.Effect
     @reactive.event(input.sample)
     def _on_sample_change():
-        ##again, guard against changing while loading
         if loading.get() or setting_selects.get():
             return
-        ##Which sample selected? if none, bail
+
         s = input.sample()
         if not s:
             return
+
         chlist_current = channels.get().get(s, [])
         if not chlist_current:
             return
-        ##reorder using cannonical channels, this fixed a problem were channels were ordered differently between samples (total channels was the same)
+
         canon = canonical_channels.get()
         ordered = order_by_canonical(canon, chlist_current)
+
         sel = input.channel()
         if sel not in ordered:
             sel = ordered[0]
+
         setting_selects.set(True)
         try:
             ui.update_select("channel", choices=ordered, selected=sel, session=session)
+
+            ui.update_select(
+                "creator_sample_display",
+                choices=list(images.get().keys()),
+                selected=s,
+                session=session,
+            )
         finally:
             setting_selects.set(False)
+
         _sync_controls_from_table(sel)
         _sync_composite_channel_choices(s, overwriteDefaults=False)
 
@@ -1860,6 +1128,144 @@ def server(input, output, session):
             )
         )
 
+    def _get_mesmer_env_name() -> str:
+        envName = (input.mesmer_env_name() or "").strip()
+        return envName or DEFAULT_MESMER_ENV_NAME
+
+
+    @reactive.Effect
+    @reactive.event(input.check_mesmer_backend)
+    def _check_mesmer_backend():
+        envName = _get_mesmer_env_name()
+
+        print(f"🔎 Checking Mesmer backend in conda environment: {envName}")
+
+        status = check_mesmer_backend(env_name=envName)
+        mesmer_backend_status.set(status)
+        mesmer_backend_detail_text.set(status.detail)
+
+        if status.ok:
+            print(f"✅ Mesmer backend available in '{envName}'.")
+        else:
+            print(f"⚠️ Mesmer backend not available in '{envName}': {status.status}")
+
+
+    @reactive.Effect
+    @reactive.event(input.show_mesmer_install_commands)
+    def _show_mesmer_install_commands():
+        envName = _get_mesmer_env_name()
+        commands = get_mesmer_install_commands(env_name=envName)
+
+        text = (
+            "Manual Mesmer/DeepCell backend installation commands:\n\n"
+            + "\n".join(commands)
+            + "\n\n"
+            "After running these in a terminal, return to PINT and click "
+            "'Check Mesmer installation'."
+        )
+
+        mesmer_backend_detail_text.set(text)
+
+        ui.modal_show(
+            ui.modal(
+                ui.h4("Install Mesmer backend"),
+                ui.p(
+                    "Run these commands in a terminal. This installs Mesmer/DeepCell "
+                    "into a separate conda environment and does not modify the main PINT environment."
+                ),
+                ui.tags.pre(
+                    "\n".join(commands),
+                    class_="seg-command-box",
+                ),
+                ui.p(
+                    "After installation, click 'Check Mesmer installation' in the Segmentation tab."
+                ),
+                easy_close=True,
+                footer=ui.modal_button("OK"),
+                size="l",
+            ),
+            session=session,
+        )
+
+
+    @reactive.Effect
+    @reactive.event(input.install_mesmer_backend)
+    def _install_mesmer_backend():
+        envName = _get_mesmer_env_name()
+
+        if not bool(input.confirm_mesmer_alpha_install()):
+            ui.modal_show(
+                ui.modal(
+                    ui.h4("Confirmation required"),
+                    ui.p(
+                        "Please tick the Alpha confirmation checkbox before installing "
+                        "the optional Mesmer backend."
+                    ),
+                    easy_close=True,
+                    footer=ui.modal_button("OK"),
+                ),
+                session=session,
+            )
+            return
+
+        ui.modal_show(
+            ui.modal(
+                ui.h4("Install Mesmer backend?"),
+                ui.p(
+                    f"This will install Mesmer/DeepCell into a separate conda environment called '{envName}'."
+                ),
+                ui.p(
+                    "The main PINT environment will not be modified. Installation can take several minutes "
+                    "and may fail depending on TensorFlow/DeepCell dependency resolution."
+                ),
+                ui.tags.small(
+                    "This is an Alpha function. Use only for testing at this stage.",
+                    class_="text-muted",
+                ),
+                easy_close=True,
+                footer=ui.div(
+                    ui.modal_button("Cancel", class_="btn btn-secondary"),
+                    ui.input_action_button(
+                        "confirm_install_mesmer_backend",
+                        "Install",
+                        class_="btn btn-warning ms-2",
+                    ),
+                ),
+            ),
+            session=session,
+        )
+
+
+    @reactive.Effect
+    @reactive.event(input.confirm_install_mesmer_backend)
+    def _confirm_install_mesmer_backend():
+        ui.modal_remove(session=session)
+
+        envName = _get_mesmer_env_name()
+
+        mesmer_backend_detail_text.set(
+            f"Installing Mesmer/DeepCell backend into conda environment '{envName}'...\n\n"
+            "This may take a while. Progress is also printed to the terminal."
+        )
+
+        print(f"⚠️ Installing Alpha Mesmer backend into environment: {envName}")
+
+        with ui.Progress(min=0, max=3, session=session) as p:
+            p.set(0, message="Starting Mesmer backend installation...")
+
+            status = install_mesmer_backend(env_name=envName)
+
+            p.set(3, message="Mesmer backend installation finished.")
+
+        mesmer_backend_status.set(status)
+        mesmer_backend_detail_text.set(status.detail)
+
+        if status.ok:
+            print(f"✅ Mesmer backend installed and available in '{envName}'.")
+        else:
+            print(f"❌ Mesmer backend installation failed or is unavailable: {status.status}")
+
+
     @reactive.Effect
     @reactive.event(input.export_all_mask_visualizations)
     def _confirm_export_all_mask_visualizations():
@@ -1884,9 +1290,9 @@ def server(input, output, session):
             footer=ui.div(
                 ui.modal_button("Cancel", class_="btn btn-secondary"),
                 ui.input_action_button(
-                    "fill_composite_from_current",
-                    "Reset creator channels",
-                    class_="btn btn-secondary w-100 mb-2",
+                    "confirm_export_all_mask_visualizations",
+                    "Export",
+                    class_="btn btn-primary ms-2",
                 ),
             ),
         )
@@ -2496,6 +1902,45 @@ def server(input, output, session):
     def param_table():
         return format_for_display(params_df.get())
     
+
+    @output
+    @render.ui
+    def mesmer_backend_summary():
+        status = mesmer_backend_status.get()
+
+        if status is None:
+            return ui.div(
+                ui.tags.div("Status: not checked yet", class_="seg-status-bad"),
+                ui.tags.small(
+                    "Click 'Check Mesmer installation' to test the optional backend.",
+                    class_="text-muted",
+                ),
+            )
+
+        if status.ok:
+            return ui.div(
+                ui.tags.div(f"Status: {status.status}", class_="seg-status-ok"),
+                ui.tags.div(f"Environment: {status.env_name}"),
+                ui.tags.div(f"Conda executable: {status.conda_executable or '—'}"),
+            )
+
+        return ui.div(
+            ui.tags.div(f"Status: {status.status}", class_="seg-status-bad"),
+            ui.tags.div(f"Environment: {status.env_name}"),
+            ui.tags.div(f"Conda executable: {status.conda_executable or '—'}"),
+            ui.tags.small(
+                "Use 'Show install commands' for manual setup instructions.",
+                class_="text-muted",
+            ),
+        )
+
+
+    @output
+    @render.text
+    def mesmer_backend_detail():
+        return mesmer_backend_detail_text.get()
+
+
     @output
     @render.ui
     def neighborhood_touching_summary():

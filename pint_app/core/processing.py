@@ -306,6 +306,7 @@ def image_winsor_range(
     qhi = max(float(qhi), float(min_upper_bound))
     return float(qlo), float(qhi)
 
+
 def process_image_pipeline(
     img: np.ndarray,
     *,
