@@ -54,6 +54,11 @@ from pint_app.core.load_masks import (
     get_cells_for_mask_name,
 )
 
+from pint_app.core.mask_render_cache import (
+    MaskRenderCache,
+    make_mask_render_cache_key,
+)
+
 from pint_app.core.mask_viz import (
     read_mask_tiff,
     match_mask_centroids_to_cells,
@@ -164,6 +169,9 @@ def server(input, output, session):
     selected_mask_match = reactive.Value(pd.DataFrame())
     manual_mask_match_df = reactive.Value(pd.DataFrame())
     final_mask_match_df = reactive.Value(pd.DataFrame())
+    maskRenderCache = MaskRenderCache(max_items=25)
+    maskRenderDataVersion = reactive.Value(0)
+
     neighborhood_input_data = reactive.Value(None)
     neighborhood_status_msg = reactive.Value("No mask dataset pushed yet.")
     neighborhood_touching_edges = reactive.Value(pd.DataFrame())
@@ -176,7 +184,8 @@ def server(input, output, session):
     mesmer_backend_detail_text = reactive.Value(
         "Mesmer backend has not been checked yet.\n\n"
         "This Alpha tab currently only manages optional Mesmer/DeepCell installation."
-    )  
+    ) 
+    segmentation_input_data = reactive.Value(None) 
         
     ## <----------------> Helper functions <-------------------> ##
     def _get_winsor_settings():
@@ -429,6 +438,7 @@ def server(input, output, session):
             norm_vmax=normVmax,
             winsor_min_upper_bound=WINSOR_MIN_UPPER_BOUND,
         )
+    
 
     def _build_composite_rgb(sampleName: str | None = None):
         if sampleName is None:
@@ -515,6 +525,340 @@ def server(input, output, session):
 
         return selected
 
+
+    def _pick_default_nuclear_channel(chlist: list[str]) -> str | None:
+        if not chlist:
+            return None
+
+        nuclearHints = [
+            "dna",
+            "iridium",
+            "histone",
+            "hoechst",
+            "dapi",
+        ]
+
+        for hint in nuclearHints:
+            for ch in chlist:
+                if hint in ch.lower():
+                    return ch
+
+        return chlist[0]
+
+
+    def _pick_default_boundary_channels(chlist: list[str]) -> list[str]:
+        if not chlist:
+            return []
+
+        boundaryHints = [
+            "ecad",
+            "e-cad",
+            "cadherin",
+            "panck",
+            "cytokeratin",
+            "keratin",
+            "cd45",
+            "vimentin",
+            "vim",
+            "sma",
+            "actin",
+            "cd31",
+            "cd3",
+            "cd20",
+            "cd68",
+            "cd90",
+        ]
+
+        selected = []
+
+        for hint in boundaryHints:
+            for ch in chlist:
+                if ch in selected:
+                    continue
+                if hint in ch.lower():
+                    selected.append(ch)
+
+        return selected[:8]
+
+
+    def _sync_segmentation_channel_choices(sampleName: str | None = None) -> None:
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            ui.update_select("seg_sample", choices=[], selected=None, session=session)
+            ui.update_select("seg_nuclear_channel", choices=[], selected=None, session=session)
+            ui.update_select("seg_boundary_channels", choices=[], selected=None, session=session)
+            return
+
+        imgs = obj.get("images", {})
+        chs = obj.get("channels", {})
+        canon = obj.get("canonical_channels", [])
+
+        samples = list(imgs.keys())
+        if not samples:
+            return
+
+        if sampleName is None or sampleName not in samples:
+            sampleName = samples[0]
+
+        chlistCurrent = chs.get(sampleName, [])
+        ordered = order_by_canonical(canon, chlistCurrent)
+
+        nuclearDefault = _pick_default_nuclear_channel(ordered)
+        boundaryDefault = _pick_default_boundary_channels(ordered)
+
+        ui.update_select(
+            "seg_sample",
+            choices=samples,
+            selected=sampleName,
+            session=session,
+        )
+
+        ui.update_select(
+            "seg_nuclear_channel",
+            choices=ordered,
+            selected=nuclearDefault,
+            session=session,
+        )
+
+        ui.update_select(
+            "seg_boundary_channels",
+            choices=ordered,
+            selected=boundaryDefault,
+            session=session,
+        )
+
+
+    def _robust_normalize_for_segmentation(
+        img: np.ndarray,
+        lowQuantile: float = 0.005,
+        highQuantile: float = 0.998,
+    ) -> np.ndarray:
+        """
+        Gentle segmentation-oriented normalization.
+
+        This is intentionally softer than the visualization pipeline:
+        - percentile clipping
+        - no hard biological threshold
+        - no aggressive background deletion
+        - output clipped to 0..1
+        """
+        arr = img.astype(np.float32, copy=False)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if arr.size == 0:
+            return arr
+
+        try:
+            lo = float(np.nanquantile(arr, lowQuantile))
+            hi = float(np.nanquantile(arr, highQuantile))
+        except Exception:
+            lo = float(np.nanmin(arr))
+            hi = float(np.nanmax(arr))
+
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            mn = float(np.nanmin(arr))
+            mx = float(np.nanmax(arr))
+            if not np.isfinite(mn) or not np.isfinite(mx) or mx <= mn:
+                return np.zeros_like(arr, dtype=np.float32)
+            lo, hi = mn, mx
+
+        arr = np.clip(arr, lo, hi)
+        arr = (arr - lo) / (hi - lo)
+        arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
+
+        return arr
+
+
+    def _get_raw_channel_image_from_segmentation_push(
+        sampleName: str,
+        channelName: str,
+    ) -> np.ndarray | None:
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            return None
+
+        imgs = obj.get("images", {})
+        chs = obj.get("channels", {})
+
+        if sampleName not in imgs:
+            return None
+
+        chlist = chs.get(sampleName, [])
+
+        if channelName not in chlist:
+            return None
+
+        idx = chlist.index(channelName)
+        return imgs[sampleName][idx, :, :].astype(np.float32)
+
+
+    def _process_channel_for_segmentation(
+        sampleName: str,
+        channelName: str,
+        mode: str,
+    ) -> np.ndarray | None:
+        raw = _get_raw_channel_image_from_segmentation_push(sampleName, channelName)
+
+        if raw is None:
+            return None
+
+        mode = (mode or "soft").strip().lower()
+
+        if mode == "raw":
+            # Still normalize for display / model input scaling, but do not use PINT settings.
+            return _robust_normalize_for_segmentation(
+                raw,
+                lowQuantile=0.0,
+                highQuantile=1.0,
+            )
+
+        if mode == "pint":
+            # Uses current PINT channel settings from params_df.
+            # This is intentionally marked as not recommended because it may include hard thresholding.
+            proc = _process_channel_from_table(sampleName, channelName)
+            if proc is None:
+                return None
+            return np.clip(
+                np.nan_to_num(proc.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0),
+                0.0,
+                1.0,
+            )
+
+        # Recommended soft segmentation preprocessing.
+        return _robust_normalize_for_segmentation(
+            raw,
+            lowQuantile=0.005,
+            highQuantile=0.998,
+        )
+
+
+    def _get_selected_segmentation_channels():
+        sampleName = input.seg_sample()
+        nuclearChannel = input.seg_nuclear_channel()
+        boundaryChannels = input.seg_boundary_channels()
+        mode = input.seg_preprocess_mode() or "soft"
+
+        if isinstance(boundaryChannels, str):
+            boundaryChannels = [boundaryChannels]
+        elif boundaryChannels is None:
+            boundaryChannels = []
+        else:
+            boundaryChannels = list(boundaryChannels)
+
+        return sampleName, nuclearChannel, boundaryChannels, mode
+
+
+    def _build_segmentation_preview_images():
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            return None, None, None, "No images pushed from PINT."
+
+        sampleName, nuclearChannel, boundaryChannels, mode = _get_selected_segmentation_channels()
+
+        if not sampleName or not nuclearChannel:
+            return None, None, None, "Select a sample and nuclear channel."
+
+        nuclearImg = _process_channel_for_segmentation(
+            sampleName=sampleName,
+            channelName=nuclearChannel,
+            mode=mode,
+        )
+
+        if nuclearImg is None:
+            return None, None, None, "Could not build nuclear input."
+
+        boundaryImgs = []
+        for ch in boundaryChannels:
+            img = _process_channel_for_segmentation(
+                sampleName=sampleName,
+                channelName=ch,
+                mode=mode,
+            )
+            if img is not None:
+                boundaryImgs.append(img)
+
+        if boundaryImgs:
+            boundaryStack = np.stack(boundaryImgs, axis=0)
+            boundaryImg = np.nanmax(boundaryStack, axis=0).astype(np.float32)
+        else:
+            boundaryImg = np.zeros_like(nuclearImg, dtype=np.float32)
+
+        combinedRgb = np.zeros((*nuclearImg.shape, 3), dtype=np.float32)
+        combinedRgb[..., 0] = boundaryImg
+        combinedRgb[..., 1] = nuclearImg
+        combinedRgb[..., 2] = nuclearImg
+        combinedRgb = np.clip(combinedRgb, 0.0, 1.0)
+
+        return nuclearImg, boundaryImg, combinedRgb, None
+
+
+    def _make_single_image_preview_figure(
+        img,
+        title: str,
+        cmap: str | None = "gray",
+        errorMessage: str | None = None,
+    ):
+        fig, ax = plt.subplots(figsize=(10, 8), dpi=120)
+
+        if errorMessage:
+            ax.text(
+                0.5,
+                0.5,
+                errorMessage,
+                ha="center",
+                va="center",
+                fontsize=12,
+            )
+            ax.set_axis_off()
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            return fig
+
+        if img is None:
+            ax.text(
+                0.5,
+                0.5,
+                "No preview available",
+                ha="center",
+                va="center",
+                fontsize=12,
+            )
+            ax.set_axis_off()
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+            return fig
+
+        if cmap is None:
+            ax.imshow(img, interpolation="nearest")
+        else:
+            ax.imshow(img, cmap=cmap, interpolation="nearest")
+
+        ax.set_axis_off()
+
+        # Small overlay label instead of matplotlib title, to avoid extra whitespace.
+        if title:
+            ax.text(
+                0.01,
+                0.99,
+                title,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                color="white",
+                bbox=dict(
+                    facecolor="black",
+                    alpha=0.55,
+                    edgecolor="none",
+                    pad=4,
+                ),
+            )
+
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        return fig
+
+
     def _build_mask_visualization_figure(
         maskPath: str,
         maskName: str,
@@ -523,7 +867,7 @@ def server(input, output, session):
         xCol: str,
         yCol: str,
         scaleFactor: int,
-    ):
+        ):
         cellMask = read_mask_tiff(maskPath)
 
         matchedData = match_mask_centroids_to_cells(
@@ -600,7 +944,79 @@ def server(input, output, session):
         plt.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.01)
 
         return fig, matchedData
+    
+    def _get_cached_mask_plot_data(
+        maskPath: str,
+        maskName: str,
+        matchingData: pd.DataFrame,
+        clusterCol: str,
+        xCol: str,
+        yCol: str,
+        scaleFactor: int,
+    ):
+        """
+        Return cached mask plot data if available; otherwise compute and cache it.
 
+        The cache intentionally does not depend on browser size or browser zoom.
+        """
+        cacheKey = make_mask_render_cache_key(
+            mask_path=maskPath,
+            data_version=maskRenderDataVersion.get(),
+            render_settings={
+                "mask_name": str(maskName),
+                "cluster_col": str(clusterCol),
+                "x_col": str(xCol),
+                "y_col": str(yCol),
+                "scale_factor": int(scaleFactor),
+                "background": "white",
+                "border_color": "white",
+                "missing_color": "#808080",
+            },
+        )
+
+        cached = maskRenderCache.get(cacheKey)
+        if cached is not None:
+            print(f"✅ Using cached mask visualization for {maskName}", flush=True)
+            return cached
+
+        print(f"▶️ Rendering mask visualization for {maskName}", flush=True)
+
+        cellMask = read_mask_tiff(maskPath)
+
+        matchedData = match_mask_centroids_to_cells(
+            cellMask=cellMask,
+            matchingData=matchingData,
+            xCol=xCol,
+            yCol=yCol,
+        )
+
+        plotData = make_mask_plot_data(
+            cellMask=cellMask,
+            matchedData=matchedData,
+            clusterCol=clusterCol,
+            scaleFactor=scaleFactor,
+            background="white",
+            borderColor="white",
+            missingColor="#808080",
+        )
+
+        cachedValue = {
+            "plotData": plotData,
+            "matchedData": matchedData,
+        }
+
+        maskRenderCache.set(cacheKey, cachedValue)
+        return cachedValue
+
+    def clear_mask_render_cache(reason: str = "") -> None:
+        maskRenderCache.clear()
+        maskRenderDataVersion.set(maskRenderDataVersion.get() + 1)
+
+        msg = f"Mask render cache cleared"
+        if reason:
+            msg += f": {reason}"
+
+        print(msg, flush=True)
 
     def _get_neighborhood_output_dir():
         obj = neighborhood_input_data.get()
@@ -611,9 +1027,58 @@ def server(input, output, session):
         if not maskFolder:
             return None
 
-        outDir = Path(maskFolder) / "Neigborhood results"
+        outDir = Path(maskFolder) / "Neighborhood results"
         outDir.mkdir(parents=True, exist_ok=True)
         return outDir
+
+
+    @reactive.Effect
+    @reactive.event(input.push_to_segmentation)
+    def _push_to_segmentation():
+        imgs = images.get()
+        chs = channels.get()
+
+        if not imgs:
+            print("⚠️ No images loaded. Load images in the PINT tab before pushing to Segmentation.")
+            segmentation_input_data.set(None)
+            return
+
+        obj = {
+            "pushed_at": datetime.now().isoformat(timespec="seconds"),
+            "images": imgs,
+            "channels": chs,
+            "canonical_channels": list(canonical_channels.get() or []),
+            "folder": last_loaded_folder.get() or (input.path() or "").strip(),
+            "n_images": len(imgs),
+        }
+
+        segmentation_input_data.set(obj)
+
+        firstSample = list(imgs.keys())[0]
+        _sync_segmentation_channel_choices(firstSample)
+
+        ui.update_navs("viewer_mode", selected="segmentation", session=session)
+
+        print(
+            f"✅ Pushed {len(imgs):,} loaded image(s) to Segmentation. "
+            f"Folder: {obj['folder'] or '—'}"
+        )
+
+
+    @reactive.Effect
+    @reactive.event(input.seg_sample)
+    def _on_seg_sample_change():
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            return
+
+        sampleName = input.seg_sample()
+        if not sampleName:
+            return
+
+        _sync_segmentation_channel_choices(sampleName)
+
 
     @reactive.Effect
     @reactive.event(input.save_composite_tiff)
@@ -1266,6 +1731,121 @@ def server(input, output, session):
             print(f"❌ Mesmer backend installation failed or is unavailable: {status.status}")
 
 
+    @output
+    @render.ui
+    def segmentation_input_summary():
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            return ui.div(
+                ui.tags.div("No images pushed from PINT yet.", class_="seg-status-bad"),
+                ui.tags.small(
+                    "Load images in the PINT tab, then click 'Push loaded images to Segmentation'.",
+                    class_="text-muted",
+                ),
+            )
+
+        folder = obj.get("folder", "") or "—"
+        pushedAt = obj.get("pushed_at", "—")
+        nImages = obj.get("n_images", 0)
+
+        return ui.div(
+            ui.tags.div("Images available for segmentation", class_="seg-status-ok"),
+            ui.tags.div(f"Images: {nImages:,}"),
+            ui.tags.div(f"Pushed at: {pushedAt}"),
+            ui.tags.div(f"Folder: {folder}"),
+        )
+
+
+    @output
+    @render.plot
+    def segmentation_nuclear_preview():
+        try:
+            nuclearImg, boundaryImg, combinedRgb, errorMessage = _build_segmentation_preview_images()
+
+            sampleName, nuclearChannel, boundaryChannels, mode = _get_selected_segmentation_channels()
+            title = f"Nuclear input: {nuclearChannel or '—'} | mode: {mode}"
+
+            return _make_single_image_preview_figure(
+                nuclearImg,
+                title=title,
+                cmap="gray",
+                errorMessage=errorMessage,
+            )
+
+        except SilentException:
+            raise
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return _make_single_image_preview_figure(
+                None,
+                title="Nuclear input",
+                errorMessage=f"Nuclear preview error:\n{e}",
+            )
+
+
+    @output
+    @render.plot
+    def segmentation_boundary_preview():
+        try:
+            nuclearImg, boundaryImg, combinedRgb, errorMessage = _build_segmentation_preview_images()
+
+            sampleName, nuclearChannel, boundaryChannels, mode = _get_selected_segmentation_channels()
+            nBoundary = 0 if boundaryChannels is None else len(boundaryChannels)
+            title = f"Boundary input: {nBoundary} channel(s) | mode: {mode}"
+
+            return _make_single_image_preview_figure(
+                boundaryImg,
+                title=title,
+                cmap="gray",
+                errorMessage=errorMessage,
+            )
+
+        except SilentException:
+            raise
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return _make_single_image_preview_figure(
+                None,
+                title="Boundary input",
+                errorMessage=f"Boundary preview error:\n{e}",
+            )
+
+
+    @output
+    @render.plot
+    def segmentation_combined_preview():
+        try:
+            nuclearImg, boundaryImg, combinedRgb, errorMessage = _build_segmentation_preview_images()
+
+            sampleName, nuclearChannel, boundaryChannels, mode = _get_selected_segmentation_channels()
+            title = f"Combined Mesmer input preview | mode: {mode}"
+
+            return _make_single_image_preview_figure(
+                combinedRgb,
+                title=title,
+                cmap=None,
+                errorMessage=errorMessage,
+            )
+
+        except SilentException:
+            raise
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return _make_single_image_preview_figure(
+                None,
+                title="Combined preview",
+                errorMessage=f"Combined preview error:\n{e}",
+            )
+
+
+
     @reactive.Effect
     @reactive.event(input.export_all_mask_visualizations)
     def _confirm_export_all_mask_visualizations():
@@ -1316,63 +1896,93 @@ def server(input, output, session):
         nMasks = len(matchTable) if matchTable is not None else 0
         nPerm = int(input.touching_n_perm() or 0)
 
+        outDir = _get_neighborhood_output_dir()
+
         sampleCol = obj["column_map"].get("sample_col", None)
         clusterCol = obj["column_map"].get("cluster_col", None)
         conditionCol = obj["column_map"].get("condition_col", None)
 
-        if not sampleCol or not clusterCol:
-            neighborhood_status_msg.set("Sample and cluster columns must be selected before running analysis.")
+        if not sampleCol or not clusterCol or not conditionCol:
+            neighborhood_status_msg.set(
+                "Sample, cluster, and condition columns must be selected before running analysis."
+            )
             return
+        
+        class NeighborhoodProgress:
+            def __init__(self, p, status_setter, total=100):
+                self.p = p
+                self.status_setter = status_setter
+                self.total = total
+                self.value = 0
 
-        with ui.Progress(min=0, max=max(nMasks + 3, 1), session=session) as p:
-            step = 0
+            def set(self, value, msg):
+                self.value = max(0, min(int(value), self.total))
+                msg = str(msg)
+
+                # Bottom-right Shiny progress
+                self.p.set(self.value, message=msg)
+
+                # Persistent in-tab status
+                self.status_setter(msg)
+
+                # Terminal/debug output
+                print(msg, flush=True)
+
+            def message(self, msg):
+                # Update message without artificially advancing too much
+                self.set(self.value, msg)
+
+            def bump(self, amount, msg):
+                self.set(self.value + amount, msg)
+
+        with ui.Progress(min=0, max=100, session=session) as p:
+            prog = NeighborhoodProgress(
+                p=p,
+                status_setter=neighborhood_status_msg.set,
+                total=100,
+            )
 
             def progress(msg: str) -> None:
-                nonlocal step
-                if (
-                    "Building touching graph for" in msg or
-                    "Done " in msg or
-                    "Summarizing observed touching interactions" in msg or
-                    "Computing permutation expectation on fixed touching graph" in msg
-                ):
-                    step = min(step + 1, max(nMasks + 3, 1))
-                p.set(step, message=msg)
+                prog.message(msg)
 
-            p.set(0, message="Starting touching analysis...")
+            prog.set(0, "Starting touching neighborhood analysis...")
+            prog.set(3, "Validating neighborhood input data...")
 
             try:
+                prog.set(
+                    10,
+                    f"Building touching graph for {nMasks:,} matched masks..."
+                )
+
                 matchedData, touchingEdges = build_touching_edges_for_pushed_dataset(
                     obj,
                     progress=progress,
                 )
+
+                prog.set(
+                    45,
+                    f"Touching graph built: {len(matchedData):,} matched cells, "
+                    f"{len(touchingEdges):,} touching edges."
+                )
+
             except Exception as e:
                 neighborhood_matched_cells.set(pd.DataFrame())
                 neighborhood_touching_edges.set(pd.DataFrame())
                 neighborhood_touching_results.set(pd.DataFrame())
                 neighborhood_sample_matrix.set(pd.DataFrame())
                 neighborhood_permanova_results.set(pd.DataFrame())
-                neighborhood_status_msg.set(f"Touching analysis failed: {e}")
+                prog.set(100, f"Touching graph construction failed: {e}")
                 return
 
             neighborhood_matched_cells.set(matchedData)
             neighborhood_touching_edges.set(touchingEdges)
 
-            # Optional TIFF copy export
-            outDir = _get_neighborhood_output_dir()
-            if bool(input.save_mask_copy_on_analysis()) and outDir is not None and matchTable is not None and not matchTable.empty:
-                maskCopyDir = outDir / "matched_mask_tiff_copies"
-                maskCopyDir.mkdir(parents=True, exist_ok=True)
-
-                for _, row in matchTable.iterrows():
-                    maskPath = row.get("MaskPath", None)
-                    if maskPath and not pd.isna(maskPath):
-                        src = Path(str(maskPath))
-                        if src.exists():
-                            dst = maskCopyDir / src.name
-                            if not dst.exists():
-                                dst.write_bytes(src.read_bytes())
-
             try:
+                prog.set(
+                    50,
+                    f"Running chance correction with {nPerm:,} permutations per sample..."
+                )
+
                 resultsDf = chance_correct_touching_interactions(
                     edgeDf=touchingEdges,
                     matchedDf=matchedData,
@@ -1382,14 +1992,22 @@ def server(input, output, session):
                     random_seed=1,
                     progress=progress,
                 )
+
+                prog.set(
+                    85,
+                    f"Chance correction complete: {len(resultsDf):,} interaction rows."
+                )
+
             except Exception as e:
                 neighborhood_touching_results.set(pd.DataFrame())
                 neighborhood_sample_matrix.set(pd.DataFrame())
                 neighborhood_permanova_results.set(pd.DataFrame())
-                neighborhood_status_msg.set(f"Touching graph built, but chance correction failed: {e}")
+                prog.set(100, f"Touching graph built, but chance correction failed: {e}")
                 return
 
             neighborhood_touching_results.set(resultsDf)
+
+            prog.set(88, "Building sample-by-interaction matrix...")
 
             sampleMatrixDf = make_sample_interaction_matrix(
                 resultsDf,
@@ -1400,13 +2018,15 @@ def server(input, output, session):
             analysisUnitCol = input.analysis_unit_col()
 
             if not analysisUnitCol or analysisUnitCol not in matchedData.columns:
-                neighborhood_touching_results.set(resultsDf)
                 neighborhood_sample_matrix.set(pd.DataFrame())
                 neighborhood_permanova_results.set(pd.DataFrame())
-                neighborhood_status_msg.set(
+                prog.set(
+                    100,
                     f"Final comparison unit column '{analysisUnitCol}' is not available."
                 )
                 return
+
+            prog.set(92, f"Aggregating results by analysis unit: {analysisUnitCol}...")
 
             if analysisUnitCol == sampleCol:
                 finalMatrixDf = sampleMatrixDf.copy()
@@ -1414,7 +2034,6 @@ def server(input, output, session):
                 permanovaSampleCol = sampleCol
             else:
                 metaDf = matchedData[[sampleCol, analysisUnitCol, conditionCol]].drop_duplicates().copy()
-
                 finalMatrixDf, finalMetaDf = aggregate_interaction_matrix(
                     matrixDf=sampleMatrixDf,
                     metadataDf=metaDf,
@@ -1426,6 +2045,8 @@ def server(input, output, session):
 
             neighborhood_sample_matrix.set(finalMatrixDf)
 
+            prog.set(95, "Running PERMANOVA on final interaction matrix...")
+
             if conditionCol and conditionCol in finalMetaDf.columns and not finalMatrixDf.empty:
                 permanovaDf = permanova_one_factor(
                     matrixDf=finalMatrixDf,
@@ -1435,6 +2056,7 @@ def server(input, output, session):
                     n_perm=999,
                     random_seed=1,
                 )
+
                 if not permanovaDf.empty:
                     permanovaDf["AnalysisUnit"] = str(analysisUnitCol)
                     permanovaDf["Status"] = "OK"
@@ -1442,6 +2064,8 @@ def server(input, output, session):
                 permanovaDf = pd.DataFrame()
 
             neighborhood_permanova_results.set(permanovaDf)
+
+            prog.set(97, "Saving neighborhood analysis output files...")
 
             # Save outputs
             if outDir is not None:
@@ -1462,7 +2086,13 @@ def server(input, output, session):
                 f"Touching analysis complete: {len(touchingEdges):,} touching edges across {nMasks} masks. "
                 f"Results saved to: {outDir if outDir is not None else 'no output folder'}"
             )
-            p.set(max(nMasks + 3, 1), message="Touching analysis complete.")
+            prog.set(
+                100,
+                f"Touching analysis complete: {len(touchingEdges):,} touching edges, "
+                f"{len(resultsDf):,} interaction rows. "
+                f"Results saved to: {outDir if outDir is not None else 'no output folder'}"
+            )
+
 
     @reactive.Effect
     def _sync_analysis_unit_col_choices():
@@ -1775,20 +2405,24 @@ def server(input, output, session):
                 axLeg.set_axis_off()
                 return fig
 
+            if maskNameCol not in sel.columns:
+                axImg.text(
+                    0.5,
+                    0.5,
+                    f"Selected mask table does not contain column '{maskNameCol}'",
+                    ha="center",
+                    va="center",
+                )
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+                return fig
+
             row = sel.iloc[0]
             maskName = str(row[maskNameCol])
             maskPath = row.get("MaskPath", None)
 
             if not maskPath or pd.isna(maskPath):
                 axImg.text(0.5, 0.5, "Selected mask has no valid file path", ha="center", va="center")
-                axImg.set_axis_off()
-                axLeg.set_axis_off()
-                return fig
-
-            try:
-                cellMask = read_mask_tiff(maskPath)
-            except Exception as e:
-                axImg.text(0.5, 0.5, f"Failed to read mask:\n{e}", ha="center", va="center")
                 axImg.set_axis_off()
                 axLeg.set_axis_off()
                 return fig
@@ -1806,30 +2440,27 @@ def server(input, output, session):
                 return fig
 
             try:
-                matchedData = match_mask_centroids_to_cells(
-                    cellMask=cellMask,
+                cachedMask = _get_cached_mask_plot_data(
+                    maskPath=str(maskPath),
+                    maskName=maskName,
                     matchingData=matchingData,
+                    clusterCol=clusterCol,
                     xCol=xCol,
                     yCol=yCol,
-                )
-            except Exception as e:
-                axImg.text(0.5, 0.5, f"Matching failed:\n{e}", ha="center", va="center")
-                axImg.set_axis_off()
-                axLeg.set_axis_off()
-                return fig
-
-            try:
-                plotData = make_mask_plot_data(
-                    cellMask=cellMask,
-                    matchedData=matchedData,
-                    clusterCol=clusterCol,
                     scaleFactor=scaleFactor,
-                    background="white",
-                    borderColor="white",
-                    missingColor="#808080",
                 )
+
+                plotData = cachedMask["plotData"]
+                matchedData = cachedMask["matchedData"]
+
             except Exception as e:
-                axImg.text(0.5, 0.5, f"Plot construction failed:\n{e}", ha="center", va="center")
+                axImg.text(
+                    0.5,
+                    0.5,
+                    f"Mask visualization failed:\n{e}",
+                    ha="center",
+                    va="center",
+                )
                 axImg.set_axis_off()
                 axLeg.set_axis_off()
                 return fig
@@ -2247,15 +2878,24 @@ def server(input, output, session):
             mask_match_df.set(pd.DataFrame())
             matched_masks_df.set(pd.DataFrame())
             missing_masks_df.set(pd.DataFrame())
+            final_mask_match_df.set(pd.DataFrame())
+            manual_mask_match_df.set(pd.DataFrame())
+            selected_mask_match.set(pd.DataFrame())
+            clear_mask_render_cache("mask matching cleared: no cell table")
             return
 
         mask_dir = (input.mask_path() or "").strip()
+
         if not mask_dir or not os.path.isdir(mask_dir):
             print("⚠️ Invalid mask folder.")
             mask_files_df.set(pd.DataFrame())
             mask_match_df.set(pd.DataFrame())
             matched_masks_df.set(pd.DataFrame())
             missing_masks_df.set(pd.DataFrame())
+            final_mask_match_df.set(pd.DataFrame())
+            manual_mask_match_df.set(pd.DataFrame())
+            selected_mask_match.set(pd.DataFrame())
+            clear_mask_render_cache("mask matching cleared: invalid mask folder")
             return
 
         cell_id_col = input.mask_cell_id_col()
@@ -2273,11 +2913,13 @@ def server(input, output, session):
             )
 
             files_df = list_mask_files(mask_dir)
+
             match_df = match_cellmask_names_to_files(
                 df_valid,
                 files_df,
                 mask_name_col=mask_name_col,
             )
+
             matched_df, missing_df = split_mask_matches(match_df)
 
         except Exception as e:
@@ -2286,6 +2928,10 @@ def server(input, output, session):
             mask_match_df.set(pd.DataFrame())
             matched_masks_df.set(pd.DataFrame())
             missing_masks_df.set(pd.DataFrame())
+            final_mask_match_df.set(pd.DataFrame())
+            manual_mask_match_df.set(pd.DataFrame())
+            selected_mask_match.set(pd.DataFrame())
+            clear_mask_render_cache("mask matching failed or cleared")
             return
 
         mask_input_df.set(df_valid)
@@ -2298,8 +2944,23 @@ def server(input, output, session):
         final_mask_match_df.set(final_df)
         manual_mask_match_df.set(pd.DataFrame())
 
-        selected_choices = list(final_df[mask_name_col].astype(str)) if not final_df.empty else []
+        clear_mask_render_cache("mask matching updated")
+
+        selected_choices = (
+            list(final_df[mask_name_col].astype(str))
+            if not final_df.empty
+            else []
+        )
         selected_default = selected_choices[0] if selected_choices else None
+
+        if selected_default is not None:
+            selected_mask_match.set(
+                final_df.loc[
+                    final_df[mask_name_col].astype(str) == str(selected_default)
+                ].copy()
+            )
+        else:
+            selected_mask_match.set(pd.DataFrame())
 
         ui.update_select(
             "selected_mask_name",
@@ -2415,6 +3076,7 @@ def server(input, output, session):
 
         print(f"✅ Exported {nMasks:,} matched mask visualizations to {outDir}")
 
+
     @reactive.Effect
     @reactive.event(input.browse_mask_csv)
     def _browse_mask_csv():
@@ -2423,31 +3085,56 @@ def server(input, output, session):
             return
         session.send_input_message("mask_csv_path", {"value": csv_path})
 
+
     @reactive.Effect
     @reactive.event(input.load_mask_csv)
     def _load_mask_csv():
         csv_path = (input.mask_csv_path() or "").strip()
 
+        def clear_mask_state(reason: str) -> None:
+            mask_input_df.set(pd.DataFrame())
+            mask_files_df.set(pd.DataFrame())
+            mask_match_df.set(pd.DataFrame())
+            matched_masks_df.set(pd.DataFrame())
+            missing_masks_df.set(pd.DataFrame())
+            final_mask_match_df.set(pd.DataFrame())
+            manual_mask_match_df.set(pd.DataFrame())
+            selected_mask_match.set(pd.DataFrame())
+            clear_mask_render_cache(reason)
+
         if not csv_path or not os.path.isfile(csv_path):
             print("⚠️ Invalid mask CSV path.")
-            mask_input_df.set(pd.DataFrame())
+            clear_mask_state("invalid mask CSV path")
             return
 
         try:
             df_mask = pd.read_csv(csv_path, index_col=0)
         except Exception as e:
             print(f"❌ Failed to read mask CSV: {e}")
-            mask_input_df.set(pd.DataFrame())
+            clear_mask_state("failed to read mask CSV")
             return
 
         if df_mask.empty:
             print("⚠️ Mask CSV is empty.")
-            mask_input_df.set(pd.DataFrame())
+            clear_mask_state("empty mask CSV")
             return
 
         mask_input_df.set(df_mask)
+
+        # New source cell table means all previous mask renders are stale.
+        mask_files_df.set(pd.DataFrame())
+        mask_match_df.set(pd.DataFrame())
+        matched_masks_df.set(pd.DataFrame())
+        missing_masks_df.set(pd.DataFrame())
+        final_mask_match_df.set(pd.DataFrame())
+        manual_mask_match_df.set(pd.DataFrame())
+        selected_mask_match.set(pd.DataFrame())
+
+        clear_mask_render_cache("new mask cell table loaded")
         _sync_mask_column_choices(df_mask)
+
         print(f"✅ Loaded mask cell table → {csv_path}")
+
 
     ##Push data from mask to neigborhood
     @reactive.Effect
@@ -2670,17 +3357,29 @@ def server(input, output, session):
 
         if not manual_df.empty:
             matched_names = set(manual_df[mask_name_col].astype(str))
-            auto_df = auto_df.loc[~auto_df[mask_name_col].astype(str).isin(matched_names)].copy()
+            auto_df = auto_df.loc[
+                ~auto_df[mask_name_col].astype(str).isin(matched_names)
+            ].copy()
 
             final_df = pd.concat([auto_df, manual_df], ignore_index=True)
         else:
             final_df = auto_df
 
         final_mask_match_df.set(final_df)
+        clear_mask_render_cache("manual mask matching updated")
 
         selected_choices = list(final_df.loc[final_df["MaskExists"], mask_name_col].astype(str)) if not final_df.empty else []
         current_selected = input.selected_mask_name()
         selected_default = current_selected if current_selected in selected_choices else (selected_choices[0] if selected_choices else None)
+
+        if selected_default is not None:
+            selected_mask_match.set(
+                final_df.loc[
+                    final_df[mask_name_col].astype(str) == str(selected_default)
+                ].copy()
+            )
+        else:
+            selected_mask_match.set(pd.DataFrame())
 
         ui.update_select(
             "selected_mask_name",
@@ -2693,7 +3392,7 @@ def server(input, output, session):
         print(f"✅ Applied {nManual} manual mask match(es).")
 
 
-##Helper to push the data to the neigborhood analysis tab
+    ##Helper to push the data to the neigborhood analysis tab
     def _build_neighborhood_input_object():
         matchDf = final_mask_match_df.get()
         inputDf = mask_input_df.get()

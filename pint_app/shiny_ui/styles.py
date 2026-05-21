@@ -95,6 +95,20 @@ def app_styles():
             .creator-slot-row input {
                 min-height: 32px;
             }
+                      
+            .viewer-main .card {
+                height: 100%;
+            }
+
+            .viewer-main .tab-content {
+                height: 100%;
+                min-height: 0;
+            }
+
+            .viewer-main .tab-pane {
+                height: 100%;
+                min-height: 0;
+            }
 
             /* Sidebar & parameter table */
             .sidebar-col {
@@ -145,6 +159,71 @@ def app_styles():
                 background-color: #f8f9fa;
                 border-color: #dee2e6 #dee2e6 #fff;
             }
+                      
+            .seg-preview-card {
+                flex: 1 1 auto;
+                min-height: 0;
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            .seg-preview-card .card-body {
+                flex: 1 1 auto;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            .seg-preview-card .tab-content {
+                flex: 1 1 auto;
+                min-height: 0;
+                height: 100%;
+                overflow: hidden;
+            }
+
+            .seg-preview-card .tab-pane {
+                height: 100%;
+                min-height: 0;
+                overflow: hidden;
+            }
+
+            .seg-preview-fill {
+                height: 100%;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+
+            .seg-preview-fill .shiny-plot-output {
+                flex: 1 1 auto;
+                height: 100% !important;
+                min-height: 0;
+            }
+
+            .seg-boundary-select-wrap select {
+                min-height: 220px !important;
+                height: 220px !important;
+                max-height: 260px !important;
+                overflow-y: auto !important;
+            }
+
+            .seg-boundary-select-wrap .selectize-control {
+                margin-bottom: 0.4rem !important;
+            }
+
+            .seg-boundary-select-wrap .selectize-input {
+                min-height: 220px !important;
+                max-height: 260px !important;
+                overflow-y: auto !important;
+                align-content: flex-start;
+            }
+                      
+
+                      
 
             .mask-section-title {
                 font-weight: 700;

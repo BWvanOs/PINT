@@ -56,6 +56,12 @@ def pint_panel():
                         class_="btn btn-primary text-white w-100",
                     ),
 
+                    ui.input_action_button(
+                        "push_to_segmentation",
+                        "Push loaded images to Segmentation tab",
+                        class_="btn btn-warning text-dark w-100 mt-2",
+                    ),
+
                     class_="mb-2",
                 ),
 

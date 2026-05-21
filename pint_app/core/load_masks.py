@@ -32,15 +32,22 @@ def validate_mask_input_table(
 
     return out
 
-def list_mask_files(mask_dir: str | Path, suffix: str = ".tiff") -> pd.DataFrame:
+def list_mask_files(mask_dir: str | Path) -> pd.DataFrame:
     """
     List mask files and derive a stem name used for matching.
+    Accepts .tif, .tiff, .TIF, and .TIFF.
     """
     mask_dir = Path(mask_dir)
+
     if not mask_dir.exists():
         raise ValueError(f"Mask directory does not exist: {mask_dir}")
 
-    files = sorted(mask_dir.glob(f"*{suffix}"))
+    allowed_suffixes = {".tif", ".tiff"}
+
+    files = sorted(
+        f for f in mask_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in allowed_suffixes
+    )
 
     if not files:
         return pd.DataFrame(columns=["MaskFile", "MaskPath", "CellMaskName"])
@@ -52,6 +59,7 @@ def list_mask_files(mask_dir: str | Path, suffix: str = ".tiff") -> pd.DataFrame
             "CellMaskName": [_strip_known_mask_suffix(f.stem) for f in files],
         }
     )
+
 
 def match_cellmask_names_to_files(
     df: pd.DataFrame,
@@ -90,6 +98,7 @@ def get_cells_for_mask_name(
     Return the subset of cell rows belonging to one mask.
     """
     return df.loc[df[mask_name_col].astype(str) == str(mask_name)].copy()
+
 
 def _strip_known_mask_suffix(name: str) -> str:
     return (

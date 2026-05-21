@@ -41,3 +41,6 @@ htmlcov/
 .pytype/
 .pyre/
 .ruff_cache/
+
+##Random stuff
+ZZZInternalInstructionsForGithub.txt
