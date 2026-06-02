@@ -316,149 +316,151 @@ def chance_correct_touching_interactions(
     n_perm: int = 1000,
     random_seed: Optional[int] = None,
     progress: Optional[ProgressFn] = None,
-    ) -> pd.DataFrame:
-        """
-        Full touching-based neighborhood summary with empirical p-values and FDR.
-        """
+) -> pd.DataFrame:
+    """
+    Full touching-based neighborhood summary with empirical p-values and FDR.
 
-        _emit(progress, "Summarizing observed touching interactions")
-        observedDf = summarize_touching_observed(edgeDf, sample_col=sample_col)
+    Important convention:
+    - edgeDf contains undirected physical cell-cell touching edges.
+    - expected_touching_stats_permutation() expands each edge into directed
+      cluster-pair counts: A -> B and B -> A.
+    - Therefore both observed and expected counts must come from the same
+      directed permutation framework.
+    """
 
+    outputCols = [
+        sample_col,
+        "cell_cluster",
+        "neighbor_cluster",
+        "observed",
+        "expected",
+        "n_cells",
+        "observed_per_cell",
+        "expected_per_cell",
+        "ChanceCorrectedInteraction",
+        "Direction",
+        "perm_sd",
+        "p_enriched",
+        "p_depleted",
+        "p_two_sided",
+        "p_adj_enriched",
+        "p_adj_depleted",
+        "p_adj_two_sided",
+    ]
+
+    if edgeDf is None or edgeDf.empty:
+        _emit(progress, "No touching edges found; stopping chance correction")
+        return pd.DataFrame(columns=outputCols)
+
+    if matchedDf is None or matchedDf.empty:
+        _emit(progress, "No matched cells found; stopping chance correction")
+        return pd.DataFrame(columns=outputCols)
+
+    _emit(progress, "Summarizing cluster frequencies")
+    clusterFreqDf = summarize_cluster_frequency(
+        matchedDf,
+        sample_col=sample_col,
+        cluster_col=cluster_col,
+    )
+
+    _emit(
+        progress,
+        f"Cluster frequency table contains {len(clusterFreqDf):,} sample-cluster rows"
+    )
+
+    if clusterFreqDf.empty:
+        _emit(progress, "No cluster frequencies found; stopping chance correction")
+        return pd.DataFrame(columns=outputCols)
+
+    _emit(
+        progress,
+        f"Computing directed permutation expectation on fixed touching graph "
+        f"({int(n_perm):,} permutations per sample)"
+    )
+
+    expectedStatsDf = expected_touching_stats_permutation(
+        edgeDf=edgeDf,
+        matchedDf=matchedDf,
+        sample_col=sample_col,
+        cluster_col=cluster_col,
+        mask_label_col=mask_label_col,
+        n_perm=n_perm,
+        random_seed=random_seed,
+        progress=progress,
+    )
+
+    if expectedStatsDf.empty:
+        _emit(progress, "Permutation expectation returned no rows")
+        return pd.DataFrame(columns=outputCols)
+
+    _emit(
+        progress,
+        f"Normalizing directed observed and expected counts for "
+        f"{len(expectedStatsDf):,} interaction rows"
+    )
+
+    out = expectedStatsDf.merge(
+        clusterFreqDf,
+        on=[sample_col, "cell_cluster"],
+        how="left",
+    )
+
+    out["n_cells"] = pd.to_numeric(out["n_cells"], errors="coerce")
+
+    badNCells = out["n_cells"].isna() | (out["n_cells"] <= 0)
+    if badNCells.any():
+        nBad = int(badNCells.sum())
         _emit(
             progress,
-            f"Observed touching summary contains {len(observedDf):,} interaction rows"
+            f"Dropping {nBad:,} interaction rows with missing or invalid source-cell counts"
         )
+        out = out.loc[~badNCells].copy()
 
-        _emit(progress, "Summarizing cluster frequencies")
-        clusterFreqDf = summarize_cluster_frequency(
-            matchedDf,
-            sample_col=sample_col,
-            cluster_col=cluster_col,
-        )
+    if out.empty:
+        _emit(progress, "No valid interaction rows after source-cell normalization")
+        return pd.DataFrame(columns=outputCols)
 
-        _emit(
-            progress,
-            f"Cluster frequency table contains {len(clusterFreqDf):,} sample-cluster rows"
-        )
+    _emit(progress, "Calculating chance-corrected interaction scores")
 
-        _emit(progress, "Normalizing observed touching interactions by cluster abundance")
-        normalizedObsDf = normalize_observed_interactions(
-            observedDf,
-            clusterFreqDf,
-            sample_col=sample_col,
-        )
+    out["observed_per_cell"] = out["observed"] / out["n_cells"]
+    out["expected_per_cell"] = out["expected"] / out["n_cells"]
 
-        if normalizedObsDf.empty:
-            _emit(progress, "No normalized touching interactions found; stopping chance correction")
+    out["ChanceCorrectedInteraction"] = (
+        out["observed_per_cell"] - out["expected_per_cell"]
+    )
 
-            return pd.DataFrame(columns=[
-                sample_col, "cell_cluster", "neighbor_cluster",
-                "n_interactions", "n_cells", "normalized",
-                "observed", "expected", "perm_sd",
-                "normalized_expected", "ChanceCorrectedInteraction",
-                "p_gt", "p_lt", "p_two_sided",
-                "p_adj_gt", "p_adj_lt", "p_adj_two_sided",
-                "Direction"
-            ])
+    out["Direction"] = np.where(
+        out["ChanceCorrectedInteraction"] > 0,
+        "Enriched",
+        np.where(
+            out["ChanceCorrectedInteraction"] < 0,
+            "Depleted",
+            "Neutral",
+        ),
+    )
 
-        _emit(
-            progress,
-            f"Computing permutation expectation on fixed touching graph "
-            f"({int(n_perm):,} permutations per sample)"
-        )
+    _emit(progress, "Adjusting empirical p-values using Benjamini-Hochberg FDR")
 
-        expectedStatsDf = expected_touching_stats_permutation(
-            edgeDf=edgeDf,
-            matchedDf=matchedDf,
-            sample_col=sample_col,
-            cluster_col=cluster_col,
-            mask_label_col=mask_label_col,
-            n_perm=n_perm,
-            random_seed=random_seed,
-            progress=progress,
-        )
+    out["p_adj_gt"] = _bh_adjust(out["p_gt"])
+    out["p_adj_lt"] = _bh_adjust(out["p_lt"])
+    out["p_adj_two_sided"] = _bh_adjust(out["p_two_sided"])
 
-        if expectedStatsDf.empty:
-            _emit(
-                progress,
-                "Permutation expectation returned no rows; expected values will be set to zero"
-            )
+    ## I keep renaming these so I now just made a renaming table :)
+    out = out.rename(columns={
+        "p_gt": "p_enriched",
+        "p_lt": "p_depleted",
+        "p_adj_gt": "p_adj_enriched",
+        "p_adj_lt": "p_adj_depleted",
+    })
 
-            expectedNormDf = pd.DataFrame(columns=[
-                sample_col, "cell_cluster", "neighbor_cluster",
-                "observed", "expected", "perm_sd",
-                "p_gt", "p_lt", "p_two_sided",
-                "n_cells", "normalized_expected"
-            ])
-        else:
-            _emit(
-                progress,
-                f"Normalizing permutation expectations for {len(expectedStatsDf):,} interaction rows"
-            )
+    out = out[outputCols].copy()
 
-            expectedNormDf = expectedStatsDf.merge(
-                clusterFreqDf,
-                on=[sample_col, "cell_cluster"],
-                how="left",
-            )
+    _emit(
+        progress,
+        f"Chance correction complete: {len(out):,} directed interaction rows"
+    )
 
-            expectedNormDf["normalized_expected"] = (
-                expectedNormDf["expected"] / expectedNormDf["n_cells"]
-            )
-
-        _emit(progress, "Merging observed and expected touching interactions")
-
-        out = normalizedObsDf.merge(
-            expectedNormDf[
-                [
-                    sample_col, "cell_cluster", "neighbor_cluster",
-                    "observed", "expected", "perm_sd",
-                    "normalized_expected",
-                    "p_gt", "p_lt", "p_two_sided",
-                ]
-            ],
-            on=[sample_col, "cell_cluster", "neighbor_cluster"],
-            how="left",
-        )
-
-        _emit(progress, "Calculating chance-corrected interaction scores")
-
-        out["observed"] = out["observed"].fillna(out["n_interactions"].astype(float))
-        out["expected"] = out["expected"].fillna(0.0)
-        out["perm_sd"] = out["perm_sd"].fillna(0.0)
-        out["normalized_expected"] = out["normalized_expected"].fillna(0.0)
-
-        out["p_gt"] = out["p_gt"].fillna(1.0)
-        out["p_lt"] = out["p_lt"].fillna(1.0)
-        out["p_two_sided"] = out["p_two_sided"].fillna(1.0)
-
-        out["ChanceCorrectedInteraction"] = (
-            out["normalized"] - out["normalized_expected"]
-        )
-
-        out["Direction"] = np.where(
-            out["ChanceCorrectedInteraction"] > 0,
-            "Enriched",
-            np.where(
-                out["ChanceCorrectedInteraction"] < 0,
-                "Depleted",
-                "Neutral",
-            ),
-        )
-
-        _emit(progress, "Adjusting empirical p-values using Benjamini-Hochberg FDR")
-
-        # adjust within each analysis run across all tested interaction rows
-        out["p_adj_gt"] = _bh_adjust(out["p_gt"])
-        out["p_adj_lt"] = _bh_adjust(out["p_lt"])
-        out["p_adj_two_sided"] = _bh_adjust(out["p_two_sided"])
-
-        _emit(
-            progress,
-            f"Chance correction complete: {len(out):,} interaction rows"
-        )
-
-        return out
+    return out
     
 
 def make_sample_interaction_matrix(

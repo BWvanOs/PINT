@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
 
 DEFAULT_MESMER_ENV_NAME = "pint-mesmer"
@@ -226,3 +228,169 @@ def install_mesmer_backend(env_name: str = DEFAULT_MESMER_ENV_NAME) -> MesmerSta
         )
 
     return status
+
+def check_mesmer_gpu(env_name: str = DEFAULT_MESMER_ENV_NAME) -> MesmerStatus:
+    """
+    Check whether TensorFlow inside the Mesmer env sees a GPU.
+    """
+    conda_exe = find_conda_executable()
+
+    if conda_exe is None:
+        return MesmerStatus(
+            ok=False,
+            status="Conda/mamba not found",
+            detail="Could not find 'conda' or 'mamba' on PATH.",
+            conda_executable=None,
+            env_name=env_name,
+        )
+
+    cmd = [
+        conda_exe,
+        "run",
+        "-n",
+        env_name,
+        "python",
+        "-c",
+        (
+            "import tensorflow as tf; "
+            "print(tf.__version__); "
+            "print(tf.config.list_physical_devices('GPU'))"
+        ),
+    ]
+
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+
+    ok = completed.returncode == 0 and "PhysicalDevice" in stdout and "GPU" in stdout
+
+    return MesmerStatus(
+        ok=ok,
+        status="GPU available" if ok else "GPU not detected",
+        detail=(
+            f"Command used:\n{' '.join(cmd)}\n\n"
+            f"stdout:\n{stdout or '—'}\n\n"
+            f"stderr:\n{stderr or '—'}"
+        ),
+        conda_executable=conda_exe,
+        env_name=env_name,
+    )
+
+def run_mesmer_backend(
+    nuclear_path: str | Path,
+    boundary_path: str | Path,
+    out_mask_path: str | Path,
+    out_json_path: str | Path,
+    image_mpp: float = 1.0,
+    compartment: str = "whole-cell",
+    env_name: str = DEFAULT_MESMER_ENV_NAME,
+) -> MesmerStatus:
+    """
+    Run Mesmer in the separate pint-mesmer environment.
+
+    The main PINT environment never imports deepcell.
+    """
+    conda_exe = find_conda_executable()
+
+    if conda_exe is None:
+        return MesmerStatus(
+            ok=False,
+            status="Conda/mamba not found",
+            detail="Could not find 'conda' or 'mamba' on PATH.",
+            conda_executable=None,
+            env_name=env_name,
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    runner_script = repo_root / "pint_app" / "core" / "run_mesmer_backend.py"
+
+    cmd = [
+        conda_exe,
+        "run",
+        "-n",
+        env_name,
+        "python",
+        str(runner_script),
+        "--nuclear",
+        str(nuclear_path),
+        "--boundary",
+        str(boundary_path),
+        "--out-mask",
+        str(out_mask_path),
+        "--out-json",
+        str(out_json_path),
+        "--image-mpp",
+        str(float(image_mpp)),
+        "--compartment",
+        str(compartment),
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return MesmerStatus(
+            ok=False,
+            status="Mesmer timed out",
+            detail=f"Command timed out:\n{' '.join(cmd)}",
+            conda_executable=conda_exe,
+            env_name=env_name,
+        )
+    except Exception as e:
+        return MesmerStatus(
+            ok=False,
+            status="Mesmer run failed",
+            detail=str(e),
+            conda_executable=conda_exe,
+            env_name=env_name,
+        )
+
+    stdout = completed.stdout.strip()
+    stderr = completed.stderr.strip()
+
+    if completed.returncode != 0:
+        return MesmerStatus(
+            ok=False,
+            status="Mesmer run failed",
+            detail=(
+                f"Command used:\n{' '.join(cmd)}\n\n"
+                f"stdout:\n{stdout or '—'}\n\n"
+                f"stderr:\n{stderr or '—'}"
+            ),
+            conda_executable=conda_exe,
+            env_name=env_name,
+        )
+
+    summary_text = ""
+    try:
+        summary_text = Path(out_json_path).read_text(encoding="utf-8")
+        summary = json.loads(summary_text)
+        n_labels = summary.get("n_labels", "unknown")
+        status_text = f"Mesmer completed: {n_labels} labels"
+    except Exception:
+        status_text = "Mesmer completed"
+
+    return MesmerStatus(
+        ok=True,
+        status=status_text,
+        detail=(
+            f"Command used:\n{' '.join(cmd)}\n\n"
+            f"Summary:\n{summary_text or '—'}\n\n"
+            f"stdout:\n{stdout or '—'}\n\n"
+            f"stderr:\n{stderr or '—'}"
+        ),
+        conda_executable=conda_exe,
+        env_name=env_name,
+    )

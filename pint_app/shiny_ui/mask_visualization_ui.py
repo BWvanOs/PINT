@@ -1,6 +1,5 @@
 from shiny import ui
 
-
 def mask_visualization_panel():
     return ui.nav_panel(
         "Mask visualization",

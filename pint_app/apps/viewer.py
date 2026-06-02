@@ -83,6 +83,8 @@ from pint_app.core.mesmer_backend import (
     check_mesmer_backend,
     get_mesmer_install_commands,
     install_mesmer_backend,
+    check_mesmer_gpu,
+    run_mesmer_backend,
 )
 
 ##Import of the UI modules
@@ -161,6 +163,10 @@ def server(input, output, session):
     data_loaded = reactive.Value(False)
     last_loaded_folder = reactive.Value("")  #This stores the last path used to load images so saving throws them into the same folder update here If you want this to cahnge
     
+    segmentation_mesmer_mask = reactive.Value(None)
+    segmentation_mesmer_result = reactive.Value(None)
+    segmentation_mesmer_mask_path = reactive.Value("")
+
     mask_input_df = reactive.Value(pd.DataFrame())
     mask_files_df = reactive.Value(pd.DataFrame())
     mask_match_df = reactive.Value(pd.DataFrame())
@@ -857,6 +863,75 @@ def server(input, output, session):
 
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
         return fig
+
+    def _safe_file_stem(name: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in str(name))
+
+
+    def _get_segmentation_output_dir() -> Path:
+        obj = segmentation_input_data.get()
+
+        folder = None
+        if obj is not None:
+            folder = obj.get("folder", None)
+
+        if folder and os.path.isdir(folder):
+            outDir = Path(folder) / "segmentation alpha"
+        else:
+            outDir = Path.cwd() / "segmentation alpha"
+
+        outDir.mkdir(parents=True, exist_ok=True)
+        return outDir
+
+
+    def _save_current_mesmer_inputs():
+        nuclearImg, boundaryImg, combinedRgb, errorMessage = _build_segmentation_preview_images()
+
+        if errorMessage:
+            raise ValueError(errorMessage)
+
+        if nuclearImg is None or boundaryImg is None:
+            raise ValueError("Could not build Mesmer input images.")
+
+        sampleName, nuclearChannel, boundaryChannels, mode = _get_selected_segmentation_channels()
+
+        if not sampleName:
+            raise ValueError("No segmentation sample selected.")
+
+        outDir = _get_segmentation_output_dir()
+        stem = _safe_file_stem(sampleName)
+
+        nuclearPath = outDir / f"{stem}_mesmer_nuclear_input.tiff"
+        boundaryPath = outDir / f"{stem}_mesmer_boundary_input.tiff"
+        inputStackPath = outDir / f"{stem}_mesmer_input_stack.tiff"
+        maskPath = outDir / f"{stem}_mesmer_mask_uint32.tiff"
+        jsonPath = outDir / f"{stem}_mesmer_summary.json"
+
+        nuclearU16 = np.clip(np.round(nuclearImg * 65535.0), 0, 65535).astype(np.uint16)
+        boundaryU16 = np.clip(np.round(boundaryImg * 65535.0), 0, 65535).astype(np.uint16)
+
+        # Save separate inputs for the external runner.
+        imwrite(nuclearPath, nuclearU16, dtype=np.uint16)
+        imwrite(boundaryPath, boundaryU16, dtype=np.uint16)
+
+        # Also save a 2-channel stack for debugging/provenance.
+        inputStack = np.stack([nuclearU16, boundaryU16], axis=0)
+        imwrite(inputStackPath, inputStack, dtype=np.uint16)
+
+        meta = {
+            "sample": sampleName,
+            "nuclear_channel": nuclearChannel,
+            "boundary_channels": boundaryChannels,
+            "preprocess_mode": mode,
+            "nuclear_input": str(nuclearPath),
+            "boundary_input": str(boundaryPath),
+            "input_stack": str(inputStackPath),
+            "mask_output": str(maskPath),
+            "summary_json": str(jsonPath),
+        }
+
+        return nuclearPath, boundaryPath, maskPath, jsonPath, meta
+
 
 
     def _build_mask_visualization_figure(
@@ -1730,6 +1805,21 @@ def server(input, output, session):
         else:
             print(f"❌ Mesmer backend installation failed or is unavailable: {status.status}")
 
+    @reactive.Effect
+    @reactive.event(input.check_mesmer_gpu)
+    def _check_mesmer_gpu():
+        envName = _get_mesmer_env_name()
+
+        print(f"🔎 Checking TensorFlow GPU in Mesmer environment: {envName}")
+
+        status = check_mesmer_gpu(env_name=envName)
+        mesmer_backend_status.set(status)
+        mesmer_backend_detail_text.set(status.detail)
+
+        if status.ok:
+            print(f"✅ TensorFlow GPU detected in '{envName}'.")
+        else:
+            print(f"⚠️ TensorFlow GPU not detected in '{envName}'. Mesmer will likely run on CPU.")
 
     @output
     @render.ui
@@ -1844,7 +1934,133 @@ def server(input, output, session):
                 errorMessage=f"Combined preview error:\n{e}",
             )
 
+    @reactive.Effect
+    @reactive.event(input.run_mesmer_current)
+    def _run_mesmer_current():
+        status = check_mesmer_backend(env_name=_get_mesmer_env_name())
 
+        if not status.ok:
+            segmentation_mesmer_result.set(status)
+            mesmer_backend_status.set(status)
+            mesmer_backend_detail_text.set(status.detail)
+            print("❌ Mesmer backend is not available. Check installation first.")
+            return
+
+        try:
+            nuclearPath, boundaryPath, maskPath, jsonPath, meta = _save_current_mesmer_inputs()
+        except Exception as e:
+            msg = f"Could not prepare Mesmer input: {e}"
+            segmentation_mesmer_mask.set(None)
+            segmentation_mesmer_result.set(None)
+            print(f"❌ {msg}")
+            mesmer_backend_detail_text.set(msg)
+            return
+
+        envName = _get_mesmer_env_name()
+        imageMpp = float(input.seg_image_mpp() or 1.0)
+        compartment = input.seg_mesmer_compartment() or "whole-cell"
+
+        print(f"▶️ Running Mesmer on current ROI: {meta['sample']}")
+        print(f"   Nuclear: {nuclearPath}")
+        print(f"   Boundary: {boundaryPath}")
+        print(f"   Output mask: {maskPath}")
+
+        with ui.Progress(min=0, max=3, session=session) as p:
+            p.set(0, message="Preparing Mesmer input...")
+            p.set(1, message="Running Mesmer in external environment...")
+
+            result = run_mesmer_backend(
+                nuclear_path=nuclearPath,
+                boundary_path=boundaryPath,
+                out_mask_path=maskPath,
+                out_json_path=jsonPath,
+                image_mpp=imageMpp,
+                compartment=compartment,
+                env_name=envName,
+            )
+
+            p.set(2, message="Reading Mesmer output...")
+
+            if result.ok and Path(maskPath).exists():
+                mask = imread(str(maskPath))
+                segmentation_mesmer_mask.set(mask)
+                segmentation_mesmer_mask_path.set(str(maskPath))
+            else:
+                segmentation_mesmer_mask.set(None)
+                segmentation_mesmer_mask_path.set("")
+
+            p.set(3, message="Mesmer run complete.")
+
+        segmentation_mesmer_result.set(result)
+        mesmer_backend_detail_text.set(result.detail)
+
+        if result.ok:
+            print(f"✅ {result.status}")
+        else:
+            print(f"❌ {result.status}")
+
+
+    @output
+    @render.ui
+    def segmentation_mesmer_result_summary():
+        result = segmentation_mesmer_result.get()
+        maskPath = segmentation_mesmer_mask_path.get()
+
+        if result is None:
+            return ui.tags.small("No Mesmer run yet.", class_="text-muted")
+
+        if not result.ok:
+            return ui.div(
+                ui.tags.div(f"Mesmer status: {result.status}", class_="seg-status-bad"),
+                ui.tags.small("See backend details for the full error.", class_="text-muted"),
+            )
+
+        mask = segmentation_mesmer_mask.get()
+        nLabels = int(np.nanmax(mask)) if mask is not None and np.size(mask) > 0 else 0
+
+        return ui.div(
+            ui.tags.div(f"Mesmer status: {result.status}", class_="seg-status-ok"),
+            ui.tags.div(f"Detected labels: {nLabels:,}"),
+            ui.tags.div(f"Mask: {maskPath or '—'}"),
+        )
+
+    @output
+    @render.plot
+    def segmentation_mesmer_mask_preview():
+        try:
+            mask = segmentation_mesmer_mask.get()
+
+            if mask is None:
+                return _make_single_image_preview_figure(
+                    None,
+                    title="Mesmer mask",
+                    errorMessage="No Mesmer mask available yet.\nRun Mesmer on the current ROI first.",
+                )
+
+            mask = np.asarray(mask)
+            display = mask.astype(np.float32)
+
+            if display.max() > 0:
+                display = display / display.max()
+
+            return _make_single_image_preview_figure(
+                display,
+                title=f"Mesmer mask | labels: {int(mask.max()):,}",
+                cmap="nipy_spectral",
+                errorMessage=None,
+            )
+
+        except SilentException:
+            raise
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return _make_single_image_preview_figure(
+                None,
+                title="Mesmer mask",
+                errorMessage=f"Mesmer mask preview error:\n{e}",
+            )
 
     @reactive.Effect
     @reactive.event(input.export_all_mask_visualizations)

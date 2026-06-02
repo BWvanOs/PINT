@@ -15,6 +15,13 @@ open issues
     -Started with manual (readme.md) on how to use it
 0.6.0.2
     -Changed winsorization upper quantile behavious (0.001 steps, min 0.9)
+0.6.1
+    -Refactored the UI into seperate modules
+    -Cleaned up some broken references
+    -Added a new panel to integrate MESMER (NOT FUNCTIONAL YET)
+0.6.2
+    -Further refactored the interface and connected the PINT tab to the MESMER back-end.
+    -Fixed a bug in the neighborhood progression bar
 
 
 

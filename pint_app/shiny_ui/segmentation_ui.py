@@ -54,6 +54,12 @@ def segmentation_panel():
                     ),
 
                     ui.input_action_button(
+                        "check_mesmer_gpu",
+                        "Check TensorFlow GPU",
+                        class_="btn btn-secondary w-100 mb-2",
+                    ),
+
+                    ui.input_action_button(
                         "install_mesmer_backend",
                         "Install Mesmer backend",
                         class_="btn btn-warning w-100 mt-2",
@@ -124,6 +130,37 @@ def segmentation_panel():
                         class_="text-muted",
                     ),
 
+                    ui.hr(),
+
+                    ui.input_numeric(
+                        "seg_image_mpp",
+                        "Image resolution / mpp",
+                        value=1.0,
+                        min=0.1,
+                        max=5.0,
+                        step=0.1,
+                        width="100%",
+                    ),
+
+                    ui.input_select(
+                        "seg_mesmer_compartment",
+                        "Mesmer compartment",
+                        choices={
+                            "whole-cell": "Whole-cell",
+                            "nuclear": "Nuclear",
+                        },
+                        selected="whole-cell",
+                        width="100%",
+                    ),
+
+                    ui.input_action_button(
+                        "run_mesmer_current",
+                        "Run Mesmer on current ROI",
+                        class_="btn btn-primary w-100 mt-2",
+                    ),
+
+                    ui.output_ui("segmentation_mesmer_result_summary"),
+
                     class_="mb-2",
                 ),
 
@@ -186,6 +223,15 @@ def segmentation_panel():
                                 class_="seg-preview-fill",
                             ),
                         ),
+
+                        ui.nav_panel(
+                            "Mesmer mask",
+                            ui.tags.div(
+                                ui.output_plot("segmentation_mesmer_mask_preview", fill=True, height="100%"),
+                                class_="seg-preview-fill",
+                            ),
+                        ),
+
                         id="segmentation_preview_mode",
                     ),
                     class_="seg-preview-card",

@@ -203,7 +203,11 @@ def app_styles():
                 height: 100% !important;
                 min-height: 0;
             }
-
+                      
+            /* Boundary channel multi-select in the Segmentation tab.
+               Shiny may render this as a plain <select multiple>, so target both
+               the raw select and possible selectize wrappers. */
+                      
             .seg-boundary-select-wrap select {
                 min-height: 220px !important;
                 height: 220px !important;
@@ -223,7 +227,7 @@ def app_styles():
             }
                       
 
-                      
+
 
             .mask-section-title {
                 font-weight: 700;
