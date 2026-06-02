@@ -2827,13 +2827,22 @@ def server(input, output, session):
         df = neighborhood_touching_results.get()
 
         expectedCols = [
-            "cell_cluster", "neighbor_cluster",
-            "n_interactions", "n_cells",
-            "normalized", "normalized_expected", "ChanceCorrectedInteraction",
-            "observed", "expected", "perm_sd",
-            "p_gt", "p_lt", "p_two_sided",
-            "p_adj_gt", "p_adj_lt", "p_adj_two_sided",
+            "cell_cluster",
+            "neighbor_cluster",
+            "observed",
+            "expected",
+            "n_cells",
+            "observed_per_cell",
+            "expected_per_cell",
+            "ChanceCorrectedInteraction",
             "Direction",
+            "perm_sd",
+            "p_enriched",
+            "p_depleted",
+            "p_two_sided",
+            "p_adj_enriched",
+            "p_adj_depleted",
+            "p_adj_two_sided",
         ]
 
         if df is None or df.empty:
@@ -2842,19 +2851,20 @@ def server(input, output, session):
 
         show = df.copy()
 
-        ## add missing columns if upstream result does not have them yet
+        # Add missing expected columns only for forward/backward compatibility.
+        # Do not include removed legacy columns here.
         for col in expectedCols:
             if col not in show.columns:
                 show[col] = np.nan
 
-        ## order columns nicely, then keep any extras at the end
+        # Order columns nicely, then keep any extras at the end.
         extraCols = [c for c in show.columns if c not in expectedCols]
         show = show[expectedCols + extraCols]
 
-        ## only show first 200 rows
+        # Only show first 200 rows.
         show = show.head(200).copy()
 
-        ## round numeric columns
+        # Round numeric columns.
         numCols = show.select_dtypes(include=["number"]).columns
         show[numCols] = show[numCols].round(3)
 

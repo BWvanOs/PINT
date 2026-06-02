@@ -22,7 +22,8 @@ open issues
 0.6.2
     -Further refactored the interface and connected the PINT tab to the MESMER back-end.
     -Fixed a bug in the neighborhood progression bar
-
+0.6.3
+    -Fixed a bug where the touching cell analysis would run as bidirectional but only summarize the interaction onesided. 
 
 
 

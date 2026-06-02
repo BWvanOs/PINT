@@ -40,30 +40,6 @@ def _bh_adjust(pvals: pd.Series) -> pd.Series:
 
     return pd.Series(out, index=pvals.index)
 
-
-def summarize_touching_observed(
-    edgeDf: pd.DataFrame,
-    *,
-    sample_col: str,
-    cluster_col_left: str = "cell_cluster",
-    cluster_col_right: str = "neighbor_cluster",
-) -> pd.DataFrame:
-    if edgeDf is None or edgeDf.empty:
-        return pd.DataFrame(columns=[sample_col, "cell_cluster", "neighbor_cluster", "n_interactions"])
-
-    out = (
-        edgeDf
-        .groupby([sample_col, cluster_col_left, cluster_col_right], sort=False)
-        .size()
-        .reset_index(name="n_interactions")
-        .rename(columns={
-            cluster_col_left: "cell_cluster",
-            cluster_col_right: "neighbor_cluster",
-        })
-    )
-    return out
-
-
 def summarize_cluster_frequency(
     matchedDf: pd.DataFrame,
     *,
@@ -81,28 +57,6 @@ def summarize_cluster_frequency(
         .rename(columns={cluster_col: "cell_cluster"})
     )
     return out
-
-
-def normalize_observed_interactions(
-    observedDf: pd.DataFrame,
-    clusterFreqDf: pd.DataFrame,
-    *,
-    sample_col: str,
-) -> pd.DataFrame:
-    if observedDf is None or observedDf.empty:
-        return pd.DataFrame(columns=[
-            sample_col, "cell_cluster", "neighbor_cluster",
-            "n_interactions", "n_cells", "normalized"
-        ])
-
-    out = observedDf.merge(
-        clusterFreqDf,
-        on=[sample_col, "cell_cluster"],
-        how="left",
-    )
-    out["normalized"] = out["n_interactions"] / out["n_cells"]
-    return out
-
 
 def expected_touching_stats_permutation(
     edgeDf: pd.DataFrame,

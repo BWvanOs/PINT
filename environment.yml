@@ -11,6 +11,7 @@ dependencies:
   - tifffile>=2024.5.22
   - openpyxl>=3.1
   - jinja2>=3.1
+  - pytest
   - pip
   - pip:
       - -e .
