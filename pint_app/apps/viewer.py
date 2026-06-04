@@ -87,6 +87,8 @@ from pint_app.core.mesmer_backend import (
     run_mesmer_backend,
 )
 
+from pint_app.core.segmentation_quantification import quantify_mesmer_masks_for_dataset
+
 ##Import of the UI modules
 ##CSS UI module
 from pint_app.shiny_ui.styles import app_styles
@@ -166,6 +168,12 @@ def server(input, output, session):
     segmentation_mesmer_mask = reactive.Value(None)
     segmentation_mesmer_result = reactive.Value(None)
     segmentation_mesmer_mask_path = reactive.Value("")
+    segmentation_mesmer_batch_results = reactive.Value(pd.DataFrame())
+    segmentation_cell_table = reactive.Value(pd.DataFrame())
+    segmentation_mask_table = reactive.Value(pd.DataFrame())
+    segmentation_cell_table_path = reactive.Value("")
+    segmentation_mask_table_path = reactive.Value("")
+    segmentation_quantification_status = reactive.Value("No Mesmer mask quantification run yet.")
 
     mask_input_df = reactive.Value(pd.DataFrame())
     mask_files_df = reactive.Value(pd.DataFrame())
@@ -885,18 +893,52 @@ def server(input, output, session):
 
 
     def _save_current_mesmer_inputs():
-        nuclearImg, boundaryImg, combinedRgb, errorMessage = _build_segmentation_preview_images()
+        sampleName = input.seg_sample()
+        return _save_mesmer_inputs_for_sample(sampleName)
 
-        if errorMessage:
-            raise ValueError(errorMessage)
+    def _save_mesmer_inputs_for_sample(sampleName: str):
+        nuclearChannel = input.seg_nuclear_channel()
+        boundaryChannels = input.seg_boundary_channels()
+        mode = input.seg_preprocess_mode() or "soft"
 
-        if nuclearImg is None or boundaryImg is None:
-            raise ValueError("Could not build Mesmer input images.")
-
-        sampleName, nuclearChannel, boundaryChannels, mode = _get_selected_segmentation_channels()
+        if isinstance(boundaryChannels, str):
+            boundaryChannels = [boundaryChannels]
+        elif boundaryChannels is None:
+            boundaryChannels = []
+        else:
+            boundaryChannels = list(boundaryChannels)
 
         if not sampleName:
-            raise ValueError("No segmentation sample selected.")
+            raise ValueError("No sample selected.")
+
+        if not nuclearChannel:
+            raise ValueError("No nuclear channel selected.")
+
+        nuclearImg = _process_channel_for_segmentation(
+            sampleName=sampleName,
+            channelName=nuclearChannel,
+            mode=mode,
+        )
+
+        if nuclearImg is None:
+            raise ValueError(f"Could not build nuclear input for {sampleName}.")
+
+        boundaryImgs = []
+
+        for ch in boundaryChannels:
+            img = _process_channel_for_segmentation(
+                sampleName=sampleName,
+                channelName=ch,
+                mode=mode,
+            )
+            if img is not None:
+                boundaryImgs.append(img)
+
+        if boundaryImgs:
+            boundaryStack = np.stack(boundaryImgs, axis=0)
+            boundaryImg = np.nanmax(boundaryStack, axis=0).astype(np.float32)
+        else:
+            boundaryImg = np.zeros_like(nuclearImg, dtype=np.float32)
 
         outDir = _get_segmentation_output_dir()
         stem = _safe_file_stem(sampleName)
@@ -910,27 +952,26 @@ def server(input, output, session):
         nuclearU16 = np.clip(np.round(nuclearImg * 65535.0), 0, 65535).astype(np.uint16)
         boundaryU16 = np.clip(np.round(boundaryImg * 65535.0), 0, 65535).astype(np.uint16)
 
-        # Save separate inputs for the external runner.
         imwrite(nuclearPath, nuclearU16, dtype=np.uint16)
         imwrite(boundaryPath, boundaryU16, dtype=np.uint16)
 
-        # Also save a 2-channel stack for debugging/provenance.
         inputStack = np.stack([nuclearU16, boundaryU16], axis=0)
         imwrite(inputStackPath, inputStack, dtype=np.uint16)
 
         meta = {
-            "sample": sampleName,
-            "nuclear_channel": nuclearChannel,
-            "boundary_channels": boundaryChannels,
-            "preprocess_mode": mode,
-            "nuclear_input": str(nuclearPath),
-            "boundary_input": str(boundaryPath),
-            "input_stack": str(inputStackPath),
-            "mask_output": str(maskPath),
-            "summary_json": str(jsonPath),
+            "SampleName": sampleName,
+            "NuclearChannel": nuclearChannel,
+            "BoundaryChannels": ";".join(boundaryChannels),
+            "PreprocessMode": mode,
+            "NuclearInput": str(nuclearPath),
+            "BoundaryInput": str(boundaryPath),
+            "InputStack": str(inputStackPath),
+            "MaskOutput": str(maskPath),
+            "SummaryJson": str(jsonPath),
         }
 
-        return nuclearPath, boundaryPath, maskPath, jsonPath, meta
+        return nuclearPath, boundaryPath, maskPath, jsonPath, meta    
+
 
 
 
@@ -1846,6 +1887,130 @@ def server(input, output, session):
             ui.tags.div(f"Folder: {folder}"),
         )
 
+    @reactive.Effect
+    @reactive.event(input.run_mesmer_all)
+    def _run_mesmer_all():
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            print("⚠️ No images pushed to Segmentation.")
+            return
+
+        imgs = obj.get("images", {})
+        if not imgs:
+            print("⚠️ No pushed images available for Mesmer batch run.")
+            return
+
+        envName = _get_mesmer_env_name()
+
+        status = check_mesmer_backend(env_name=envName)
+        if not status.ok:
+            segmentation_mesmer_result.set(status)
+            mesmer_backend_status.set(status)
+            mesmer_backend_detail_text.set(status.detail)
+            print("❌ Mesmer backend is not available. Check installation first.")
+            return
+
+        deepcellToken = (input.deepcell_access_token() or "").strip()
+        if not deepcellToken:
+            print("⚠️ No DeepCell access token entered. Mesmer may fail if model files are not already cached.")
+
+        imageMpp = float(input.seg_image_mpp() or 1.0)
+        compartment = input.seg_mesmer_compartment() or "whole-cell"
+
+        sampleNames = list(imgs.keys())
+        outRows = []
+
+        outDir = _get_segmentation_output_dir()
+        batchSummaryPath = outDir / "mesmer_batch_summary.csv"
+
+        print(f"▶️ Running Mesmer batch on {len(sampleNames):,} ROI(s).")
+        print(f"   Output folder: {outDir}")
+
+        with ui.Progress(min=0, max=len(sampleNames), session=session) as p:
+            for i, sampleName in enumerate(sampleNames, start=1):
+                p.set(i - 1, message=f"Preparing {sampleName} ({i}/{len(sampleNames)})")
+
+                row = {
+                    "SampleName": sampleName,
+                    "Status": "Not started",
+                    "Ok": False,
+                    "MaskPath": "",
+                    "NLabels": np.nan,
+                    "Error": "",
+                }
+
+                try:
+                    nuclearPath, boundaryPath, maskPath, jsonPath, meta = _save_mesmer_inputs_for_sample(sampleName)
+
+                    row.update(meta)
+                    row["Status"] = "Running"
+
+                    p.set(i - 1, message=f"Running Mesmer: {sampleName} ({i}/{len(sampleNames)})")
+
+                    result = run_mesmer_backend(
+                        nuclear_path=nuclearPath,
+                        boundary_path=boundaryPath,
+                        out_mask_path=maskPath,
+                        out_json_path=jsonPath,
+                        image_mpp=imageMpp,
+                        compartment=compartment,
+                        env_name=envName,
+                        deepcell_access_token=deepcellToken if deepcellToken else None,
+                    )
+
+                    row["Status"] = result.status
+                    row["Ok"] = bool(result.ok)
+                    row["MaskPath"] = str(maskPath) if Path(maskPath).exists() else ""
+                    row["Error"] = "" if result.ok else result.detail
+
+                    if result.ok and Path(maskPath).exists():
+                        try:
+                            mask = imread(str(maskPath))
+                            row["NLabels"] = int(np.nanmax(mask)) if mask.size > 0 else 0
+
+                            # Keep last successful mask in preview.
+                            segmentation_mesmer_mask.set(mask)
+                            segmentation_mesmer_mask_path.set(str(maskPath))
+                            segmentation_mesmer_result.set(result)
+
+                        except Exception as e:
+                            row["Ok"] = False
+                            row["Status"] = "Mask read failed"
+                            row["Error"] = str(e)
+
+                    mesmer_backend_detail_text.set(result.detail)
+
+                    if result.ok:
+                        print(f"✅ {sampleName}: {result.status}")
+                    else:
+                        print(f"❌ {sampleName}: {result.status}")
+
+                except Exception as e:
+                    row["Status"] = "Failed before Mesmer"
+                    row["Error"] = str(e)
+                    print(f"❌ {sampleName}: {e}")
+
+                outRows.append(row)
+
+                # Write partial results after every ROI.
+                try:
+                    pd.DataFrame(outRows).to_csv(batchSummaryPath, index=False)
+                except Exception as e:
+                    print(f"⚠️ Could not write batch summary: {e}")
+
+                p.set(i, message=f"Finished {sampleName} ({i}/{len(sampleNames)})")
+
+        batchDf = pd.DataFrame(outRows)
+        segmentation_mesmer_batch_results.set(batchDf)
+
+        nOk = int(batchDf["Ok"].sum()) if "Ok" in batchDf.columns and not batchDf.empty else 0
+
+        print(
+            f"✅ Mesmer batch finished: {nOk}/{len(sampleNames)} ROI(s) completed. "
+            f"Summary saved to: {batchSummaryPath}"
+        )    
+
 
     @output
     @render.plot
@@ -1956,11 +2121,17 @@ def server(input, output, session):
             mesmer_backend_detail_text.set(msg)
             return
 
+        sampleName = meta.get("SampleName", input.seg_sample() or "unknown")
+
         envName = _get_mesmer_env_name()
         imageMpp = float(input.seg_image_mpp() or 1.0)
         compartment = input.seg_mesmer_compartment() or "whole-cell"
+        deepcellToken = (input.deepcell_access_token() or "").strip()
 
-        print(f"▶️ Running Mesmer on current ROI: {meta['sample']}")
+        if not deepcellToken:
+            print("ℹ️ No DeepCell access token entered. This is fine if Mesmer model files are already cached.")
+
+        print(f"▶️ Running Mesmer on current ROI: {sampleName}")
         print(f"   Nuclear: {nuclearPath}")
         print(f"   Boundary: {boundaryPath}")
         print(f"   Output mask: {maskPath}")
@@ -1968,6 +2139,8 @@ def server(input, output, session):
         with ui.Progress(min=0, max=3, session=session) as p:
             p.set(0, message="Preparing Mesmer input...")
             p.set(1, message="Running Mesmer in external environment...")
+
+            deepcellToken = (input.deepcell_access_token() or "").strip()
 
             result = run_mesmer_backend(
                 nuclear_path=nuclearPath,
@@ -1977,6 +2150,7 @@ def server(input, output, session):
                 image_mpp=imageMpp,
                 compartment=compartment,
                 env_name=envName,
+                deepcell_access_token=deepcellToken if deepcellToken else None,
             )
 
             p.set(2, message="Reading Mesmer output...")
@@ -2005,24 +2179,212 @@ def server(input, output, session):
     def segmentation_mesmer_result_summary():
         result = segmentation_mesmer_result.get()
         maskPath = segmentation_mesmer_mask_path.get()
+        batchDf = segmentation_mesmer_batch_results.get()
+
+        parts = []
 
         if result is None:
-            return ui.tags.small("No Mesmer run yet.", class_="text-muted")
+            parts.append(ui.tags.small("No single-ROI Mesmer run yet.", class_="text-muted"))
+        elif not result.ok:
+            parts.append(
+                ui.div(
+                    ui.tags.div(f"Last Mesmer status: {result.status}", class_="seg-status-bad"),
+                    ui.tags.small("See backend details for the full error.", class_="text-muted"),
+                )
+            )
+        else:
+            mask = segmentation_mesmer_mask.get()
+            nLabels = int(np.nanmax(mask)) if mask is not None and np.size(mask) > 0 else 0
 
-        if not result.ok:
-            return ui.div(
-                ui.tags.div(f"Mesmer status: {result.status}", class_="seg-status-bad"),
-                ui.tags.small("See backend details for the full error.", class_="text-muted"),
+            parts.append(
+                ui.div(
+                    ui.tags.div(f"Last Mesmer status: {result.status}", class_="seg-status-ok"),
+                    ui.tags.div(f"Detected labels: {nLabels:,}"),
+                    ui.tags.div(f"Mask: {maskPath or '—'}"),
+                )
             )
 
-        mask = segmentation_mesmer_mask.get()
-        nLabels = int(np.nanmax(mask)) if mask is not None and np.size(mask) > 0 else 0
+        if batchDf is not None and not batchDf.empty:
+            nTotal = len(batchDf)
+            nOk = int(batchDf["Ok"].sum()) if "Ok" in batchDf.columns else 0
 
-        return ui.div(
-            ui.tags.div(f"Mesmer status: {result.status}", class_="seg-status-ok"),
-            ui.tags.div(f"Detected labels: {nLabels:,}"),
-            ui.tags.div(f"Mask: {maskPath or '—'}"),
+            parts.append(ui.hr())
+            parts.append(
+                ui.div(
+                    ui.tags.div("Batch run summary", class_="mask-section-title"),
+                    ui.tags.div(f"Completed: {nOk}/{nTotal} ROI(s)"),
+                )
+            )
+
+        return ui.div(*parts)
+
+
+    @output
+    @render.ui
+    def segmentation_quantification_summary():
+        status = segmentation_quantification_status.get()
+        cellDf = segmentation_cell_table.get()
+        maskDf = segmentation_mask_table.get()
+        cellPath = segmentation_cell_table_path.get()
+
+        parts = [
+            ui.tags.div(status, class_="compact-small-line"),
+        ]
+
+        if maskDf is not None and not maskDf.empty:
+            nMasks = int(maskDf["MaskExists"].sum()) if "MaskExists" in maskDf.columns else 0
+            nOk = int((maskDf["Status"] == "OK").sum()) if "Status" in maskDf.columns else nMasks
+
+            parts.append(ui.tags.div(f"Masks found: {nMasks:,}", class_="compact-small-line"))
+            parts.append(ui.tags.div(f"Masks quantified: {nOk:,}", class_="compact-small-line"))
+
+        if cellDf is not None and not cellDf.empty:
+            parts.append(ui.tags.div(f"Cells quantified: {len(cellDf):,}", class_="compact-small-line"))
+            parts.append(ui.tags.div(f"Columns: {len(cellDf.columns):,}", class_="compact-small-line"))
+
+        if cellPath:
+            parts.append(ui.tags.div(f"Cell table: {cellPath}", class_="compact-small-line"))
+
+        return ui.div(*parts)
+
+
+    @reactive.Effect
+    @reactive.event(input.push_mesmer_to_mask_visualization)
+    def _push_mesmer_to_mask_visualization():
+        cellDf = segmentation_cell_table.get()
+        maskDf = segmentation_mask_table.get()
+
+        if cellDf is None or cellDf.empty:
+            print("⚠️ No Mesmer cell table available. Run quantification first.")
+            return
+
+        if maskDf is None or maskDf.empty:
+            print("⚠️ No Mesmer mask table available. Run quantification first.")
+            return
+
+        if "MaskExists" in maskDf.columns:
+            validMasks = maskDf.loc[maskDf["MaskExists"]].copy()
+        else:
+            validMasks = maskDf.copy()
+
+        if validMasks.empty:
+            print("⚠️ No valid Mesmer masks available to push.")
+            return
+
+        outDir = _get_segmentation_output_dir()
+        cellPath = segmentation_cell_table_path.get()
+
+        # Push generated cell table into the existing Mask visualization state.
+        mask_input_df.set(cellDf.copy())
+
+        session.send_input_message("mask_csv_path", {"value": cellPath or ""})
+        session.send_input_message("mask_path", {"value": str(outDir)})
+
+        _sync_mask_column_choices(cellDf)
+
+        colNames = list(cellDf.columns)
+
+        ui.update_select(
+            "mask_cell_id_col",
+            choices=colNames,
+            selected="ObjectNumber",
+            session=session,
         )
+
+        ui.update_select(
+            "mask_x_col",
+            choices=colNames,
+            selected="Location_Center_X",
+            session=session,
+        )
+
+        ui.update_select(
+            "mask_y_col",
+            choices=colNames,
+            selected="Location_Center_Y",
+            session=session,
+        )
+
+        ui.update_select(
+            "mask_name_col",
+            choices=colNames,
+            selected="CellMaskName",
+            session=session,
+        )
+
+        ui.update_select(
+            "mask_cluster_col",
+            choices=colNames,
+            selected="Cluster" if "Cluster" in colNames else "ObjectNumber",
+            session=session,
+        )
+
+        ui.update_select(
+            "mask_condition_col",
+            choices=colNames,
+            selected="Condition" if "Condition" in colNames else "SampleName",
+            session=session,
+        )
+
+        ui.update_select(
+            "mask_sample_col",
+            choices=colNames,
+            selected="SampleName",
+            session=session,
+        )
+
+        # Build direct match table. This avoids asking the user to run manual mask matching.
+        finalMaskDf = validMasks.copy()
+
+        if "CellMaskName" not in finalMaskDf.columns:
+            finalMaskDf["CellMaskName"] = finalMaskDf["SampleName"]
+
+        finalMaskDf["ManualMatch"] = False
+
+        # Keep columns expected by downstream mask tools.
+        if "MaskFile" not in finalMaskDf.columns:
+            finalMaskDf["MaskFile"] = finalMaskDf["MaskPath"].map(lambda x: Path(str(x)).name)
+
+        if "MaskExists" not in finalMaskDf.columns:
+            finalMaskDf["MaskExists"] = True
+
+        filesDf = finalMaskDf[["MaskFile", "MaskPath", "CellMaskName"]].copy()
+
+        mask_files_df.set(filesDf)
+        mask_match_df.set(finalMaskDf.copy())
+        matched_masks_df.set(finalMaskDf.copy())
+        missing_masks_df.set(pd.DataFrame())
+        final_mask_match_df.set(finalMaskDf.copy())
+        manual_mask_match_df.set(pd.DataFrame())
+
+        clear_mask_render_cache("Mesmer results pushed to mask visualization")
+
+        selectedChoices = list(finalMaskDf["CellMaskName"].astype(str))
+        selectedDefault = selectedChoices[0] if selectedChoices else None
+
+        if selectedDefault is not None:
+            selected_mask_match.set(
+                finalMaskDf.loc[
+                    finalMaskDf["CellMaskName"].astype(str) == str(selectedDefault)
+                ].copy()
+            )
+        else:
+            selected_mask_match.set(pd.DataFrame())
+
+        ui.update_select(
+            "selected_mask_name",
+            choices=selectedChoices,
+            selected=selectedDefault,
+            session=session,
+        )
+
+        ui.update_navs("viewer_mode", selected="mask", session=session)
+
+        print(
+            f"✅ Pushed Mesmer results to Mask visualization: "
+            f"{len(cellDf):,} cells across {len(finalMaskDf):,} masks."
+        )
+
 
     @output
     @render.plot
@@ -2061,6 +2423,89 @@ def server(input, output, session):
                 title="Mesmer mask",
                 errorMessage=f"Mesmer mask preview error:\n{e}",
             )
+
+
+    @reactive.Effect
+    @reactive.event(input.quantify_mesmer_masks)
+    def _quantify_mesmer_masks():
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            segmentation_quantification_status.set("No images pushed to Segmentation.")
+            print("⚠️ No images pushed to Segmentation.")
+            return
+
+        imgs = obj.get("images", {})
+        chs = obj.get("channels", {})
+
+        if not imgs:
+            segmentation_quantification_status.set("No pushed images available.")
+            print("⚠️ No pushed images available.")
+            return
+
+        outDir = _get_segmentation_output_dir()
+        cellTablePath = outDir / "mesmer_cell_table.csv"
+        maskTablePath = outDir / "mesmer_mask_table.csv"
+
+        sampleNames = list(imgs.keys())
+
+        print(f"▶️ Quantifying Mesmer masks for {len(sampleNames):,} ROI(s).")
+        print(f"   Mask folder: {outDir}")
+
+        with ui.Progress(min=0, max=max(len(sampleNames), 1), session=session) as p:
+            step = 0
+
+            def progress(msg: str):
+                nonlocal step
+                step = min(step + 1, len(sampleNames))
+                p.set(step, message=msg)
+                print(msg, flush=True)
+
+            p.set(0, message="Starting Mesmer mask quantification...")
+
+            try:
+                cellDf, maskDf = quantify_mesmer_masks_for_dataset(
+                    images=imgs,
+                    channels=chs,
+                    mask_folder=outDir,
+                    mask_suffix="_mesmer_mask_uint32.tiff",
+                    progress=progress,
+                )
+            except Exception as e:
+                segmentation_cell_table.set(pd.DataFrame())
+                segmentation_mask_table.set(pd.DataFrame())
+                segmentation_cell_table_path.set("")
+                segmentation_mask_table_path.set("")
+                segmentation_quantification_status.set(f"Quantification failed: {e}")
+                print(f"❌ Quantification failed: {e}")
+                return
+
+        segmentation_cell_table.set(cellDf)
+        segmentation_mask_table.set(maskDf)
+
+        try:
+            cellDf.to_csv(cellTablePath, index=False)
+            maskDf.to_csv(maskTablePath, index=False)
+
+            segmentation_cell_table_path.set(str(cellTablePath))
+            segmentation_mask_table_path.set(str(maskTablePath))
+
+        except Exception as e:
+            segmentation_quantification_status.set(f"Quantified masks, but saving failed: {e}")
+            print(f"⚠️ Quantified masks, but saving failed: {e}")
+            return
+
+        nMasks = int(maskDf["MaskExists"].sum()) if not maskDf.empty and "MaskExists" in maskDf.columns else 0
+        nCells = len(cellDf)
+
+        msg = (
+            f"Quantification complete: {nCells:,} cells from {nMasks:,} mask(s). "
+            f"Saved cell table to: {cellTablePath}"
+        )
+
+        segmentation_quantification_status.set(msg)
+        print(f"✅ {msg}")
+
 
     @reactive.Effect
     @reactive.event(input.export_all_mask_visualizations)

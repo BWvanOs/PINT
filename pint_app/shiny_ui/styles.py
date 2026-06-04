@@ -96,20 +96,6 @@ def app_styles():
                 min-height: 32px;
             }
                       
-            .viewer-main .card {
-                height: 100%;
-            }
-
-            .viewer-main .tab-content {
-                height: 100%;
-                min-height: 0;
-            }
-
-            .viewer-main .tab-pane {
-                height: 100%;
-                min-height: 0;
-            }
-
             /* Sidebar & parameter table */
             .sidebar-col {
                 display: flex;
@@ -160,10 +146,45 @@ def app_styles():
                 border-color: #dee2e6 #dee2e6 #fff;
             }
                       
+            .seg-citation-card {
+                flex: 0 0 auto;
+            }
+
+            .seg-citation-card .card-body {
+                padding: 0.45rem 0.65rem !important;
+            }
+
+            .seg-citation-content {
+                font-size: 0.86rem;
+                line-height: 1.25;
+            }
+
+            .seg-citation-content details {
+                margin-top: 0.25rem;
+            }
+
+            .seg-citation-content summary {
+                cursor: pointer;
+                font-weight: 650;
+            }
+
+            .seg-citation-box {
+                background: #f8f9fa;
+                border: 1px solid #d0d0d0;
+                border-radius: 0.35rem;
+                padding: 0.45rem;
+                white-space: pre-wrap;
+                font-size: 0.76rem;
+                line-height: 1.2;
+                margin-top: 0.35rem;
+                margin-bottom: 0.35rem;
+                max-height: 160px;
+                overflow-y: auto;
+            }
+
             .seg-preview-card {
                 flex: 1 1 auto;
                 min-height: 0;
-                height: 100%;
                 display: flex;
                 flex-direction: column;
                 overflow: hidden;
@@ -203,11 +224,8 @@ def app_styles():
                 height: 100% !important;
                 min-height: 0;
             }
-                      
-            /* Boundary channel multi-select in the Segmentation tab.
-               Shiny may render this as a plain <select multiple>, so target both
-               the raw select and possible selectize wrappers. */
-                      
+
+            /* Segmentation boundary channel picker */
             .seg-boundary-select-wrap select {
                 min-height: 220px !important;
                 height: 220px !important;

@@ -24,8 +24,9 @@ open issues
     -Fixed a bug in the neighborhood progression bar
 0.6.3
     -Fixed a bug where the touching cell analysis would run as bidirectional but only summarize the interaction onesided. 
-
-
+0.6.4
+    -Alpha version of Mesmer intergrated. Keep in mind that the interface is very cluttered because now it is used to provide me feedback.
+    -Fixed inconsistency in packages that failed to display messages during analysis on older installations
 
 
 

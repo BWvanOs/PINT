@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import os
 
 
 DEFAULT_MESMER_ENV_NAME = "pint-mesmer"
@@ -291,6 +292,7 @@ def run_mesmer_backend(
     image_mpp: float = 1.0,
     compartment: str = "whole-cell",
     env_name: str = DEFAULT_MESMER_ENV_NAME,
+    deepcell_access_token: str | None = None,
 ) -> MesmerStatus:
     """
     Run Mesmer in the separate pint-mesmer environment.
@@ -332,6 +334,11 @@ def run_mesmer_backend(
         str(compartment),
     ]
 
+    run_env = os.environ.copy()
+
+    if deepcell_access_token:
+        run_env["DEEPCELL_ACCESS_TOKEN"] = deepcell_access_token
+
     try:
         completed = subprocess.run(
             cmd,
@@ -339,7 +346,8 @@ def run_mesmer_backend(
             text=True,
             timeout=1800,
             check=False,
-        )
+            env=run_env,
+        )        
     except subprocess.TimeoutExpired:
         return MesmerStatus(
             ok=False,
@@ -359,6 +367,20 @@ def run_mesmer_backend(
 
     stdout = completed.stdout.strip()
     stderr = completed.stderr.strip()
+
+    if "DEEPCELL_ACCESS_TOKEN not found" in stderr:
+        return MesmerStatus(
+            ok=False,
+            status="DeepCell access token required",
+            detail=(
+                "Mesmer requires a DeepCell access token to download/load model files.\n\n"
+                "Enter the token in the Segmentation tab and run Mesmer again. "
+                "The token is passed only to the external Mesmer process and is not saved by PINT.\n\n"
+                f"stderr:\n{stderr}"
+            ),
+            conda_executable=conda_exe,
+            env_name=env_name,
+        )
 
     if completed.returncode != 0:
         return MesmerStatus(

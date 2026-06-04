@@ -35,6 +35,22 @@ def segmentation_panel():
                         width="100%",
                     ),
 
+                    ui.input_password(
+                        "deepcell_access_token",
+                        "DeepCell access token",
+                        value="",
+                        width="100%",
+                    ),
+
+                    ui.tags.small(
+                        "Required by DeepCell/Mesmer to download/load model files. "
+                        "The token is passed only to the external Mesmer process and is not saved by PINT.",
+                        class_="text-muted",
+                    ),
+
+                    ui.br(),
+                    ui.br(),
+
                     ui.input_action_button(
                         "check_mesmer_backend",
                         "Check Mesmer installation",
@@ -134,7 +150,7 @@ def segmentation_panel():
 
                     ui.input_numeric(
                         "seg_image_mpp",
-                        "Image resolution / mpp",
+                        "Microns per pixel (mpp)",
                         value=1.0,
                         min=0.1,
                         max=5.0,
@@ -159,7 +175,29 @@ def segmentation_panel():
                         class_="btn btn-primary w-100 mt-2",
                     ),
 
+                    ui.input_action_button(
+                        "run_mesmer_all",
+                        "Run Mesmer on all pushed ROIs",
+                        class_="btn btn-secondary w-100 mt-2",
+                    ),
+
                     ui.output_ui("segmentation_mesmer_result_summary"),
+
+                    ui.hr(),
+
+                    ui.input_action_button(
+                        "quantify_mesmer_masks",
+                        "Create cell table from Mesmer masks",
+                        class_="btn btn-primary w-100 mt-2",
+                    ),
+
+                    ui.input_action_button(
+                        "push_mesmer_to_mask_visualization",
+                        "Push Mesmer results to Mask visualization",
+                        class_="btn btn-success w-100 mt-2",
+                    ),
+
+                    ui.output_ui("segmentation_quantification_summary"),
 
                     class_="mb-2",
                 ),
@@ -187,6 +225,42 @@ def segmentation_panel():
             # RIGHT VIEWER COLUMN
             # ============================================================
             ui.tags.div(
+                ui.card(
+                    ui.tags.div(
+                        ui.tags.strong("Citation reminder: "),
+                        ui.tags.span(
+                            "If you use Mesmer/DeepCell segmentations, please cite the original Mesmer/TissueNet publication. "
+                        ),
+                        ui.tags.details(
+                            ui.tags.summary("Copy citation"),
+                            ui.tags.pre(
+                                (
+                                    "Greenwald, N. F. et al. (2022). Whole-cell segmentation of tissue images "
+                                    "with human-level performance using large-scale data annotation and deep learning. "
+                                    "Nature Biotechnology, 40, 555–565. https://doi.org/10.1038/s41587-021-01094-0"
+                                ),
+                                class_="seg-citation-box",
+                            ),
+                            ui.tags.pre(
+                                (
+                                    "@article{greenwald2022whole,\n"
+                                    "  title={Whole-cell segmentation of tissue images with human-level performance using large-scale data annotation and deep learning},\n"
+                                    "  author={Greenwald, Noah F. and Miller, Geneva and Moen, Erick and others},\n"
+                                    "  journal={Nature Biotechnology},\n"
+                                    "  volume={40},\n"
+                                    "  pages={555--565},\n"
+                                    "  year={2022},\n"
+                                    "  doi={10.1038/s41587-021-01094-0}\n"
+                                    "}"
+                                ),
+                                class_="seg-citation-box",
+                            ),
+                        ),
+                        class_="seg-citation-content",
+                    ),
+                    class_="seg-citation-card mb-2",
+                ),
+
                 ui.card(
                     ui.card_header("Segmentation input preview"),
                     ui.navset_tab(
