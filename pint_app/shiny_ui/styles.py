@@ -149,6 +149,18 @@ def app_styles():
             .seg-citation-card {
                 flex: 0 0 auto;
             }
+                      
+            .seg-citation-title {
+                font-size: 1.5rem;
+                font-weight: 800;
+                line-height: 1.2;
+                margin-bottom: 0.15rem;
+            }
+
+            .seg-citation-message {
+                font-size: 0.92rem;
+                line-height: 1.25;
+            }
 
             .seg-citation-card .card-body {
                 padding: 0.45rem 0.65rem !important;
@@ -166,6 +178,7 @@ def app_styles():
             .seg-citation-content summary {
                 cursor: pointer;
                 font-weight: 650;
+                font-size: 0.88rem;
             }
 
             .seg-citation-box {
@@ -271,16 +284,17 @@ def app_styles():
                 line-height: 1.2;
             }
 
-            .alpha-warning-card {
-                border: 1px solid #d39e00;
-                background-color: #fff3cd;
-                color: #664d03;
+            .beta-warning-card {
+                border: 1px solid #6ea8fe;
+                background-color: #e7f1ff;
+                color: #084298;
                 border-radius: 0.35rem;
             }
 
-            .alpha-warning-title {
+            .beta-warning-title {
                 font-weight: 750;
                 margin-bottom: 0.35rem;
             }
+                      
         """)
     )

@@ -972,6 +972,47 @@ def server(input, output, session):
 
         return nuclearPath, boundaryPath, maskPath, jsonPath, meta    
 
+    def _build_pint_processed_stack_for_sample(sampleName: str) -> tuple[np.ndarray, list[str]]:
+        imgs = images.get()
+        chs = channels.get()
+
+        if sampleName not in imgs:
+            raise ValueError(f"Sample not found: {sampleName}")
+
+        channelNames = chs.get(sampleName, [])
+        processedChannels = []
+
+        for channelName in channelNames:
+            proc = _process_channel_from_table(sampleName, channelName)
+
+            if proc is None:
+                raise ValueError(
+                    f"Could not process channel '{channelName}' for sample '{sampleName}'."
+                )
+
+            processedChannels.append(proc.astype(np.float32))
+
+        stack = np.stack(processedChannels, axis=0)
+
+        return stack, channelNames
+    
+    def _build_pint_processed_dataset_for_quantification() -> tuple[dict[str, np.ndarray], dict[str, list[str]]]:
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            raise ValueError("No images pushed to Segmentation.")
+
+        imgs = obj.get("images", {})
+        processedImages = {}
+        processedChannels = {}
+
+        for sampleName in imgs.keys():
+            stack, channelNames = _build_pint_processed_stack_for_sample(sampleName)
+            processedImages[sampleName] = stack
+            processedChannels[sampleName] = channelNames
+
+        return processedImages, processedChannels
+    
 
 
 
@@ -1774,21 +1815,6 @@ def server(input, output, session):
     def _install_mesmer_backend():
         envName = _get_mesmer_env_name()
 
-        if not bool(input.confirm_mesmer_alpha_install()):
-            ui.modal_show(
-                ui.modal(
-                    ui.h4("Confirmation required"),
-                    ui.p(
-                        "Please tick the Alpha confirmation checkbox before installing "
-                        "the optional Mesmer backend."
-                    ),
-                    easy_close=True,
-                    footer=ui.modal_button("OK"),
-                ),
-                session=session,
-            )
-            return
-
         ui.modal_show(
             ui.modal(
                 ui.h4("Install Mesmer backend?"),
@@ -2435,8 +2461,25 @@ def server(input, output, session):
             print("⚠️ No images pushed to Segmentation.")
             return
 
-        imgs = obj.get("images", {})
-        chs = obj.get("channels", {})
+        quantMode = input.seg_quantification_mode() or "raw"
+
+        try:
+            if quantMode == "pint":
+                imgs, chs = _build_pint_processed_dataset_for_quantification()
+                quantModeLabel = "current PINT-processed images"
+            else:
+                imgs = obj.get("images", {})
+                chs = obj.get("channels", {})
+                quantModeLabel = "raw pushed images"
+
+        except Exception as e:
+            segmentation_cell_table.set(pd.DataFrame())
+            segmentation_mask_table.set(pd.DataFrame())
+            segmentation_cell_table_path.set("")
+            segmentation_mask_table_path.set("")
+            segmentation_quantification_status.set(f"Could not prepare quantification images: {e}")
+            print(f"❌ Could not prepare quantification images: {e}")
+            return
 
         if not imgs:
             segmentation_quantification_status.set("No pushed images available.")
@@ -2450,6 +2493,7 @@ def server(input, output, session):
         sampleNames = list(imgs.keys())
 
         print(f"▶️ Quantifying Mesmer masks for {len(sampleNames):,} ROI(s).")
+        print(f"   Quantification mode: {quantModeLabel}")
         print(f"   Mask folder: {outDir}")
 
         with ui.Progress(min=0, max=max(len(sampleNames), 1), session=session) as p:
@@ -2500,6 +2544,7 @@ def server(input, output, session):
 
         msg = (
             f"Quantification complete: {nCells:,} cells from {nMasks:,} mask(s). "
+            f"Mode: {quantModeLabel}. "
             f"Saved cell table to: {cellTablePath}"
         )
 

@@ -13,19 +13,14 @@ def segmentation_panel():
             ui.tags.div(
                 ui.card(
                     ui.card_header("Segmentation module"),
+
                     ui.tags.div(
-                        ui.tags.div("Alpha function", class_="alpha-warning-title"),
+                        ui.tags.div("Beta function", class_="beta-warning-title"),
                         ui.tags.p(
-                            "This segmentation module is experimental and under active development."
+                            "This segmentation module is in beta testing and should be functional. "
+                            "Please inspect results carefully."
                         ),
-                        ui.tags.p(
-                            "At this stage it manages the optional Mesmer/DeepCell backend "
-                            "and prepares PINT images for segmentation preview."
-                        ),
-                        ui.tags.p(
-                            "Do not treat this function as production-ready without manual QC."
-                        ),
-                        class_="alpha-warning-card p-3 mb-3",
+                        class_="beta-warning-card p-3 mb-3",
                     ),
 
                     ui.input_text(
@@ -51,47 +46,49 @@ def segmentation_panel():
                     ui.br(),
                     ui.br(),
 
-                    ui.input_action_button(
-                        "check_mesmer_backend",
-                        "Check Mesmer installation",
-                        class_="btn btn-primary w-100 mb-2",
+                    ui.row(
+                        ui.column(
+                            6,
+                            ui.input_action_button(
+                                "check_mesmer_backend",
+                                "Check Mesmer installation",
+                                class_="btn btn-primary w-100 mb-2",
+                            ),
+                        ),
+                        ui.column(
+                            6,
+                            ui.input_action_button(
+                                "check_mesmer_gpu",
+                                "Check TensorFlow GPU utilization",
+                                class_="btn btn-secondary w-100 mb-2",
+                            ),
+                        ),
+                        class_="gx-2",
                     ),
 
-                    ui.input_action_button(
-                        "show_mesmer_install_commands",
-                        "Show install commands",
-                        class_="btn btn-secondary w-100 mb-2",
+                    ui.row(
+                        ui.column(
+                            6,
+                            ui.input_action_button(
+                                "show_mesmer_install_commands",
+                                "Show install commands",
+                                class_="btn btn-secondary w-100",
+                            ),
+                        ),
+                        ui.column(
+                            6,
+                            ui.input_action_button(
+                                "install_mesmer_backend",
+                                "Install Mesmer backend",
+                                class_="btn btn-warning w-100",
+                            ),
+                        ),
+                        class_="gx-2",
                     ),
 
-                    ui.input_checkbox(
-                        "confirm_mesmer_alpha_install",
-                        "I understand this is an experimental Alpha backend and will be installed in a separate conda environment.",
-                        value=False,
-                    ),
-
-                    ui.input_action_button(
-                        "check_mesmer_gpu",
-                        "Check TensorFlow GPU",
-                        class_="btn btn-secondary w-100 mb-2",
-                    ),
-
-                    ui.input_action_button(
-                        "install_mesmer_backend",
-                        "Install Mesmer backend",
-                        class_="btn btn-warning w-100 mt-2",
-                    ),
-
-                    ui.br(),
                     ui.br(),
                     ui.output_ui("mesmer_backend_summary"),
 
-                    class_="mb-2",
-                ),
-
-
-                ui.card(
-                    ui.card_header("Mesmer backend details"),
-                    ui.output_text_verbatim("mesmer_backend_detail"),
                     class_="mb-2",
                 ),
 
@@ -129,15 +126,16 @@ def segmentation_panel():
                         class_="seg-boundary-select-wrap",
                     ),
 
-                    ui.input_radio_buttons(
+                    ui.input_select(
                         "seg_preprocess_mode",
-                        "Segmentation input mode",
+                        "Segmentation input preprocessing",
                         choices={
-                            "soft": "Soft segmentation preprocessing — recommended",
-                            "pint": "Use current PINT channel settings — not recommended",
-                            "raw": "Use raw image values — not recommended",
+                            "soft": "Minimal preprocessing (recommended)",
+                            "pint": "Current PINT settings (not recommended)",
+                            "raw": "Raw values (not recommended)",
                         },
                         selected="soft",
+                        width="100%",
                     ),
 
                     ui.tags.small(
@@ -185,6 +183,17 @@ def segmentation_panel():
 
                     ui.hr(),
 
+                    ui.input_select(
+                        "seg_quantification_mode",
+                        "Cell-table quantification images",
+                        choices={
+                            "raw": "Raw image values",
+                            "pint": "Current PINT-processed values",
+                        },
+                        selected="pint",
+                        width="100%",
+                    ),
+
                     ui.input_action_button(
                         "quantify_mesmer_masks",
                         "Create cell table from Mesmer masks",
@@ -227,9 +236,13 @@ def segmentation_panel():
             ui.tags.div(
                 ui.card(
                     ui.tags.div(
-                        ui.tags.strong("Citation reminder: "),
-                        ui.tags.span(
-                            "If you use Mesmer/DeepCell segmentations, please cite the original Mesmer/TissueNet publication. "
+                        ui.tags.div(
+                            ui.tags.strong("Citation reminder"),
+                            class_="seg-citation-title",
+                        ),
+                        ui.tags.div(
+                            "If you use Mesmer/DeepCell segmentations, please cite the original Mesmer/TissueNet publication.",
+                            class_="seg-citation-message",
                         ),
                         ui.tags.details(
                             ui.tags.summary("Copy citation"),
