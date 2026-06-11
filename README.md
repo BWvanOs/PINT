@@ -84,8 +84,15 @@ Before you start: if you use Mesmer/DeepCell segmentations, please cite the orig
 
 Greenwald, N. F. et al. (2022). Whole-cell segmentation of tissue images with human-level performance using large-scale data annotation and deep learning. Nature Biotechnology, 40, 555–565. https://doi.org/10.1038/s41587-021-01094-0
 
-### Installing Mesmer
+### 1. Installing Mesmer
 
-PINT does nog include the mesmer installation by default. You can install it through the interface or by hand and tell PINT where to find it.
+PINT does nog include the mesmer installation by default. You can install it through the interface (only tested on Linux) or by hand and tell PINT where to find the environment
 
-When you open de tab
+### 2. Image input
+What to use as input (boundary/cytoplasm stainings)
+How it handles the stacking of the images (maxpixel?)
+
+### 3. Segmentation settings
+Explanation of the different settings
+
+

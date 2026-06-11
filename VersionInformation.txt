@@ -28,6 +28,9 @@ open issues
 0.6.4
     -Alpha version of Mesmer intergrated. Keep in mind that the interface is very cluttered because now it is used to provide me feedback.
     -Fixed inconsistency in packages that failed to display messages during analysis on older installations
+0.6.5
+    -Improved UI of segmentation tab 
+    -Included option to also measure the raw images with the masks
 
 
 
