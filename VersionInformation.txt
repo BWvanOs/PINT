@@ -9,8 +9,8 @@ Fixed viewer bug that would render the images under the mask visualization tab
 open issues
     -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv, however.
     -Winsorization floor value is not user adjustable.
-    -Unable to pick own color for channels
     -There is this weird behaviour specifically in macOS where upon loading of the images, the interface can become unresponsive.
+    -Defauls colors for the image creator become unresponsive after settting your own color. Will fix
 
 0.6.0.1
     -Started with manual (readme.md) on how to use it
@@ -31,7 +31,9 @@ open issues
 0.6.5
     -Improved UI of segmentation tab 
     -Included option to also measure the raw images with the masks
-
+0.6.6 
+    -Aligned the interfaces of the last 2 tabs with the rest.
+    -Included a custom color picker! 
 
 
 

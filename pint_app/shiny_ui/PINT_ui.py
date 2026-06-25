@@ -309,9 +309,8 @@ def pint_panel():
             # ============================================================
             ui.tags.div(
                 ui.tags.div(
-                    ui.row(
-                        ui.column(
-                            3,
+                    ui.tags.div(
+                        ui.tags.div(
                             ui.input_select(
                                 "sample",
                                 "Sample",
@@ -321,28 +320,25 @@ def pint_panel():
                             ),
                         ),
 
-                        ui.column(
-                            1,
+                        ui.tags.div(
                             ui.input_action_button(
                                 "prev_sample",
                                 "←",
-                                class_="btn-sm w-100",
+                                class_="btn-sm",
                             ),
                         ),
 
-                        ui.column(
-                            1,
+                        ui.tags.div(
                             ui.input_action_button(
                                 "next_sample",
                                 "→",
-                                class_="btn-sm w-100",
+                                class_="btn-sm",
                             ),
                         ),
 
-                        ui.column(1),
+                        ui.tags.div(),
 
-                        ui.column(
-                            3,
+                        ui.tags.div(
                             ui.input_select(
                                 "channel",
                                 "Channel",
@@ -352,25 +348,23 @@ def pint_panel():
                             ),
                         ),
 
-                        ui.column(
-                            1,
+                        ui.tags.div(
                             ui.input_action_button(
                                 "prev_channel",
                                 "←",
-                                class_="btn-sm w-100",
+                                class_="btn-sm",
                             ),
                         ),
 
-                        ui.column(
-                            1,
+                        ui.tags.div(
                             ui.input_action_button(
                                 "next_channel",
                                 "→",
-                                class_="btn-sm w-100",
+                                class_="btn-sm",
                             ),
                         ),
 
-                        class_="align-items-end gy-0 gx-1 viewer-navigator-row",
+                        class_="pint-navigator-grid",
                     ),
                     class_="viewer-navigator",
                 ),

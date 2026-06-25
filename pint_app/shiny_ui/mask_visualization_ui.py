@@ -1,11 +1,11 @@
 from shiny import ui
 
+
 def mask_visualization_panel():
     return ui.nav_panel(
         "Mask visualization",
-        ui.row(
-            ui.column(
-                3,
+        ui.tags.div(
+            ui.tags.div(
                 ui.card(
                     ui.card_header("Mask input"),
 
@@ -33,9 +33,8 @@ def mask_visualization_panel():
                                 class_="btn btn-primary w-100",
                             ),
                         ),
+                        class_="gx-1 gy-0 mb-2",
                     ),
-
-                    ui.br(),
 
                     ui.input_text(
                         "mask_path",
@@ -61,9 +60,8 @@ def mask_visualization_panel():
                                 class_="btn btn-primary w-100",
                             ),
                         ),
+                        class_="gx-1 gy-0 mb-2",
                     ),
-
-                    ui.br(),
 
                     ui.input_select(
                         "mask_cell_id_col",
@@ -122,15 +120,16 @@ def mask_visualization_panel():
                         min=1,
                         max=20,
                         step=1,
+                        width="100%",
                     ),
-                ),
 
-                ui.br(),
+                    class_="mb-2",
+                ),
 
                 ui.card(
                     ui.card_header("Matched masks"),
 
-                    ui.div(
+                    ui.tags.div(
                         ui.tags.div(
                             "Selection / visualization",
                             class_="mask-section-title",
@@ -182,23 +181,60 @@ def mask_visualization_panel():
 
                         class_="compact-stack",
                     ),
+
+                    class_="mb-2",
                 ),
+
+                class_="controls-left",
             ),
 
-            ui.column(
-                9,
-                ui.card(
-                    ui.card_header("Visualization"),
-                    ui.div(
-                        ui.output_plot(
-                            "mask_viewer",
-                            fill=True,
-                            height="100%",
+            ui.tags.div(
+                ui.tags.div(
+                    ui.row(
+                        ui.column(
+                            6,
+                            ui.input_select(
+                                "selected_mask_name_display",
+                                "Mask",
+                                choices=[],
+                                selected=None,
+                                width="100%",
+                            ),
                         ),
-                        style="height: 75vh;",
+                        ui.column(
+                            3,
+                            ui.input_action_button(
+                                "mask_prev",
+                                "←",
+                                class_="btn-sm w-100",
+                            ),
+                        ),
+                        ui.column(
+                            3,
+                            ui.input_action_button(
+                                "mask_next",
+                                "→",
+                                class_="btn-sm w-100",
+                            ),
+                        ),
+                        class_="align-items-end gy-0 gx-1 viewer-navigator-row",
                     ),
+                    class_="viewer-navigator",
                 ),
+
+                ui.tags.div(
+                    ui.output_plot(
+                        "mask_viewer",
+                        fill=True,
+                        height="100%",
+                    ),
+                    class_="viewer-plot-fill",
+                ),
+
+                class_="viewer-main",
             ),
+
+            class_="pint-main-layout",
         ),
         value="mask",
     )

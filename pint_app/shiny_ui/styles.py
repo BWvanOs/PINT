@@ -37,6 +37,89 @@ def app_styles():
                 opacity: 1;
                 margin: 0.6rem 0;
             }
+                      
+            /* Fixed-width navigator controls.
+            Prevents sample/channel selectors and arrow buttons from stretching on ultrawide screens. */
+            .pint-navigator-fixed {
+                display: flex !important;
+                flex-wrap: nowrap !important;
+                align-items: flex-end;
+                width: 950px;
+                max-width: 100%;
+            }
+
+            .pint-navigator-fixed .navigator-select {
+                flex: 0 0 375px;
+                width: 375px;
+                max-width: 375px;
+            }
+
+            .pint-navigator-fixed .navigator-button {
+                flex: 0 0 50px;
+                width: 50px;
+                max-width: 50px;
+            }
+
+            .pint-navigator-fixed .navigator-spacer {
+                flex: 0 0 50px;
+                width: 50px;
+                max-width: 50px;
+            }
+
+            .pint-navigator-fixed .navigator-button .btn {
+                width: 100%;
+                min-width: 0;
+                padding-left: 0;
+                padding-right: 0;
+            }
+                                
+            .pint-navigator-half-fixed {
+                display: flex !important;
+                flex-wrap: nowrap !important;
+                align-items: flex-end;
+                width: 550px;
+                max-width: 100%;
+            }
+                      
+            .pint-navigator-half-fixed .navigator-select {
+                flex: 0 0 425px;
+                max-width: 425px;
+            }
+
+            .pint-navigator-half-fixed .navigator-button {
+                flex: 0 0 50px;
+                max-width: 50px;
+            }
+
+            .pint-navigator-half-fixed .navigator-button .btn {
+                width: 100%;
+                min-width: 0;
+                padding-left: 0;
+                padding-right: 0;
+            }
+                      
+            /* PINT tab: fixed pixel navigator, independent of screen width */
+            .pint-navigator-grid {
+                display: grid !important;
+                grid-template-columns: 375px 50px 50px 50px 375px 50px 50px;
+                column-gap: 0.25rem;
+                align-items: end;
+                width: max-content;
+                max-width: 100%;
+            }
+
+            .pint-navigator-grid .shiny-input-container {
+                width: 100% !important;
+                margin-bottom: 0 !important;
+            }
+
+            .pint-navigator-grid .btn {
+                width: 100% !important;
+                min-width: 0 !important;
+                padding-left: 0 !important;
+                padding-right: 0 !important;
+                margin-bottom: 0 !important;
+            }
 
             .viewer-navigator {
                 flex: 0 0 auto;
@@ -101,6 +184,54 @@ def app_styles():
                 display: flex;
                 flex-direction: column;
                 height: 100%;
+            }
+                      
+            /* Remove numeric spinner arrows from creator gain fields */
+            .creator-slot-row input[type="number"] {
+                appearance: textfield;
+                -moz-appearance: textfield;
+            }
+
+            /* Chrome, Edge, Safari */
+            .creator-slot-row input[type="number"]::-webkit-outer-spin-button,
+            .creator-slot-row input[type="number"]::-webkit-inner-spin-button {
+                -webkit-appearance: none;
+                margin: 0;
+            }
+            
+            .controls-left.controls-left-wide {
+                flex-basis: 600px;
+                width: 600px;
+                max-width: 600px;
+            }
+                                
+            .creator-color-custom-wrap {
+                display: flex;
+                align-items: center;
+                gap: 0.25rem;
+            }
+
+            .creator-color-picker {
+                width: 34px;
+                height: 34px;
+                min-width: 34px;
+                padding: 0;
+                border: 1px solid #8f8f8f;
+                border-radius: 0.25rem;
+                background: transparent;
+                cursor: pointer;
+            }
+
+            .creator-color-custom-wrap .shiny-input-container {
+                flex: 1 1 auto;
+                margin-bottom: 0 !important;
+            }
+
+            .creator-color-custom-wrap input[type="text"] {
+                height: 34px;
+                font-size: 0.8rem;
+                padding-left: 0.35rem;
+                padding-right: 0.35rem;
             }
 
             .param-table-wrap table {
@@ -294,6 +425,14 @@ def app_styles():
             .beta-warning-title {
                 font-weight: 750;
                 margin-bottom: 0.35rem;
+            }
+                      
+            /* Keep Shiny progress/notification UI above PINT sidebars */
+            #shiny-notification-panel,
+            .shiny-notification,
+            .shiny-progress-container,
+            .shiny-progress {
+                z-index: 3000 !important;
             }
                       
         """)

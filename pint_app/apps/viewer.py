@@ -467,7 +467,13 @@ def server(input, output, session):
 
             channelName = getattr(input, f"comp_channel_{slotIdx}")()
             colorName = getattr(input, f"comp_color_{slotIdx}")()
+            customHex = getattr(input, f"comp_hex_{slotIdx}")()
             gain = float(getattr(input, f"comp_gain_{slotIdx}")())
+
+            if customHex:
+                customHex = str(customHex).strip()
+                if customHex.startswith("#") and len(customHex) == 7:
+                    colorName = customHex
 
             if not channelName or channelName == COMPOSITE_EMPTY_CHOICE:
                 continue
@@ -1175,6 +1181,145 @@ def server(input, output, session):
 
         print(msg, flush=True)
 
+    def _get_final_mask_name_col() -> str:
+        return input.mask_name_col() or "CellMaskName"
+
+
+    def _get_valid_mask_choices() -> list[str]:
+        finalDf = final_mask_match_df.get()
+
+        if finalDf is None or finalDf.empty:
+            return []
+
+        maskNameCol = _get_final_mask_name_col()
+
+        if maskNameCol not in finalDf.columns:
+            return []
+
+        if "MaskExists" in finalDf.columns:
+            finalDf = finalDf.loc[finalDf["MaskExists"]].copy()
+
+        return _deduplicate_mask_choices(finalDf[maskNameCol].tolist())
+
+
+    def _set_selected_mask_match(selectedName: str | None) -> None:
+        finalDf = final_mask_match_df.get()
+
+        if finalDf is None or finalDf.empty or not selectedName:
+            selected_mask_match.set(pd.DataFrame())
+            return
+
+        maskNameCol = _get_final_mask_name_col()
+
+        if maskNameCol not in finalDf.columns:
+            selected_mask_match.set(pd.DataFrame())
+            return
+
+        sel = finalDf.loc[
+            finalDf[maskNameCol].astype(str) == str(selectedName)
+        ].copy()
+
+        selected_mask_match.set(sel)
+
+
+    def _deduplicate_mask_choices(values) -> list[str]:
+        seen = set()
+        out = []
+
+        for value in values or []:
+            if value is None or pd.isna(value):
+                continue
+
+            value = str(value)
+
+            if value in seen:
+                continue
+
+            seen.add(value)
+            out.append(value)
+
+        return out
+
+
+    def _update_mask_select_controls(
+        choices: list[str] | None = None,
+        selected: str | None = None,
+    ) -> None:
+        if choices is None:
+            choices = _get_valid_mask_choices()
+
+        choices = _deduplicate_mask_choices(choices)
+
+        if selected is not None:
+            selected = str(selected)
+
+        if selected not in choices:
+            selected = choices[0] if choices else None
+
+        ui.update_select(
+            "selected_mask_name",
+            choices=choices,
+            selected=selected,
+            session=session,
+        )
+
+        ui.update_select(
+            "selected_mask_name_display",
+            choices=choices,
+            selected=selected,
+            session=session,
+        )
+
+        _set_selected_mask_match(selected)
+
+
+    def _clear_mask_selection_controls() -> None:
+        ui.update_select(
+            "selected_mask_name",
+            choices=[],
+            selected=None,
+            session=session,
+        )
+
+        ui.update_select(
+            "selected_mask_name_display",
+            choices=[],
+            selected=None,
+            session=session,
+        )
+
+        selected_mask_match.set(pd.DataFrame())
+
+
+    def _select_mask_by_name(selectedName: str | None) -> None:
+        choices = _get_valid_mask_choices()
+
+        if not selectedName or str(selectedName) not in choices:
+            selectedName = choices[0] if choices else None
+
+        _update_mask_select_controls(
+            choices=choices,
+            selected=selectedName,
+        )
+
+
+    def _cycle_mask_selection(step: int) -> None:
+        choices = _get_valid_mask_choices()
+
+        if not choices:
+            _clear_mask_selection_controls()
+            return
+
+        current = input.selected_mask_name_display() or input.selected_mask_name()
+
+        if current not in choices:
+            selected = choices[0]
+        else:
+            idx = choices.index(current)
+            selected = choices[(idx + step) % len(choices)]
+
+        _select_mask_by_name(selected)
+
     def _get_neighborhood_output_dir():
         obj = neighborhood_input_data.get()
         if obj is None:
@@ -1858,11 +2003,11 @@ def server(input, output, session):
         print(f"⚠️ Installing Alpha Mesmer backend into environment: {envName}")
 
         with ui.Progress(min=0, max=3, session=session) as p:
-            p.set(0, message="Starting Mesmer backend installation...")
+            p.set(value=0, message="Starting Mesmer backend installation...")
 
             status = install_mesmer_backend(env_name=envName)
 
-            p.set(3, message="Mesmer backend installation finished.")
+            p.set(value=3, message="Mesmer backend installation finished.")
 
         mesmer_backend_status.set(status)
         mesmer_backend_detail_text.set(status.detail)
@@ -1955,7 +2100,7 @@ def server(input, output, session):
 
         with ui.Progress(min=0, max=len(sampleNames), session=session) as p:
             for i, sampleName in enumerate(sampleNames, start=1):
-                p.set(i - 1, message=f"Preparing {sampleName} ({i}/{len(sampleNames)})")
+                p.set(value=i - 1, message=f"Preparing {sampleName} ({i}/{len(sampleNames)})")
 
                 row = {
                     "SampleName": sampleName,
@@ -1972,7 +2117,7 @@ def server(input, output, session):
                     row.update(meta)
                     row["Status"] = "Running"
 
-                    p.set(i - 1, message=f"Running Mesmer: {sampleName} ({i}/{len(sampleNames)})")
+                    p.set(value=i - 1, message=f"Running Mesmer: {sampleName} ({i}/{len(sampleNames)})")
 
                     result = run_mesmer_backend(
                         nuclear_path=nuclearPath,
@@ -2025,7 +2170,7 @@ def server(input, output, session):
                 except Exception as e:
                     print(f"⚠️ Could not write batch summary: {e}")
 
-                p.set(i, message=f"Finished {sampleName} ({i}/{len(sampleNames)})")
+                p.set(value=i, message=f"Finished {sampleName} ({i}/{len(sampleNames)})")
 
         batchDf = pd.DataFrame(outRows)
         segmentation_mesmer_batch_results.set(batchDf)
@@ -2163,8 +2308,8 @@ def server(input, output, session):
         print(f"   Output mask: {maskPath}")
 
         with ui.Progress(min=0, max=3, session=session) as p:
-            p.set(0, message="Preparing Mesmer input...")
-            p.set(1, message="Running Mesmer in external environment...")
+            p.set(value=0, message="Preparing Mesmer input...")
+            p.set(value=1, message="Running Mesmer in external environment...")
 
             deepcellToken = (input.deepcell_access_token() or "").strip()
 
@@ -2179,7 +2324,7 @@ def server(input, output, session):
                 deepcell_access_token=deepcellToken if deepcellToken else None,
             )
 
-            p.set(2, message="Reading Mesmer output...")
+            p.set(value=2, message="Reading Mesmer output...")
 
             if result.ok and Path(maskPath).exists():
                 mask = imread(str(maskPath))
@@ -2189,7 +2334,7 @@ def server(input, output, session):
                 segmentation_mesmer_mask.set(None)
                 segmentation_mesmer_mask_path.set("")
 
-            p.set(3, message="Mesmer run complete.")
+            p.set(value=3, message="Mesmer run complete.")
 
         segmentation_mesmer_result.set(result)
         mesmer_backend_detail_text.set(result.detail)
@@ -2388,20 +2533,9 @@ def server(input, output, session):
         selectedChoices = list(finalMaskDf["CellMaskName"].astype(str))
         selectedDefault = selectedChoices[0] if selectedChoices else None
 
-        if selectedDefault is not None:
-            selected_mask_match.set(
-                finalMaskDf.loc[
-                    finalMaskDf["CellMaskName"].astype(str) == str(selectedDefault)
-                ].copy()
-            )
-        else:
-            selected_mask_match.set(pd.DataFrame())
-
-        ui.update_select(
-            "selected_mask_name",
+        _update_mask_select_controls(
             choices=selectedChoices,
             selected=selectedDefault,
-            session=session,
         )
 
         ui.update_navs("viewer_mode", selected="mask", session=session)
@@ -2502,10 +2636,10 @@ def server(input, output, session):
             def progress(msg: str):
                 nonlocal step
                 step = min(step + 1, len(sampleNames))
-                p.set(step, message=msg)
+                p.set(value=step, message=msg)
                 print(msg, flush=True)
 
-            p.set(0, message="Starting Mesmer mask quantification...")
+            p.set(value=0, message="Starting Mesmer mask quantification...")
 
             try:
                 cellDf, maskDf = quantify_mesmer_masks_for_dataset(
@@ -2626,7 +2760,7 @@ def server(input, output, session):
                 msg = str(msg)
 
                 # Bottom-right Shiny progress
-                self.p.set(self.value, message=msg)
+                self.p.set(value=self.value, message=msg)
 
                 # Persistent in-tab status
                 self.status_setter(msg)
@@ -3597,6 +3731,7 @@ def server(input, output, session):
             final_mask_match_df.set(pd.DataFrame())
             manual_mask_match_df.set(pd.DataFrame())
             selected_mask_match.set(pd.DataFrame())
+            _clear_mask_selection_controls()
             clear_mask_render_cache("mask matching cleared: no cell table")
             return
 
@@ -3611,6 +3746,7 @@ def server(input, output, session):
             final_mask_match_df.set(pd.DataFrame())
             manual_mask_match_df.set(pd.DataFrame())
             selected_mask_match.set(pd.DataFrame())
+            _clear_mask_selection_controls()
             clear_mask_render_cache("mask matching cleared: invalid mask folder")
             return
 
@@ -3647,6 +3783,7 @@ def server(input, output, session):
             final_mask_match_df.set(pd.DataFrame())
             manual_mask_match_df.set(pd.DataFrame())
             selected_mask_match.set(pd.DataFrame())
+            _clear_mask_selection_controls()
             clear_mask_render_cache("mask matching failed or cleared")
             return
 
@@ -3669,20 +3806,9 @@ def server(input, output, session):
         )
         selected_default = selected_choices[0] if selected_choices else None
 
-        if selected_default is not None:
-            selected_mask_match.set(
-                final_df.loc[
-                    final_df[mask_name_col].astype(str) == str(selected_default)
-                ].copy()
-            )
-        else:
-            selected_mask_match.set(pd.DataFrame())
-
-        ui.update_select(
-            "selected_mask_name",
+        _update_mask_select_controls(
             choices=selected_choices,
             selected=selected_default,
-            session=session,
         )
 
         print(f"✅ Mask matching complete: {len(matched_df)} matched, {len(missing_df)} missing.")
@@ -3742,7 +3868,7 @@ def server(input, output, session):
 
                 if not maskPath or pd.isna(maskPath):
                     done += 1
-                    p.set(done, message=f"Skipping {maskName}: no valid mask path")
+                    p.set(value=done, message=f"Skipping {maskName}: no valid mask path")
                     continue
 
                 try:
@@ -3754,7 +3880,7 @@ def server(input, output, session):
 
                     if matchingData.empty:
                         done += 1
-                        p.set(done, message=f"Skipping {maskName}: no rows in cell table")
+                        p.set(value=done, message=f"Skipping {maskName}: no rows in cell table")
                         continue
 
                     fig, matchedData = _build_mask_visualization_figure(
@@ -3780,7 +3906,7 @@ def server(input, output, session):
                     plt.close(fig)
 
                     done += 1
-                    p.set(done, message=f"Exported {maskName} ({matchedData.shape[0]:,} cells)")
+                    p.set(value=done, message=f"Exported {maskName} ({matchedData.shape[0]:,} cells)")
 
                 except Exception as e:
                     try:
@@ -3788,7 +3914,7 @@ def server(input, output, session):
                     except Exception:
                         pass
                     done += 1
-                    p.set(done, message=f"Failed {maskName}: {e}")
+                    p.set(value=done, message=f"Failed {maskName}: {e}")
 
         print(f"✅ Exported {nMasks:,} matched mask visualizations to {outDir}")
 
@@ -3816,6 +3942,7 @@ def server(input, output, session):
             final_mask_match_df.set(pd.DataFrame())
             manual_mask_match_df.set(pd.DataFrame())
             selected_mask_match.set(pd.DataFrame())
+            _clear_mask_selection_controls()
             clear_mask_render_cache(reason)
 
         if not csv_path or not os.path.isfile(csv_path):
@@ -3845,6 +3972,7 @@ def server(input, output, session):
         final_mask_match_df.set(pd.DataFrame())
         manual_mask_match_df.set(pd.DataFrame())
         selected_mask_match.set(pd.DataFrame())
+        _clear_mask_selection_controls()
 
         clear_mask_render_cache("new mask cell table loaded")
         _sync_mask_column_choices(df_mask)
@@ -3953,16 +4081,47 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.selected_mask_name)
     def _on_selected_mask_name():
-        selected_name = input.selected_mask_name()
-        match_df = final_mask_match_df.get()
+        selectedName = input.selected_mask_name()
 
-        if match_df is None or match_df.empty or not selected_name:
+        if not selectedName:
             selected_mask_match.set(pd.DataFrame())
             return
 
-        mask_name_col = input.mask_name_col() or "CellMaskName"
-        sel = match_df.loc[match_df[mask_name_col].astype(str) == str(selected_name)].copy()
-        selected_mask_match.set(sel)
+        if selectedName != input.selected_mask_name_display():
+            ui.update_select(
+                "selected_mask_name_display",
+                selected=selectedName,
+                session=session,
+            )
+
+        _set_selected_mask_match(selectedName)
+
+    @reactive.Effect
+    @reactive.event(input.selected_mask_name_display)
+    def _on_selected_mask_name_display():
+        selectedName = input.selected_mask_name_display()
+
+        if not selectedName:
+            return
+
+        if selectedName == input.selected_mask_name():
+            return
+
+        _select_mask_by_name(selectedName)
+
+
+    @reactive.Effect
+    @reactive.event(input.mask_prev)
+    def _mask_prev():
+        _cycle_mask_selection(step=-1)
+
+
+    @reactive.Effect
+    @reactive.event(input.mask_next)
+    def _mask_next():
+        _cycle_mask_selection(step=1)       
+
+
 
     @output
     @render.ui
@@ -4031,24 +4190,63 @@ def server(input, output, session):
             print("⚠️ No automatic mask matching available.")
             manual_mask_match_df.set(pd.DataFrame())
             final_mask_match_df.set(pd.DataFrame())
-            return
-
-        unmatched_df = match_df.loc[~match_df["MaskExists"]].copy()
-        if unmatched_df.empty:
-            manual_mask_match_df.set(pd.DataFrame())
-            final_mask_match_df.set(match_df.copy())
-            print("✅ No manual matches needed.")
+            _clear_mask_selection_controls()
             return
 
         mask_name_col = input.mask_name_col() or "CellMaskName"
+
+        if "MaskExists" not in match_df.columns:
+            print("⚠️ Mask match table does not contain 'MaskExists'.")
+            manual_mask_match_df.set(pd.DataFrame())
+            final_mask_match_df.set(pd.DataFrame())
+            _clear_mask_selection_controls()
+            return
+
+        unmatched_df = match_df.loc[~match_df["MaskExists"]].copy()
+
+        if unmatched_df.empty:
+            manual_mask_match_df.set(pd.DataFrame())
+
+            final_df = match_df.copy()
+            final_mask_match_df.set(final_df)
+
+            selected_choices = (
+                list(final_df.loc[final_df["MaskExists"], mask_name_col].astype(str))
+                if not final_df.empty and mask_name_col in final_df.columns
+                else []
+            )
+
+            current_selected = input.selected_mask_name()
+            selected_default = (
+                current_selected
+                if current_selected in selected_choices
+                else (selected_choices[0] if selected_choices else None)
+            )
+
+            _update_mask_select_controls(
+                choices=selected_choices,
+                selected=selected_default,
+            )
+
+            print("✅ No manual matches needed.")
+            return
+
+        if files_df is None or files_df.empty:
+            print("⚠️ No mask files available for manual matching.")
+            return
+
         manualRows = []
 
         for i, (_, row) in enumerate(unmatched_df.iterrows()):
             selectedFile = getattr(input, f"manual_mask_match_{i}")()
+
             if not selectedFile:
                 continue
 
-            fileRow = files_df.loc[files_df["MaskFile"].astype(str) == str(selectedFile)].copy()
+            fileRow = files_df.loc[
+                files_df["MaskFile"].astype(str) == str(selectedFile)
+            ].copy()
+
             if fileRow.empty:
                 continue
 
@@ -4073,6 +4271,7 @@ def server(input, output, session):
 
         if not manual_df.empty:
             matched_names = set(manual_df[mask_name_col].astype(str))
+
             auto_df = auto_df.loc[
                 ~auto_df[mask_name_col].astype(str).isin(matched_names)
             ].copy()
@@ -4084,24 +4283,22 @@ def server(input, output, session):
         final_mask_match_df.set(final_df)
         clear_mask_render_cache("manual mask matching updated")
 
-        selected_choices = list(final_df.loc[final_df["MaskExists"], mask_name_col].astype(str)) if not final_df.empty else []
+        selected_choices = (
+            list(final_df.loc[final_df["MaskExists"], mask_name_col].astype(str))
+            if not final_df.empty and "MaskExists" in final_df.columns
+            else []
+        )
+
         current_selected = input.selected_mask_name()
-        selected_default = current_selected if current_selected in selected_choices else (selected_choices[0] if selected_choices else None)
+        selected_default = (
+            current_selected
+            if current_selected in selected_choices
+            else (selected_choices[0] if selected_choices else None)
+        )
 
-        if selected_default is not None:
-            selected_mask_match.set(
-                final_df.loc[
-                    final_df[mask_name_col].astype(str) == str(selected_default)
-                ].copy()
-            )
-        else:
-            selected_mask_match.set(pd.DataFrame())
-
-        ui.update_select(
-            "selected_mask_name",
+        _update_mask_select_controls(
             choices=selected_choices,
             selected=selected_default,
-            session=session,
         )
 
         nManual = len(manual_df)
