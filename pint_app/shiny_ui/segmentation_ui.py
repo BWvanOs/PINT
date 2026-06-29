@@ -201,9 +201,15 @@ def segmentation_panel():
                     ),
 
                     ui.input_action_button(
+                        "push_mesmer_to_clustering",
+                        "Push quantification to Clustering",
+                        class_="btn btn-success w-100 mt-2",
+                    ),
+
+                    ui.input_action_button(
                         "push_mesmer_to_mask_visualization",
                         "Push Mesmer results to Mask visualization",
-                        class_="btn btn-success w-100 mt-2",
+                        class_="btn btn-secondary w-100 mt-2",
                     ),
 
                     ui.output_ui("segmentation_quantification_summary"),

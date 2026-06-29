@@ -6,11 +6,15 @@ Added a way to visualize cellmasks in the app
 Added automated export function that export selected channels for all images
 Fixed viewer bug that would render the images under the mask visualization tab 
 
-open issues
+open issues/to do
     -If global normalization for a given channels fails it's not fed back to the user. It is stored in the resulting csv, however.
     -Winsorization floor value is not user adjustable.
     -There is this weird behaviour specifically in macOS where upon loading of the images, the interface can become unresponsive.
     -Defauls colors for the image creator become unresponsive after settting your own color. Will fix
+    -Decide on data structure for the clustering
+        -Anndata?
+        -make the push button transfer ownership of the data from segmentation to clustering to save data
+    -Let user free up RAM by removing objects. Eg masks or data tables.
 
 0.6.0.1
     -Started with manual (readme.md) on how to use it

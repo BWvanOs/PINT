@@ -165,6 +165,31 @@ def mask_visualization_panel():
 
                         ui.hr(class_="mask-divider"),
 
+                        ui.tags.div(
+                            "Mask colors",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.input_select(
+                            "mask_color_palette",
+                            "Color palette",
+                            choices={
+                                "viridis": "viridis",
+                                "plasma": "plasma",
+                                "inferno": "inferno",
+                                "magma": "magma",
+                                "cividis": "cividis",
+                                "turbo": "turbo",
+                                "custom": "custom",
+                            },
+                            selected="viridis",
+                            width="100%",
+                        ),
+
+                        ui.output_ui("mask_custom_color_ui"),
+
+                        ui.hr(class_="mask-divider"),
+
                         ui.input_action_button(
                             "export_all_mask_visualizations",
                             "Export all matched mask visualizations",

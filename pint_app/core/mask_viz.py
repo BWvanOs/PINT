@@ -149,21 +149,46 @@ def make_mask_plot_data(
     background: str = "white",
     borderColor: str = "white",
     missingColor: str = "#808080",
+    clusterColorMap: dict[str, str] | None = None,
 ) -> dict:
     """
     Convert a cell mask + matched cell annotations into an RGB image matrix and legend colors.
+
+    The global clusterColorMap is used for stable color lookup.
+    The returned clusterColors only contains clusters present in this mask,
+    so the legend does not show all possible clusters.
     """
     if clusterCol not in matchedData.columns:
         raise ValueError(f"Cluster column '{clusterCol}' not found in matchedData")
 
     labelInfo = matchedData.loc[:, ["CellValueMask", clusterCol]].copy()
     labelInfo = labelInfo.drop_duplicates(subset=["CellValueMask"])
-    labelInfo[clusterCol] = labelInfo[clusterCol].astype("string")
-    labelInfo[clusterCol] = labelInfo[clusterCol].fillna("Unknown")
-    labelInfo[clusterCol] = labelInfo[clusterCol].replace("<NA>", "Unknown")
 
-    allClusters = sorted(labelInfo[clusterCol].astype(str).unique())
-    clusterColors = make_distinct_colors(allClusters)
+    labelInfo[clusterCol] = labelInfo[clusterCol].astype("string")
+    labelInfo[clusterCol] = labelInfo[clusterCol].fillna("Unassigned")
+    labelInfo[clusterCol] = labelInfo[clusterCol].replace("<NA>", "Unassigned")
+    labelInfo[clusterCol] = labelInfo[clusterCol].astype(str).str.strip()
+
+    labelInfo.loc[
+        labelInfo[clusterCol].isin(["", "nan", "None", "NA", "<NA>"]),
+        clusterCol,
+    ] = "Unassigned"
+
+    clustersPresent = sorted(
+        labelInfo[clusterCol].astype(str).unique(),
+        key=lambda x: x.lower(),
+    )
+
+    if clusterColorMap is None:
+        lookupColors = make_distinct_colors(clustersPresent)
+    else:
+        lookupColors = dict(clusterColorMap)
+
+    # Legend colors: only clusters present in the selected mask.
+    clusterColors = {
+        clusterName: lookupColors.get(clusterName, missingColor)
+        for clusterName in clustersPresent
+    }
 
     bgRgb = np.array(to_rgb(background), dtype=float)
     borderRgb = np.array(to_rgb(borderColor), dtype=float)
@@ -178,7 +203,14 @@ def make_mask_plot_data(
     for _, row in labelInfo.iterrows():
         maskValue = int(row["CellValueMask"])
         clusterName = str(row[clusterCol])
-        rgb = clusterColors.get(clusterName, missingRgb)
+
+        colorValue = lookupColors.get(clusterName, missingColor)
+
+        try:
+            rgb = np.array(to_rgb(colorValue), dtype=float)
+        except ValueError:
+            rgb = missingRgb
+
         colorMat[cellMask == maskValue] = rgb
         assignedMaskValues.append(maskValue)
 

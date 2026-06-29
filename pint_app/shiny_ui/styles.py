@@ -435,5 +435,58 @@ def app_styles():
                 z-index: 3000 !important;
             }
                       
+            .advanced-settings-wide {
+                width: min(100%, 1850px);
+                max-width: 1850px;
+                margin-left: auto;
+                margin-right: auto;
+            }
+
+            .advanced-settings-card {
+                width: 100%;
+                border: 1px solid #dee2e6;
+                box-shadow: 0 0.15rem 0.45rem rgba(0, 0, 0, 0.08);
+            }
+
+            .advanced-settings-card .card-body {
+                width: 100%;
+                overflow: visible;
+            }
+
+            .advanced-memory-table-wrap {
+                width: 100%;
+                max-width: 100%;
+                overflow-x: auto;
+            }
+
+            .advanced-memory-table-wrap .shiny-html-output {
+                width: 100% !important;
+                display: block !important;
+                min-height: 50px;
+            }
+
+            .advanced-memory-table-wrap table {
+                display: table !important;
+                width: 100% !important;
+                table-layout: fixed;
+                border-collapse: collapse;
+                font-size: 0.86rem;
+            }
+
+            .advanced-memory-table-wrap th,
+            .advanced-memory-table-wrap td {
+                padding: 0.35rem 0.45rem;
+                vertical-align: top;
+                border-bottom: 1px solid #dee2e6;
+                white-space: normal;
+                overflow-wrap: anywhere;
+            }
+
+            .advanced-memory-table-wrap th {
+                font-weight: 750;
+                background-color: #f8f9fa;
+                text-align: left;
+            }
+                      
         """)
     )

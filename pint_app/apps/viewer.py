@@ -10,6 +10,21 @@ from shiny import App, ui, render, reactive
 from shiny.types import SilentException
 
 from scipy.ndimage import grey_opening, uniform_filter, median_filter
+from scipy import sparse
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+try:
+    import igraph as ig
+    import leidenalg
+    LEIDEN_AVAILABLE = True
+except Exception:
+    ig = None
+    leidenalg = None
+    LEIDEN_AVAILABLE = False
+
+
 import os, sys, subprocess
 import shutil
 import warnings
@@ -65,6 +80,12 @@ from pint_app.core.mask_viz import (
     make_mask_plot_data,
 )
 
+from pint_app.core.mask_colors import (
+    get_sorted_cluster_names,
+    make_palette_color_map,
+    make_custom_color_map,
+)
+
 from pint_app.core.mask_neighbors_stats import (
     chance_correct_touching_interactions,
     make_sample_interaction_matrix,
@@ -96,8 +117,10 @@ from pint_app.shiny_ui.styles import app_styles
 from pint_app.shiny_ui.creator_ui import creator_panel
 from pint_app.shiny_ui.PINT_ui import pint_panel
 from pint_app.shiny_ui.segmentation_ui import segmentation_panel
+from pint_app.shiny_ui.clustering_ui import clustering_panel
 from pint_app.shiny_ui.mask_visualization_ui import mask_visualization_panel
 from pint_app.shiny_ui.neighborhood_ui import neighborhood_panel
+from pint_app.shiny_ui.advanced_settings_ui import advanced_settings_panel
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Tight layout not applied.*")
 
@@ -132,11 +155,17 @@ app_ui = ui.page_sidebar(
                         ##------->MESMER segmentation panel of the shiny app<------##
                         segmentation_panel(),
                         
+                        ##------->Clustering and annotation panel of the shiny app<------##
+                        clustering_panel(),
+
                         ##------->Mask visulaization and niegborhood preperation panel of the shiny app<------##
                         mask_visualization_panel(),
 
                         ##------->Touching neigborhood panel of the shiny app<------##
                         neighborhood_panel(),
+  
+                        ##------->Advanced settings and memory diagnostics panel<------##
+                        advanced_settings_panel(),
                         id="viewer_mode",
                     ),
                 ),
@@ -175,6 +204,42 @@ def server(input, output, session):
     segmentation_mask_table_path = reactive.Value("")
     segmentation_quantification_status = reactive.Value("No Mesmer mask quantification run yet.")
 
+    # Shared clustering dataset state.
+    # This is intentionally one central object used by all clustering sub-tabs:
+    # Data preparation, Clustering, and Cluster names.
+    #
+    # For now this stores a pandas DataFrame from segmentation quantification.
+    # Later this will probably become a mini AnnData-like structure to include xenium:
+    #   {
+    #       "obs": cell metadata,
+    #       "X": sparse feature matrix,
+    #       "var_names": feature/channel names,
+    #       "obsm": PCA/UMAP/PaCMAP embeddings,
+    #       "source": input source,
+    #   }
+    clustering_data = reactive.Value(pd.DataFrame())
+    clustering_source = reactive.Value("")
+    clustering_status = reactive.Value("No clustering dataset loaded yet.")
+    clustering_feature_columns = reactive.Value([])
+    clustering_metadata_columns = reactive.Value([])
+    clustering_excluded_columns = reactive.Value([])
+    ##User defined column to input cluster parameters and names to plot
+    clustering_column_map = reactive.Value(pd.DataFrame(columns=["ChannelNamesForClustering", "ChannelNameToDisplay"]))
+    # PCA / clustering analysis state.
+    clustering_analysis_status = reactive.Value("No PCA or clustering run yet.")
+    clustering_feature_matrix = reactive.Value(None)
+    clustering_feature_source_columns = reactive.Value([])
+    clustering_feature_display_columns = reactive.Value([])
+    clustering_pca_scores = reactive.Value(pd.DataFrame())
+    clustering_pca_loadings = reactive.Value(pd.DataFrame())
+    clustering_pca_variance = reactive.Value(pd.DataFrame())
+    clustering_leiden_labels = reactive.Value(pd.DataFrame())
+    clustering_marker_summary = reactive.Value(pd.DataFrame())
+    # Future subclustering hook.
+    # For now None means use all cells.
+    # Later this can hold selected PINT_Cell_ID values for major-cluster subclustering. But this is for a later implementation
+    clustering_active_cell_ids = reactive.Value(None)
+
     mask_input_df = reactive.Value(pd.DataFrame())
     mask_files_df = reactive.Value(pd.DataFrame())
     mask_match_df = reactive.Value(pd.DataFrame())
@@ -200,7 +265,13 @@ def server(input, output, session):
         "This Alpha tab currently only manages optional Mesmer/DeepCell installation."
     ) 
     segmentation_input_data = reactive.Value(None) 
-        
+    
+    ##Reserved column for the clustering data table
+    PINT_CELL_ID_COL = "PINT_Cell_ID"
+    RESERVED_CLUSTERING_COLUMNS = {PINT_CELL_ID_COL}
+
+
+
     ## <----------------> Helper functions <-------------------> ##
     def _get_winsor_settings():
         """
@@ -1019,17 +1090,299 @@ def server(input, output, session):
 
         return processedImages, processedChannels
     
+    def _make_default_clustering_column_map(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Build a default clustering column map from the currently loaded table.
 
+        Reserved columns such as PINT_Cell_ID are not exported as clustering features.
+        """
+        if df is None or df.empty:
+            return pd.DataFrame(
+                columns=["ChannelNamesForClustering", "ChannelNameToDisplay"]
+            )
+
+        exportCols = [
+            c for c in df.columns
+            if c not in RESERVED_CLUSTERING_COLUMNS
+        ]
+
+        return pd.DataFrame(
+            {
+                "ChannelNamesForClustering": exportCols,
+                "ChannelNameToDisplay": exportCols,
+            }
+        )
+
+    def _parse_feature_list_text(text: str) -> list[str]:
+        """
+        Parse a user-provided feature list.
+
+        Accepts comma-separated, semicolon-separated, or newline-separated values.
+        """
+        text = str(text or "").replace(";", "\n").replace(",", "\n")
+        values = [x.strip() for x in text.splitlines()]
+        return [x for x in values if x]
+
+
+    def _get_pca_feature_map() -> pd.DataFrame:
+        """
+        Return the feature map used for PCA/clustering.
+
+        Starts from the validated clustering column map.
+        Optionally filters to a manually entered feature subset.
+        The manual list may contain either source column names or display names.
+        """
+        validMap = _get_valid_clustering_column_map()
+
+        expectedCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+
+        if validMap is None or validMap.empty:
+            return pd.DataFrame(columns=expectedCols)
+
+        featureMode = input.clustering_pca_feature_mode() or "all_mapped"
+
+        if featureMode == "manual_subset":
+            requested = _parse_feature_list_text(input.clustering_pca_feature_list())
+
+            if not requested:
+                return pd.DataFrame(columns=expectedCols)
+
+            requestedSet = set(requested)
+
+            validMap = validMap.loc[
+                validMap["ChannelNamesForClustering"].isin(requestedSet)
+                | validMap["ChannelNameToDisplay"].isin(requestedSet)
+            ].copy()
+
+        return validMap.reset_index(drop=True)
+
+    def _prepare_clustering_feature_matrix() -> tuple[np.ndarray, pd.DataFrame, list[str], list[str]]:
+        """
+        Build the numeric feature matrix for PCA/clustering.
+
+        Returns:
+        - X: numeric matrix, cells × selected features
+        - obs: dataframe with PINT_Cell_ID
+        - sourceCols: original dataframe column names
+        - displayCols: display names used in plots
+        """
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            raise ValueError("No clustering dataset loaded.")
+
+        if PINT_CELL_ID_COL not in df.columns:
+            raise ValueError("Create/validate PINT_Cell_ID before running PCA.")
+
+        featureMap = _get_pca_feature_map()
+
+        if featureMap is None or featureMap.empty:
+            raise ValueError("No valid feature columns selected for PCA/clustering.")
+
+        sourceCols = featureMap["ChannelNamesForClustering"].tolist()
+        displayCols = featureMap["ChannelNameToDisplay"].tolist()
+
+        missingCols = [c for c in sourceCols if c not in df.columns]
+        if missingCols:
+            raise ValueError(
+                "Selected feature columns are missing from clustering_data: "
+                + ", ".join(missingCols)
+            )
+
+        # Optional future subclustering.
+        activeIds = clustering_active_cell_ids.get()
+
+        if activeIds is not None:
+            activeIds = set(map(str, activeIds))
+            useDf = df.loc[df[PINT_CELL_ID_COL].astype(str).isin(activeIds)].copy()
+        else:
+            useDf = df
+
+        if useDf.empty:
+            raise ValueError("No cells available for the current clustering run.")
+
+        obs = useDf[[PINT_CELL_ID_COL]].copy()
+
+        Xdf = useDf.loc[:, sourceCols].copy()
+        Xdf = Xdf.apply(pd.to_numeric, errors="coerce")
+        Xdf = Xdf.replace([np.inf, -np.inf], np.nan)
+
+        # Drop features that are entirely missing.
+        allMissing = Xdf.columns[Xdf.isna().all()].tolist()
+        if allMissing:
+            keepMask = ~Xdf.columns.isin(allMissing)
+            Xdf = Xdf.loc[:, keepMask].copy()
+
+            featureMap = featureMap.loc[keepMask].copy()
+            sourceCols = featureMap["ChannelNamesForClustering"].tolist()
+            displayCols = featureMap["ChannelNameToDisplay"].tolist()
+
+        if Xdf.shape[1] == 0:
+            raise ValueError("No numeric feature columns remain after filtering.")
+
+        # Fill missing values by marker median.
+        medians = Xdf.median(axis=0, numeric_only=True)
+        Xdf = Xdf.fillna(medians).fillna(0)
+
+        transform = input.clustering_transform() or "asinh"
+        cofactor = float(input.clustering_asinh_cofactor() or 5)
+
+        X = Xdf.to_numpy(dtype=np.float32, copy=True)
+
+        if transform == "asinh":
+            if cofactor <= 0:
+                raise ValueError("asinh cofactor must be > 0.")
+            X = np.arcsinh(X / cofactor).astype(np.float32, copy=False)
+
+        elif transform == "log1p":
+            X = np.clip(X, a_min=0, a_max=None)
+            X = np.log1p(X).astype(np.float32, copy=False)
+
+        elif transform == "none":
+            pass
+
+        else:
+            raise ValueError(f"Unknown transform: {transform}")
+
+        if bool(input.clustering_scale_data()):
+            scaler = StandardScaler(copy=True)
+            X = scaler.fit_transform(X).astype(np.float32, copy=False)
+
+        return X, obs, sourceCols, displayCols
+
+
+    def _make_pca_loadings_grid_figure(
+        loadingsDf: pd.DataFrame,
+        *,
+        n_pcs: int = 20,
+        top_n: int = 20,
+        n_cols: int = 5,
+    ):
+        """
+        Build one multi-panel PCA loading figure.
+
+        Each panel shows the top positive and top negative feature loadings
+        for one PC, similar in spirit to Seurat's PCA loading plots.
+        """
+        if loadingsDf is None or loadingsDf.empty:
+            raise ValueError("No PCA loadings available. Run PCA first.")
+
+        if "Feature" not in loadingsDf.columns:
+            raise ValueError("PCA loadings table does not contain a Feature column.")
+
+        pcCols = [c for c in loadingsDf.columns if c.startswith("PC_")]
+
+        if not pcCols:
+            raise ValueError("No PC loading columns found.")
+
+        n_pcs = max(1, min(int(n_pcs), len(pcCols)))
+        top_n = max(1, int(top_n))
+        n_cols = max(1, int(n_cols))
+
+        usePcCols = pcCols[:n_pcs]
+
+        n_rows = int(np.ceil(len(usePcCols) / n_cols))
+
+        # Width/height chosen to keep feature labels readable.
+        fig_width = n_cols * 4.2
+        fig_height = n_rows * 6.0
+
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(fig_width, fig_height),
+            dpi=160,
+            squeeze=False,
+        )
+
+        for ax in axes.ravel():
+            ax.set_axis_off()
+
+        for i, pcCol in enumerate(usePcCols):
+            ax = axes.ravel()[i]
+            ax.set_axis_on()
+
+            temp = loadingsDf[["Feature", pcCol]].copy()
+            temp = temp.rename(columns={pcCol: "Loading"})
+            temp["Loading"] = pd.to_numeric(temp["Loading"], errors="coerce")
+            temp = temp.replace([np.inf, -np.inf], np.nan).dropna(subset=["Loading"])
+
+            if temp.empty:
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"{pcCol}\nNo valid loadings",
+                    ha="center",
+                    va="center",
+                )
+                ax.set_axis_off()
+                continue
+
+            top_pos = (
+                temp
+                .sort_values("Loading", ascending=False)
+                .head(top_n)
+            )
+
+            top_neg = (
+                temp
+                .sort_values("Loading", ascending=True)
+                .head(top_n)
+            )
+
+            plotDf = pd.concat([top_neg, top_pos], ignore_index=True)
+            plotDf = plotDf.drop_duplicates(subset=["Feature"], keep="first")
+
+            # Sort for a clean horizontal bar plot.
+            plotDf = plotDf.sort_values("Loading", ascending=True).copy()
+
+            y = np.arange(len(plotDf))
+
+            colors = [
+                "#3B528B" if v < 0 else "#8B0000"
+                for v in plotDf["Loading"]
+            ]
+
+            ax.barh(
+                y,
+                plotDf["Loading"],
+                color=colors,
+                edgecolor="none",
+            )
+
+            ax.axvline(0, color="black", linewidth=0.7)
+
+            ax.set_yticks(y)
+            ax.set_yticklabels(plotDf["Feature"], fontsize=6)
+
+            ax.tick_params(axis="x", labelsize=7)
+            ax.set_xlabel("Loading", fontsize=8)
+            ax.set_title(pcCol, fontsize=10, fontweight="bold")
+
+            # Reduce clutter.
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+        fig.suptitle(
+            f"PCA loadings | top {top_n} positive and top {top_n} negative features per PC",
+            fontsize=14,
+            y=0.995,
+        )
+
+        plt.tight_layout(rect=[0, 0, 1, 0.985])
+
+        return fig
 
 
     def _build_mask_visualization_figure(
-        maskPath: str,
-        maskName: str,
-        matchingData: pd.DataFrame,
-        clusterCol: str,
-        xCol: str,
-        yCol: str,
-        scaleFactor: int,
+            maskPath: str,
+            maskName: str,
+            matchingData: pd.DataFrame,
+            clusterCol: str,
+            xCol: str,
+            yCol: str,
+            scaleFactor: int,
+            clusterColorMap: dict[str, str] | None = None,
         ):
         cellMask = read_mask_tiff(maskPath)
 
@@ -1048,6 +1401,7 @@ def server(input, output, session):
             background="white",
             borderColor="white",
             missingColor="#808080",
+            clusterColorMap=clusterColorMap,
         )
 
         colorMat = plotData["colorMat"]
@@ -1079,7 +1433,7 @@ def server(input, output, session):
 
         handles = [
             Patch(facecolor=clusterColors[name], edgecolor="none", label=name)
-            for name in sorted(clusterColors.keys())
+            for name in sorted(clusterColors.keys(), key=lambda x: x.lower())
         ]
 
         axLeg.set_axis_off()
@@ -1116,11 +1470,14 @@ def server(input, output, session):
         xCol: str,
         yCol: str,
         scaleFactor: int,
+        clusterColorMap: dict[str, str] | None = None,
+        colorPalette: str = "viridis",
     ):
         """
         Return cached mask plot data if available; otherwise compute and cache it.
 
         The cache intentionally does not depend on browser size or browser zoom.
+        It does depend on color settings, because color changes alter the rendered image.
         """
         cacheKey = make_mask_render_cache_key(
             mask_path=maskPath,
@@ -1134,6 +1491,8 @@ def server(input, output, session):
                 "background": "white",
                 "border_color": "white",
                 "missing_color": "#808080",
+                "color_palette": str(colorPalette),
+                "cluster_color_map": clusterColorMap or {},
             },
         )
 
@@ -1161,6 +1520,7 @@ def server(input, output, session):
             background="white",
             borderColor="white",
             missingColor="#808080",
+            clusterColorMap=clusterColorMap,
         )
 
         cachedValue = {
@@ -1170,7 +1530,8 @@ def server(input, output, session):
 
         maskRenderCache.set(cacheKey, cachedValue)
         return cachedValue
-
+    
+    
     def clear_mask_render_cache(reason: str = "") -> None:
         maskRenderCache.clear()
         maskRenderDataVersion.set(maskRenderDataVersion.get() + 1)
@@ -2418,6 +2779,501 @@ def server(input, output, session):
 
         return ui.div(*parts)
 
+    @reactive.Effect
+    @reactive.event(input.load_clustering_table)
+    def _load_clustering_table():
+        table_path = (input.clustering_table_path() or "").strip()
+
+        print(f"▶️ Clustering table load requested: {table_path}", flush=True)
+
+        try:
+            if not table_path or not os.path.isfile(table_path):
+                raise ValueError(f"Invalid clustering table path: {table_path!r}")
+
+            file_size_mb = os.path.getsize(table_path) / 1024 / 1024
+
+            with ui.Progress(min=0, max=3, session=session) as p:
+                p.set(value=0, message=f"Reading clustering table ({file_size_mb:.1f} MB)...")
+
+                t0 = datetime.now()
+                df, original_name = _read_clustering_table_path(table_path)
+                t1 = datetime.now()
+
+                print(
+                    f"✅ pandas read complete in {(t1 - t0).total_seconds():.1f} sec. "
+                    f"Shape: {df.shape[0]:,} rows × {df.shape[1]:,} columns.",
+                    flush=True,
+                )
+
+                if df is None or df.empty:
+                    raise ValueError("Loaded file is empty.")
+
+                p.set(value=1, message="Storing clustering table...")
+
+                clustering_data.set(df)
+                clustering_source.set("file_path")
+                clustering_column_map.set(_make_default_clustering_column_map(df))
+
+                clustering_feature_columns.set([])
+                clustering_metadata_columns.set([])
+                clustering_excluded_columns.set([])
+
+                p.set(value=2, message="Updating Data preparation tab...")
+
+                msg = (
+                    f"Loaded clustering table '{original_name}' into Data preparation: "
+                    f"{len(df):,} rows, {len(df.columns):,} columns."
+                )
+
+                clustering_status.set(msg)
+
+                p.set(value=3, message="Done.")
+
+            ui.update_navs("viewer_mode", selected="clustering", session=session)
+            ui.update_navs("clustering_workspace_mode", selected="Data preparation", session=session)
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Could not load clustering table: {e}"
+            clustering_status.set(msg)
+            print(f"⚠️ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(input.export_clustering_column_map)
+    def _export_clustering_column_map():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            print("⚠️ No clustering dataset loaded. Load a table first.")
+            return
+
+        colMap = clustering_column_map.get()
+
+        if colMap is None or colMap.empty:
+            colMap = _make_default_clustering_column_map(df)
+            clustering_column_map.set(colMap)
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        savePath = pick_save_csv_dialog(
+            initialdir=initdir,
+            initialfile="clustering_column_map.csv",
+        )
+
+        if not savePath:
+            print("🛑 Export clustering column map canceled.")
+            return
+
+        try:
+            colMap.to_csv(savePath, index=False)
+            print(
+                f"✅ Exported clustering column map → {savePath}. "
+                f"Protected columns such as {PINT_CELL_ID_COL} were excluded."
+            )
+        except Exception as e:
+            print(f"❌ Failed to export clustering column map: {e}")
+
+
+    @reactive.Effect
+    @reactive.event(input.import_clustering_column_map)
+    def _import_clustering_column_map():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            print("⚠️ No clustering dataset loaded. Load a table before importing a column map.")
+            return
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        csvPath = pick_open_csv_dialog(initialdir=initdir)
+
+        if not csvPath:
+            print("🛑 Import clustering column map canceled.")
+            return
+
+        try:
+            colMap = pd.read_csv(csvPath)
+        except Exception as e:
+            print(f"❌ Failed to read clustering column map: {e}")
+            return
+
+        requiredCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+        missing = [c for c in requiredCols if c not in colMap.columns]
+
+        if missing:
+            print(
+                "❌ Clustering column map is missing required column(s): "
+                + ", ".join(missing)
+            )
+            return
+
+        colMap = colMap[requiredCols].copy()
+        clustering_column_map.set(colMap)
+
+        validMap = _get_valid_clustering_column_map()
+
+        print(
+            f"✅ Imported clustering column map → {csvPath}. "
+            f"{len(validMap):,} valid selected columns found in current dataset."
+        )
+
+    @reactive.Effect
+    @reactive.event(input.run_clustering_pca)
+    def _run_clustering_pca():
+        try:
+            X, obs, sourceCols, displayCols = _prepare_clustering_feature_matrix()
+
+            nCells, nFeatures = X.shape
+            requestedPcs = int(input.clustering_n_pcs() or 20)
+            nPcs = max(2, min(requestedPcs, nFeatures, nCells - 1))
+
+            if nPcs < 2:
+                raise ValueError("Need at least 2 PCs. Check number of cells/features.")
+
+            clustering_analysis_status.set(
+                f"Running PCA on {nCells:,} cells × {nFeatures:,} features..."
+            )
+
+            print(
+                f"▶️ Running PCA: {nCells:,} cells × {nFeatures:,} features, "
+                f"{nPcs} PCs.",
+                flush=True,
+            )
+
+            pca = PCA(n_components=nPcs, random_state=int(input.clustering_random_seed() or 1))
+            scores = pca.fit_transform(X)
+
+            scoreCols = [f"PC_{i}" for i in range(1, nPcs + 1)]
+
+            scoresDf = obs.copy()
+            for i, col in enumerate(scoreCols):
+                scoresDf[col] = scores[:, i].astype(np.float32)
+
+            loadingsDf = pd.DataFrame(
+                pca.components_.T,
+                columns=scoreCols,
+            )
+            loadingsDf.insert(0, "Feature", displayCols)
+            loadingsDf.insert(0, "SourceColumn", sourceCols)
+
+            varianceDf = pd.DataFrame(
+                {
+                    "PC": scoreCols,
+                    "ExplainedVarianceRatio": pca.explained_variance_ratio_,
+                    "ExplainedVariancePercent": pca.explained_variance_ratio_ * 100,
+                    "CumulativeVariancePercent": np.cumsum(pca.explained_variance_ratio_) * 100,
+                }
+            )
+
+            clustering_feature_matrix.set(X)
+            clustering_feature_source_columns.set(sourceCols)
+            clustering_feature_display_columns.set(displayCols)
+
+            clustering_pca_scores.set(scoresDf)
+            clustering_pca_loadings.set(loadingsDf)
+            clustering_pca_variance.set(varianceDf)
+
+            clustering_leiden_labels.set(pd.DataFrame())
+            clustering_marker_summary.set(pd.DataFrame())
+
+            msg = (
+                f"PCA complete: {nCells:,} cells × {nFeatures:,} features, "
+                f"{nPcs:,} PCs."
+            )
+
+            clustering_analysis_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"PCA failed: {e}"
+            clustering_analysis_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(input.export_pca_loadings_plot)
+    def _export_pca_loadings_plot():
+        loadingsDf = clustering_pca_loadings.get()
+
+        if loadingsDf is None or loadingsDf.empty:
+            msg = "No PCA loadings available. Run PCA first."
+            clustering_analysis_status.set(msg)
+            print(f"⚠️ {msg}")
+            return
+
+        try:
+            nPcs = int(input.clustering_loadings_n_pcs() or 20)
+            topN = int(input.clustering_loadings_top_n() or 20)
+
+            outDir = pick_folder_dialog()
+
+            if not outDir:
+                print("🛑 PCA loading export canceled.")
+                return
+
+            outDir = Path(outDir)
+            outDir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            outPath = outDir / f"PINT_PCA_loadings_top{topN}_{nPcs}PCs_{timestamp}.png"
+
+            fig = _make_pca_loadings_grid_figure(
+                loadingsDf,
+                n_pcs=nPcs,
+                top_n=topN,
+                n_cols=5,
+            )
+
+            fig.savefig(
+                outPath,
+                dpi=600,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+
+            csvPath = outDir / f"PINT_PCA_loadings_table_{timestamp}.csv"
+            loadingsDf.to_csv(csvPath, index=False)
+
+            msg = f"Exported PCA loading plot to: {outPath}"
+            clustering_analysis_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"PCA loading export failed: {e}"
+            clustering_analysis_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+
+    @reactive.Effect
+    @reactive.event(input.run_leiden_clustering)
+    def _run_leiden_clustering():
+        try:
+            if not LEIDEN_AVAILABLE:
+                raise ImportError(
+                    "Leiden clustering requires python-igraph and leidenalg. "
+                    "Install with: pip install python-igraph leidenalg"
+                )
+
+            pcaDf = clustering_pca_scores.get()
+
+            if pcaDf is None or pcaDf.empty:
+                raise ValueError("Run PCA before Leiden clustering.")
+
+            nDims = int(input.clustering_leiden_n_dims() or 10)
+            nNeighbors = int(input.clustering_leiden_n_neighbors() or 15)
+            resolution = float(input.clustering_leiden_resolution() or 1.0)
+            seed = int(input.clustering_random_seed() or 1)
+
+            pcCols = [c for c in pcaDf.columns if c.startswith("PC_")]
+
+            if len(pcCols) < 2:
+                raise ValueError("PCA scores do not contain enough PC columns.")
+
+            usePcCols = pcCols[: min(nDims, len(pcCols))]
+            Xpca = pcaDf.loc[:, usePcCols].to_numpy(dtype=np.float32, copy=True)
+
+            nCells = Xpca.shape[0]
+
+            if nCells < 3:
+                raise ValueError("Need at least 3 cells for graph clustering.")
+
+            nNeighbors = max(2, min(nNeighbors, nCells - 1))
+
+            clustering_analysis_status.set(
+                f"Building kNN graph using {len(usePcCols)} PCs and {nNeighbors} neighbors..."
+            )
+
+            print(
+                f"▶️ Leiden clustering: {nCells:,} cells, "
+                f"{len(usePcCols)} PCs, k={nNeighbors}, resolution={resolution}",
+                flush=True,
+            )
+
+            nn = NearestNeighbors(
+                n_neighbors=nNeighbors + 1,
+                metric="euclidean",
+                algorithm="auto",
+            )
+            nn.fit(Xpca)
+
+            distances, indices = nn.kneighbors(Xpca)
+
+            edges = []
+            weights = []
+
+            for i in range(nCells):
+                # Skip first neighbor because it is usually the cell itself.
+                for j, dist in zip(indices[i, 1:], distances[i, 1:]):
+                    if i == j:
+                        continue
+
+                    a = int(i)
+                    b = int(j)
+
+                    if a < b:
+                        edges.append((a, b))
+                    else:
+                        edges.append((b, a))
+
+                    # Convert distance to a simple positive similarity weight.
+                    weights.append(float(1.0 / (1.0 + dist)))
+
+            if not edges:
+                raise ValueError("No graph edges were created.")
+
+            edgeDf = pd.DataFrame(edges, columns=["source", "target"])
+            edgeDf["weight"] = weights
+
+            # Collapse duplicate undirected edges.
+            edgeDf = (
+                edgeDf
+                .groupby(["source", "target"], as_index=False)["weight"]
+                .max()
+            )
+
+            graph = ig.Graph(n=nCells, edges=list(map(tuple, edgeDf[["source", "target"]].to_numpy())))
+            graph.es["weight"] = edgeDf["weight"].tolist()
+
+            partition = leidenalg.find_partition(
+                graph,
+                leidenalg.RBConfigurationVertexPartition,
+                weights=graph.es["weight"],
+                resolution_parameter=resolution,
+                seed=seed,
+            )
+
+            labels = np.array(partition.membership, dtype=int)
+
+            labelsDf = pcaDf[[PINT_CELL_ID_COL]].copy()
+            labelsDf["PINT_Leiden_cluster"] = [
+                f"Cluster_{x}" for x in labels
+            ]
+
+            clustering_leiden_labels.set(labelsDf)
+
+            # Add cluster labels back to the master dataset by PINT_Cell_ID.
+            master = clustering_data.get().copy()
+
+            if "PINT_Leiden_cluster" in master.columns:
+                master = master.drop(columns=["PINT_Leiden_cluster"])
+
+            master = master.merge(
+                labelsDf,
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+
+            clustering_data.set(master)
+
+            nClusters = labelsDf["PINT_Leiden_cluster"].nunique()
+
+            msg = (
+                f"Leiden clustering complete: {nCells:,} cells, "
+                f"{nClusters:,} clusters."
+            )
+
+            clustering_analysis_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Leiden clustering failed: {e}"
+            clustering_analysis_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @output
+    @render.data_frame
+    def clustering_pca_variance_preview():
+        df = clustering_pca_variance.get()
+
+        if df is None or df.empty:
+            empty = pd.DataFrame({"Message": ["No PCA variance available yet."]})
+            return render.DataGrid(empty, height="250px", filters=False)
+
+        show = df.copy()
+        numCols = show.select_dtypes(include=["number"]).columns
+        show[numCols] = show[numCols].round(3)
+
+        return render.DataGrid(show, height="300px", filters=False)
+
+
+    @output
+    @render.data_frame
+    def clustering_leiden_counts_preview():
+        labelsDf = clustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            empty = pd.DataFrame({"Message": ["No Leiden clusters available yet."]})
+            return render.DataGrid(empty, height="250px", filters=False)
+
+        out = (
+            labelsDf
+            .groupby("PINT_Leiden_cluster", sort=False)
+            .size()
+            .reset_index(name="n_cells")
+            .sort_values("PINT_Leiden_cluster")
+        )
+
+        return render.DataGrid(out, height="300px", filters=False)
+
+
+    @output
+    @render.plot
+    def clustering_pca_plot():
+        pcaDf = clustering_pca_scores.get()
+        labelsDf = clustering_leiden_labels.get()
+
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=140)
+
+        if pcaDf is None or pcaDf.empty:
+            ax.text(0.5, 0.5, "Run PCA to show PC plot", ha="center", va="center")
+            ax.set_axis_off()
+            return fig
+
+        plotDf = pcaDf.copy()
+
+        if labelsDf is not None and not labelsDf.empty:
+            plotDf = plotDf.merge(labelsDf, on=PINT_CELL_ID_COL, how="left")
+        else:
+            plotDf["PINT_Leiden_cluster"] = "Unclustered"
+
+        if "PC_1" not in plotDf.columns or "PC_2" not in plotDf.columns:
+            ax.text(0.5, 0.5, "PC_1 / PC_2 not available", ha="center", va="center")
+            ax.set_axis_off()
+            return fig
+
+        clusters = plotDf["PINT_Leiden_cluster"].fillna("Unclustered").astype(str)
+        clusterCodes, clusterNames = pd.factorize(clusters)
+
+        ax.scatter(
+            plotDf["PC_1"],
+            plotDf["PC_2"],
+            c=clusterCodes,
+            s=float(input.clustering_plot_point_size() or 2),
+            alpha=float(input.clustering_plot_alpha() or 0.7),
+            cmap=input.clustering_scatter_palette() or "viridis",
+            linewidths=0,
+        )
+
+        ax.set_xlabel("PC 1")
+        ax.set_ylabel("PC 2")
+        ax.set_title("PCA")
+
+        return fig
+
 
     @reactive.Effect
     @reactive.event(input.push_mesmer_to_mask_visualization)
@@ -2544,6 +3400,160 @@ def server(input, output, session):
             f"✅ Pushed Mesmer results to Mask visualization: "
             f"{len(cellDf):,} cells across {len(finalMaskDf):,} masks."
         )
+
+    @reactive.Effect
+    @reactive.event(input.push_mesmer_to_clustering)
+    def _push_mesmer_to_clustering():
+        cellDf = segmentation_cell_table.get()
+
+        if cellDf is None or cellDf.empty:
+            msg = "No segmentation quantification available. Run 'Create cell table from Mesmer masks' first."
+            clustering_status.set(msg)
+            print(f"⚠️ {msg}")
+            return
+
+        # Do not copy here.
+        # This avoids duplicating a potentially large segmentation quantification table.
+        clustering_data.set(cellDf)
+        clustering_source.set("segmentation_quantification")
+        clustering_column_map.set(_make_default_clustering_column_map(cellDf))
+
+        # Clear column-role guesses for now.
+        clustering_feature_columns.set([])
+        clustering_metadata_columns.set([])
+        clustering_excluded_columns.set([])
+
+        sourcePath = segmentation_cell_table_path.get()
+
+        msg = (
+            f"Loaded segmentation quantification into Clustering: "
+            f"{len(cellDf):,} cells, {len(cellDf.columns):,} columns."
+        )
+
+        if sourcePath:
+            msg += f" Source table: {sourcePath}"
+
+        clustering_status.set(msg)
+
+        ui.update_navs("viewer_mode", selected="clustering", session=session)
+        ui.update_navs("clustering_workspace_mode", selected="Data preparation", session=session)
+
+        print(f"✅ {msg}")
+
+    
+    def _read_clustering_table_path(path: str):
+        """
+        Read a clustering table directly from disk.
+
+        This avoids Shiny/browser upload overhead and is much better for large
+        cell-by-marker tables.
+        """
+        path = str(path or "").strip()
+
+        if not path:
+            raise ValueError("No clustering table path provided.")
+
+        if not os.path.isfile(path):
+            raise ValueError(f"File does not exist: {path}")
+
+        name_lower = path.lower()
+        original_name = os.path.basename(path)
+
+        if name_lower.endswith(".csv"):
+            df = pd.read_csv(path, low_memory=False)
+        elif name_lower.endswith(".tsv") or name_lower.endswith(".txt"):
+            df = pd.read_csv(path, sep="\t", low_memory=False)
+        else:
+            df = pd.read_csv(path, sep=None, engine="python")
+
+        return df, original_name
+
+
+    def _get_valid_clustering_column_map() -> pd.DataFrame:
+        """
+        Return a cleaned column map containing only columns that exist in clustering_data.
+        """
+        df = clustering_data.get()
+        colMap = clustering_column_map.get()
+
+        expectedCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+
+        if df is None or df.empty:
+            return pd.DataFrame(columns=expectedCols)
+
+        if colMap is None or colMap.empty:
+            return pd.DataFrame(columns=expectedCols)
+
+        missing = [c for c in expectedCols if c not in colMap.columns]
+        if missing:
+            return pd.DataFrame(columns=expectedCols)
+
+        out = colMap[expectedCols].copy()
+
+        out["ChannelNamesForClustering"] = (
+            out["ChannelNamesForClustering"]
+            .astype(str)
+            .str.strip()
+        )
+
+        out["ChannelNameToDisplay"] = (
+            out["ChannelNameToDisplay"]
+            .astype(str)
+            .str.strip()
+        )
+
+        # Remove empty rows.
+        out = out.loc[out["ChannelNamesForClustering"] != ""].copy()
+
+        # Keep only columns actually present in the loaded table.
+        # Keep only columns actually present in the loaded table.
+        availableCols = set(df.columns)
+        out = out.loc[out["ChannelNamesForClustering"].isin(availableCols)].copy()
+
+        # Never allow protected structural columns to become clustering features.
+        out = out.loc[
+            ~out["ChannelNamesForClustering"].isin(RESERVED_CLUSTERING_COLUMNS)
+        ].copy()
+
+        # If display name is empty, fall back to the source column name.
+        emptyDisplay = out["ChannelNameToDisplay"] == ""
+        out.loc[emptyDisplay, "ChannelNameToDisplay"] = out.loc[
+            emptyDisplay,
+            "ChannelNamesForClustering"
+        ]
+
+        # Avoid duplicate source columns.
+        out = out.drop_duplicates(subset=["ChannelNamesForClustering"], keep="first")
+
+        return out.reset_index(drop=True)
+
+
+    def _build_selected_clustering_dataset() -> pd.DataFrame:
+        """
+        Build the selected marker/channel table for clustering preview.
+
+        The protected PINT_Cell_ID is shown first in the preview but is not part
+        of the clustering feature map.
+        """
+        df = clustering_data.get()
+        colMap = _get_valid_clustering_column_map()
+
+        if df is None or df.empty or colMap.empty:
+            return pd.DataFrame()
+
+        if PINT_CELL_ID_COL not in df.columns:
+            return pd.DataFrame()
+
+        sourceCols = colMap["ChannelNamesForClustering"].tolist()
+        displayCols = colMap["ChannelNameToDisplay"].tolist()
+
+        selected = df.loc[:, [PINT_CELL_ID_COL] + sourceCols].copy()
+
+        # Red marker is visual only. The real master-data column remains PINT_Cell_ID.
+        selected.columns = ["🔴 PINT_Cell_ID"] + displayCols
+
+        return selected
+
 
 
     @output
@@ -3201,6 +4211,124 @@ def server(input, output, session):
             session=session,
         )
 
+    @reactive.calc
+    def active_mask_cluster_color_map() -> dict[str, str]:
+        df = mask_input_df.get()
+
+        if df is None or df.empty:
+            return {}
+
+        clusterCol = input.mask_cluster_col()
+
+        if not clusterCol or clusterCol not in df.columns:
+            return {}
+
+        clusterNames = get_sorted_cluster_names(df[clusterCol])
+        paletteName = input.mask_color_palette() or "viridis"
+
+        if paletteName == "custom":
+            return make_custom_color_map(
+                clusterNames,
+                input,
+                default_color="#808080",
+            )
+
+        return make_palette_color_map(
+            clusterNames,
+            paletteName,
+        )
+
+    @output
+    @render.ui
+    def mask_custom_color_ui():
+        df = mask_input_df.get()
+
+        if df is None or df.empty:
+            return ui.tags.small(
+                "Load a cell table first.",
+                class_="text-muted",
+            )
+
+        clusterCol = input.mask_cluster_col()
+
+        if not clusterCol or clusterCol not in df.columns:
+            return ui.tags.small(
+                "Select a cluster column first.",
+                class_="text-muted",
+            )
+
+        clusterNames = get_sorted_cluster_names(df[clusterCol])
+
+        if len(clusterNames) == 0:
+            return ui.tags.small(
+                "No cluster names found.",
+                class_="text-muted",
+            )
+
+        rows = [
+            ui.tags.small(
+                "Custom colors are used when the color palette is set to custom.",
+                class_="text-muted",
+            ),
+            ui.tags.div(
+                f"Clusters found: {len(clusterNames):,}",
+                class_="compact-small-line mb-2",
+            ),
+        ]
+
+        for i, clusterName in enumerate(clusterNames):
+            inputId = f"mask_cluster_color_{i}"
+
+            # Preserve existing color if the UI is rebuilt.
+            try:
+                currentValue = getattr(input, inputId)()
+            except Exception:
+                currentValue = None
+
+            if not currentValue:
+                currentValue = "#808080"
+
+            rows.append(
+                ui.row(
+                    ui.column(
+                        7,
+                        ui.tags.div(
+                            clusterName,
+                            class_="small",
+                            title=clusterName,
+                            style=(
+                                "white-space: nowrap; "
+                                "overflow: hidden; "
+                                "text-overflow: ellipsis;"
+                            ),
+                        ),
+                    ),
+                    ui.column(
+                        5,
+                        ui.tags.input(
+                            id=inputId,
+                            type="color",
+                            value=currentValue,
+                            oninput=(
+                                f"Shiny.setInputValue('{inputId}', this.value, "
+                                "{priority: 'event'});"
+                            ),
+                            onchange=(
+                                f"Shiny.setInputValue('{inputId}', this.value, "
+                                "{priority: 'event'});"
+                            ),
+                            style="width: 100%; height: 32px;",
+                        ),
+                    ),
+                    class_="gx-1 gy-1 align-items-center",
+                )
+            )
+
+        return ui.tags.div(
+            *rows,
+            class_="compact-stack",
+            style="max-height: 350px; overflow-y: auto;",
+        )
 
     @output
     @render.plot
@@ -3279,6 +4407,9 @@ def server(input, output, session):
                 axLeg.set_axis_off()
                 return fig
 
+            clusterColorMap = active_mask_cluster_color_map()
+            colorPalette = input.mask_color_palette() or "viridis"
+
             try:
                 cachedMask = _get_cached_mask_plot_data(
                     maskPath=str(maskPath),
@@ -3288,8 +4419,9 @@ def server(input, output, session):
                     xCol=xCol,
                     yCol=yCol,
                     scaleFactor=scaleFactor,
+                    clusterColorMap=clusterColorMap,
+                    colorPalette=colorPalette,
                 )
-
                 plotData = cachedMask["plotData"]
                 matchedData = cachedMask["matchedData"]
 
@@ -3311,7 +4443,7 @@ def server(input, output, session):
             clusterColors = plotData["clusterColors"]
             handles = [
                 Patch(facecolor=clusterColors[name], edgecolor="none", label=name)
-                for name in sorted(clusterColors.keys())
+                for name in sorted(clusterColors.keys(), key=lambda x: x.lower())
             ]
 
             axLeg.set_axis_off()
@@ -3405,13 +4537,445 @@ def server(input, output, session):
             ),
         )
 
-
     @output
     @render.text
     def mesmer_backend_detail():
         return mesmer_backend_detail_text.get()
 
 
+    @reactive.Effect
+    @reactive.event(input.browse_clustering_table)
+    def _browse_clustering_table():
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        csv_path = pick_open_csv_dialog(initialdir=initdir)
+
+        if not csv_path:
+            print("🛑 Clustering table selection canceled.")
+            return
+
+        session.send_input_message("clustering_table_path", {"value": csv_path})
+
+
+    @output
+    @render.ui
+    def clustering_data_summary():
+        df = clustering_data.get()
+        status = clustering_status.get()
+        source = clustering_source.get()
+
+        parts = [
+            ui.tags.div(status, class_="compact-small-line"),
+        ]
+
+        if source:
+            parts.append(
+                ui.tags.div(
+                    f"Source: {source}",
+                    class_="compact-small-line",
+                )
+            )
+
+        if df is None or df.empty:
+            parts.append(
+                ui.tags.div(
+                    "No shared clustering dataset available yet.",
+                    class_="compact-small-line text-muted",
+                )
+            )
+            return ui.div(*parts)
+
+        parts.extend(
+            [
+                ui.tags.div(f"Rows/cells: {len(df):,}", class_="compact-small-line"),
+                ui.tags.div(f"Columns: {len(df.columns):,}", class_="compact-small-line"),
+            ]
+        )
+
+        return ui.div(*parts)
+
+    @output
+    @render.data_frame
+    def clustering_data_preview():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            empty = pd.DataFrame(
+                {
+                    "Message": [
+                        "No clustering dataset loaded yet. Load a table or push segmentation quantification to Clustering."
+                    ]
+                }
+            )
+            return render.DataGrid(empty, height="400px")
+
+        # Show only a small preview. This avoids rendering a huge table in the browser.
+        show = df.head(100).copy()
+
+        # Round numeric values in the preview only.
+        # This does NOT modify clustering_data.
+        numCols = show.select_dtypes(include=["number"]).columns
+
+        if len(numCols) > 0:
+            show[numCols] = show[numCols].round(4)
+
+        return render.DataGrid(
+            show,
+            height="500px",
+            filters=False,
+        )
+    
+    @output
+    @render.ui
+    def clustering_cell_id_controls():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            return ui.tags.small(
+                "Load a clustering dataset first.",
+                class_="text-muted",
+            )
+
+        colNames = list(df.columns)
+        method = input.clustering_cell_id_method() or "combine"
+
+        if method == "existing":
+            return ui.div(
+                ui.input_select(
+                    "clustering_existing_cell_id_col",
+                    "Existing unique ID column",
+                    choices=colNames,
+                    selected=colNames[0] if colNames else None,
+                )
+            )
+
+        if method == "combine":
+            defaultCols = [
+                c for c in ["SampleName", "CellMaskName", "ObjectNumber"]
+                if c in colNames
+            ]
+
+            if not defaultCols:
+                defaultCols = colNames[:2]
+
+            return ui.div(
+                ui.input_selectize(
+                    "clustering_cell_id_component_cols",
+                    "Columns to combine into PINT_Cell_ID",
+                    choices=colNames,
+                    selected=defaultCols,
+                    multiple=True,
+                ),
+
+                ui.input_text(
+                    "clustering_cell_id_separator",
+                    "Separator",
+                    value="__",
+                ),
+            )
+
+        return ui.div(
+            ui.tags.small(
+                "PINT will create IDs from row order. This is useful for testing, "
+                "but less stable than using biological/sample/cell columns.",
+                class_="text-muted",
+            )
+        )
+    
+    def _validate_pint_cell_id_column(df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        Validate that PINT_Cell_ID exists and uniquely identifies every row.
+        """
+        if df is None or df.empty:
+            return False, "No clustering dataset loaded."
+
+        if PINT_CELL_ID_COL not in df.columns:
+            return False, f"{PINT_CELL_ID_COL} does not exist."
+
+        ids_raw = df[PINT_CELL_ID_COL]
+        ids = ids_raw.astype(str).str.strip()
+
+        n_rows = len(ids)
+        n_missing = int(ids_raw.isna().sum())
+        n_empty = int((ids == "").sum())
+        n_unique = int(ids.nunique(dropna=False))
+        n_duplicate_rows = int(n_rows - n_unique)
+
+        if n_missing > 0:
+            return False, f"{PINT_CELL_ID_COL} contains {n_missing:,} missing value(s)."
+
+        if n_empty > 0:
+            return False, f"{PINT_CELL_ID_COL} contains {n_empty:,} empty value(s)."
+
+        if n_unique != n_rows:
+            return (
+                False,
+                f"{PINT_CELL_ID_COL} is not unique: "
+                f"{n_unique:,} unique IDs for {n_rows:,} rows "
+                f"({n_duplicate_rows:,} duplicate row(s))."
+            )
+
+        return True, f"{PINT_CELL_ID_COL} is valid for {n_rows:,} rows."
+
+
+    @reactive.Effect
+    @reactive.event(input.create_clustering_cell_id)
+    def _create_clustering_cell_id():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            msg = "No clustering dataset loaded. Load a table first."
+            print(f"⚠️ {msg}")
+            clustering_status.set(msg)
+            return
+
+        method = input.clustering_cell_id_method() or "combine"
+
+        try:
+            df_new = df.copy()
+
+            if method == "existing":
+                col = input.clustering_existing_cell_id_col()
+
+                if not col or col not in df_new.columns:
+                    raise ValueError("Select a valid existing ID column.")
+
+                ids = df_new[col].astype(str).str.strip()
+
+            elif method == "combine":
+                cols = input.clustering_cell_id_component_cols()
+
+                if isinstance(cols, str):
+                    cols = [cols]
+                elif cols is None:
+                    cols = []
+                else:
+                    cols = list(cols)
+
+                if len(cols) < 2:
+                    raise ValueError("Select at least two columns to create a combined cell ID.")
+
+                missing_cols = [c for c in cols if c not in df_new.columns]
+                if missing_cols:
+                    raise ValueError(
+                        "Selected ID component column(s) are missing: "
+                        + ", ".join(missing_cols)
+                    )
+
+                sep = input.clustering_cell_id_separator() or "__"
+
+                component_df = df_new.loc[:, cols].copy()
+
+                if component_df.isna().any().any():
+                    missing_counts = component_df.isna().sum()
+                    missing_counts = missing_counts.loc[missing_counts > 0]
+                    detail = ", ".join(
+                        f"{col}: {int(n):,}"
+                        for col, n in missing_counts.items()
+                    )
+                    raise ValueError(
+                        "Cannot create combined PINT_Cell_ID because selected columns "
+                        f"contain missing values: {detail}"
+                    )
+
+                ids = component_df.astype(str).apply(
+                    lambda row: sep.join(v.strip() for v in row),
+                    axis=1,
+                )
+
+            elif method == "row_order":
+                n = len(df_new)
+                width = max(9, len(str(n)))
+
+                ids = pd.Series(
+                    [f"PINT_Cell_{i:0{width}d}" for i in range(1, n + 1)],
+                    index=df_new.index,
+                )
+
+            else:
+                raise ValueError(f"Unknown Cell ID method: {method}")
+
+            df_new[PINT_CELL_ID_COL] = ids.astype(str)
+
+            ok, msg = _validate_pint_cell_id_column(df_new)
+
+            if not ok:
+                raise ValueError(msg)
+
+            # Add/update only the protected ID column.
+            # All original columns are retained.
+            clustering_data.set(df_new)
+
+            # Refresh the default map after creating PINT_Cell_ID.
+            # The map helper should exclude PINT_Cell_ID.
+            clustering_column_map.set(_make_default_clustering_column_map(df_new))
+
+            clustering_status.set(msg)
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            msg = f"Could not create PINT_Cell_ID: {e}"
+            clustering_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @output
+    @render.ui
+    def clustering_cell_id_summary():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            return ui.tags.small(
+                "No clustering dataset loaded yet.",
+                class_="text-muted",
+            )
+
+        if PINT_CELL_ID_COL not in df.columns:
+            return ui.div(
+                ui.tags.div(
+                    "PINT_Cell_ID has not been created yet.",
+                    class_="compact-small-line text-muted",
+                ),
+                ui.tags.small(
+                    "Create a unique cell identifier before selecting columns for PCA, PaCMAP, or clustering.",
+                    class_="text-muted",
+                ),
+            )
+
+        ids = df[PINT_CELL_ID_COL].astype(str)
+
+        nRows = len(ids)
+        nUnique = ids.nunique(dropna=False)
+        nMissing = int(df[PINT_CELL_ID_COL].isna().sum())
+        nEmpty = int((ids.str.strip() == "").sum())
+        nDuplicateRows = int(nRows - nUnique)
+
+        isValid = (
+            nRows > 0
+            and nMissing == 0
+            and nEmpty == 0
+            and nUnique == nRows
+        )
+
+        if isValid:
+            return ui.div(
+                ui.tags.div(
+                    "PINT_Cell_ID status: valid",
+                    class_="compact-small-line text-success",
+                ),
+                ui.tags.div(
+                    f"Rows: {nRows:,}",
+                    class_="compact-small-line",
+                ),
+                ui.tags.div(
+                    f"Unique IDs: {nUnique:,}",
+                    class_="compact-small-line",
+                ),
+                ui.tags.div(
+                    "Missing/empty IDs: 0",
+                    class_="compact-small-line",
+                ),
+            )
+
+        return ui.div(
+            ui.tags.div(
+                "PINT_Cell_ID status: invalid",
+                class_="compact-small-line text-danger",
+            ),
+            ui.tags.div(
+                f"Rows: {nRows:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.div(
+                f"Unique IDs: {nUnique:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.div(
+                f"Missing IDs: {nMissing:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.div(
+                f"Empty IDs: {nEmpty:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.div(
+                f"Duplicate rows: {nDuplicateRows:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.small(
+                "Use an existing unique column, or combine columns such as SampleName + ObjectNumber.",
+                class_="text-muted",
+            ),
+        )
+
+    @output
+    @render.ui
+    def clustering_column_map_summary():
+        df = clustering_data.get()
+        colMap = clustering_column_map.get()
+        validMap = _get_valid_clustering_column_map()
+
+        if df is None or df.empty:
+            return ui.tags.small(
+                "No clustering dataset loaded yet.",
+                class_="text-muted",
+            )
+
+        nMapped = 0 if colMap is None or colMap.empty else len(colMap)
+        nValid = len(validMap)
+        nTotal = len(df.columns)
+
+        return ui.div(
+            ui.tags.div(
+                f"Current dataset columns: {nTotal:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.div(
+                f"Rows in column map: {nMapped:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.div(
+                f"Valid selected columns for clustering: {nValid:,}",
+                class_="compact-small-line",
+            ),
+            ui.tags.small(
+                "Only columns listed in the imported column map and present in the loaded table "
+                "will be used for clustering.",
+                class_="text-muted",
+            ),
+        )
+
+
+    @output
+    @render.data_frame
+    def selected_clustering_data_preview():
+        selected = _build_selected_clustering_dataset()
+
+        if selected is None or selected.empty:
+            empty = pd.DataFrame(
+                {
+                    "Message": [
+                        "No selected clustering dataset yet. Export, edit, and import a clustering column map first."
+                    ]
+                }
+            )
+            return render.DataGrid(empty, height="300px", filters=False)
+
+        show = selected.head(100).copy()
+
+        numCols = show.select_dtypes(include=["number"]).columns
+        if len(numCols) > 0:
+            show[numCols] = show[numCols].round(4)
+
+        return render.DataGrid(
+            show,
+            height="350px",
+            filters=False,
+        )
+
+
+    
     @output
     @render.ui
     def neighborhood_touching_summary():
@@ -3859,6 +5423,8 @@ def server(input, output, session):
 
         nMasks = len(exportDf)
 
+        clusterColorMap = active_mask_cluster_color_map()
+
         with ui.Progress(min=0, max=nMasks, session=session) as p:
             done = 0
 
@@ -3891,6 +5457,7 @@ def server(input, output, session):
                         xCol=xCol,
                         yCol=yCol,
                         scaleFactor=scaleFactor,
+                        clusterColorMap=clusterColorMap,
                     )
 
                     safeName = "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in maskName)
@@ -4366,5 +5933,315 @@ def server(input, output, session):
                 "sample_col": sampleCol,
             },
         }
+
+    ## <----------------> Advanced settings / memory helpers <-------------------> ##
+    def _format_bytes(n_bytes):
+        """
+        Convert a byte count into a readable string.
+        """
+        if n_bytes is None:
+            return "unknown"
+
+        try:
+            n_bytes = float(n_bytes)
+        except Exception:
+            return "unknown"
+
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = n_bytes
+
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{size:.0f} {unit}"
+                return f"{size:.2f} {unit}"
+            size /= 1024
+
+        return f"{size:.2f} TB"
+
+
+    def _estimate_object_size(obj, seen=None):
+        """
+        Estimate memory used by common PINT objects.
+
+        This is intentionally conservative and avoids expensive deep inspection
+        where possible.
+
+        Handles:
+        - pandas DataFrame / Series
+        - NumPy arrays
+        - scipy sparse matrices
+        - dictionaries/lists/tuples containing those objects
+        - generic Python objects via sys.getsizeof fallback
+        """
+        if obj is None:
+            return 0
+
+        if seen is None:
+            seen = set()
+
+        obj_id = id(obj)
+        if obj_id in seen:
+            return 0
+        seen.add(obj_id)
+
+        # pandas tables
+        if isinstance(obj, pd.DataFrame):
+            return int(obj.memory_usage(index=True, deep=True).sum())
+
+        if isinstance(obj, pd.Series):
+            return int(obj.memory_usage(index=True, deep=True))
+
+        # NumPy arrays
+        if isinstance(obj, np.ndarray):
+            return int(obj.nbytes)
+
+        # Sparse matrices, relevant for future Xenium-style workflows
+        if sparse.issparse(obj):
+            total = 0
+            for attr in ("data", "indices", "indptr"):
+                arr = getattr(obj, attr, None)
+                if arr is not None:
+                    total += int(arr.nbytes)
+            return total
+
+        # Dictionaries, for example the loaded image library:
+        # {image_name: numpy array}
+        if isinstance(obj, dict):
+            total = sys.getsizeof(obj)
+            for key, value in obj.items():
+                total += _estimate_object_size(key, seen)
+                total += _estimate_object_size(value, seen)
+            return int(total)
+
+        # Lists/tuples/sets
+        if isinstance(obj, (list, tuple, set)):
+            total = sys.getsizeof(obj)
+            for item in obj:
+                total += _estimate_object_size(item, seen)
+            return int(total)
+
+        # Fallback for other Python objects
+        try:
+            return int(sys.getsizeof(obj))
+        except Exception:
+            return 0
+
+
+    def _describe_object(obj):
+        """
+        Return a compact human-readable description of an object.
+        """
+        if obj is None:
+            return "None"
+
+        if isinstance(obj, pd.DataFrame):
+            return f"DataFrame: {len(obj):,} rows × {len(obj.columns):,} columns"
+
+        if isinstance(obj, pd.Series):
+            return f"Series: {len(obj):,} values"
+
+        if isinstance(obj, np.ndarray):
+            return f"NumPy array: shape={obj.shape}, dtype={obj.dtype}"
+
+        if sparse.issparse(obj):
+            return f"Sparse matrix: shape={obj.shape}, nnz={obj.nnz:,}, dtype={obj.dtype}"
+
+        if isinstance(obj, dict):
+            return f"dict: {len(obj):,} entries"
+
+        if isinstance(obj, (list, tuple, set)):
+            return f"{type(obj).__name__}: {len(obj):,} entries"
+
+        return type(obj).__name__
+
+
+    def _memory_row(name, obj, note=""):
+        """
+        Build one row for the advanced memory table.
+        """
+        size_bytes = _estimate_object_size(obj)
+
+        return {
+            "Object": name,
+            "Loaded": "Yes" if obj is not None and not (
+                isinstance(obj, pd.DataFrame) and obj.empty
+            ) and not (
+                isinstance(obj, dict) and len(obj) == 0
+            ) else "No",
+            "Estimated size": _format_bytes(size_bytes),
+            "Bytes": size_bytes,
+            "Description": _describe_object(obj),
+            "Note": note,
+        }
+
+    @output
+    @render.table
+    def advanced_object_memory_table():
+        rows = []
+
+        rows.append(
+            _memory_row(
+                "Loaded image library",
+                images.get(),
+                "Main dictionary of loaded IMC image arrays.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Channel names",
+                channels.get(),
+                "Dictionary linking images to channel names.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Parameter table",
+                params_df.get(),
+                "Current per-channel processing parameters shown in the sidebar.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Segmentation Mesmer mask",
+                segmentation_mesmer_mask.get(),
+                "Most recent Mesmer mask array loaded/generated in the segmentation tab.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Segmentation Mesmer result",
+                segmentation_mesmer_result.get(),
+                "Full Mesmer result object, if stored.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Segmentation batch results",
+                segmentation_mesmer_batch_results.get(),
+                "Table of batch Mesmer segmentation results.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Segmentation quantification dataframe",
+                segmentation_cell_table.get(),
+                "Cell-level quantification table generated from segmentation masks.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Segmentation statistics / mask table",
+                segmentation_mask_table.get(),
+                "Mask-level statistics table generated during quantification.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Mask input table",
+                mask_input_df.get(),
+                "Loaded cell table for mask visualization.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Mask files table",
+                mask_files_df.get(),
+                "Detected mask files.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Final mask match table",
+                final_mask_match_df.get(),
+                "Final mapping between cell tables and mask files.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Neighborhood input data",
+                neighborhood_input_data.get(),
+                "Dataset pushed into the neighborhood analysis workflow.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Neighborhood touching edges",
+                neighborhood_touching_edges.get(),
+                "Cell-cell touching edge table.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Neighborhood matched cells",
+                neighborhood_matched_cells.get(),
+                "Cells matched to touching/neighborhood data.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Neighborhood touching results",
+                neighborhood_touching_results.get(),
+                "Chance-corrected neighborhood interaction results.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Neighborhood sample matrix",
+                neighborhood_sample_matrix.get(),
+                "Sample-level interaction matrix.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Neighborhood PERMANOVA results",
+                neighborhood_permanova_results.get(),
+                "PERMANOVA output table.",
+            )
+        )
+
+
+        rows.append(
+            _memory_row(
+                "Clustering dataset",
+                clustering_data.get(),
+                "Shared clustering dataset used by Data preparation, Clustering, and Cluster names.",
+            )
+        )
+
+        out = pd.DataFrame(rows)
+
+        # Sort largest objects to the top.
+        out = out.sort_values("Bytes", ascending=False)
+
+        # Keep raw bytes for sorting/debugging but put it near the end.
+        out = out[
+            [
+                "Object",
+                "Loaded",
+                "Estimated size",
+                "Description",
+                "Note",
+                "Bytes",
+            ]
+        ]
+
+        return out
 
 app = App(app_ui, server)
