@@ -23,7 +23,12 @@ except Exception:
     ig = None
     leidenalg = None
     LEIDEN_AVAILABLE = False
-
+try:
+    import pacmap
+    PACMAP_AVAILABLE = True
+except Exception:
+    pacmap = None
+    PACMAP_AVAILABLE = False
 
 import os, sys, subprocess
 import shutil
@@ -235,10 +240,13 @@ def server(input, output, session):
     clustering_pca_variance = reactive.Value(pd.DataFrame())
     clustering_leiden_labels = reactive.Value(pd.DataFrame())
     clustering_marker_summary = reactive.Value(pd.DataFrame())
+    clustering_pacmap_embedding = reactive.Value(pd.DataFrame())
+    clustering_annotation_status = reactive.Value("No annotation visualizations generated yet.")
     # Future subclustering hook.
     # For now None means use all cells.
     # Later this can hold selected PINT_Cell_ID values for major-cluster subclustering. But this is for a later implementation
     clustering_active_cell_ids = reactive.Value(None)
+    clustering_cluster_name_map = reactive.Value(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
 
     mask_input_df = reactive.Value(pd.DataFrame())
     mask_files_df = reactive.Value(pd.DataFrame())
@@ -1373,6 +1381,607 @@ def server(input, output, session):
 
         return fig
 
+
+    def _make_unique_names(names: list[str]) -> list[str]:
+        """
+        Make display names unique while preserving readability.
+        """
+        counts = {}
+        out = []
+
+        for name in names:
+            base = str(name)
+            if base not in counts:
+                counts[base] = 1
+                out.append(base)
+            else:
+                counts[base] += 1
+                out.append(f"{base}_{counts[base]}")
+
+        return out
+
+
+    def _cluster_sort_key(value):
+        """
+        Sort Cluster_2 before Cluster_10.
+        Falls back to lowercase string sorting.
+        """
+        value = str(value)
+
+        if value.startswith("Cluster_"):
+            try:
+                return (0, int(value.replace("Cluster_", "")))
+            except Exception:
+                pass
+
+        return (1, value.lower())
+
+
+    def _get_heatmap_feature_map() -> pd.DataFrame:
+        """
+        Return marker/channel feature map for cluster heatmaps.
+
+        This can use all mapped clustering features, or a manually entered subset.
+        """
+        validMap = _get_valid_clustering_column_map()
+
+        expectedCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+
+        if validMap is None or validMap.empty:
+            return pd.DataFrame(columns=expectedCols)
+
+        mode = input.clustering_heatmap_feature_mode() or "all_mapped"
+
+        if mode == "manual_subset":
+            requested = _parse_feature_list_text(input.clustering_heatmap_feature_list())
+
+            if not requested:
+                return pd.DataFrame(columns=expectedCols)
+
+            requestedSet = set(requested)
+
+            validMap = validMap.loc[
+                validMap["ChannelNamesForClustering"].isin(requestedSet)
+                | validMap["ChannelNameToDisplay"].isin(requestedSet)
+            ].copy()
+
+        return validMap.reset_index(drop=True)
+
+
+    def _build_cluster_marker_matrix() -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Build cluster × marker matrix from current Leiden clusters.
+
+        Returns:
+        - plotMatrix: cluster-indexed matrix used for plotting
+        - summaryDf: same data with cluster column included, used for CSV/preview
+        """
+        df = clustering_data.get()
+        labelsDf = clustering_leiden_labels.get()
+
+        if df is None or df.empty:
+            raise ValueError("No clustering dataset loaded.")
+
+        if PINT_CELL_ID_COL not in df.columns:
+            raise ValueError("PINT_Cell_ID is missing. Create/validate cell IDs first.")
+
+        if labelsDf is None or labelsDf.empty:
+            raise ValueError("No Leiden clusters available. Run Leiden clustering first.")
+
+        featureMap = _get_heatmap_feature_map()
+
+        if featureMap is None or featureMap.empty:
+            raise ValueError("No valid marker/channel features selected for the heatmap.")
+
+        sourceCols = featureMap["ChannelNamesForClustering"].tolist()
+        displayCols = _make_unique_names(featureMap["ChannelNameToDisplay"].tolist())
+
+        missingCols = [c for c in sourceCols if c not in df.columns]
+        if missingCols:
+            raise ValueError(
+                "Heatmap feature columns are missing from clustering_data: "
+                + ", ".join(missingCols)
+            )
+
+        useDf = df[[PINT_CELL_ID_COL] + sourceCols].copy()
+
+        # Attach Leiden labels by stable ID.
+        useDf = useDf.merge(
+            labelsDf[[PINT_CELL_ID_COL, "PINT_Leiden_cluster"]],
+            on=PINT_CELL_ID_COL,
+            how="inner",
+        )
+
+        if useDf.empty:
+            raise ValueError("No cells matched between clustering_data and Leiden labels.")
+
+        for col in sourceCols:
+            useDf[col] = pd.to_numeric(useDf[col], errors="coerce")
+
+        useDf[sourceCols] = useDf[sourceCols].replace([np.inf, -np.inf], np.nan)
+
+        aggregationMode = input.clustering_heatmap_aggregation() or "mean"
+
+        if aggregationMode == "median":
+            summary = (
+                useDf
+                .groupby("PINT_Leiden_cluster", sort=False)[sourceCols]
+                .median()
+            )
+        else:
+            summary = (
+                useDf
+                .groupby("PINT_Leiden_cluster", sort=False)[sourceCols]
+                .mean()
+            )
+
+        # Sort cluster rows naturally.
+        sortedClusters = sorted(summary.index.tolist(), key=_cluster_sort_key)
+        summary = summary.loc[sortedClusters].copy()
+
+        # Rename columns to display names.
+        summary.columns = displayCols
+
+        heatmapMode = input.clustering_heatmap_mode() or "absolute"
+
+        if heatmapMode == "zscore":
+            z = summary.copy()
+
+            markerMean = z.mean(axis=0)
+            markerStd = z.std(axis=0).replace(0, np.nan)
+
+            z = (z - markerMean) / markerStd
+            z = z.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+            zClip = float(input.clustering_heatmap_z_clip() or 2)
+            if zClip > 0:
+                z = z.clip(lower=-zClip, upper=zClip)
+
+            plotMatrix = z
+
+        elif heatmapMode == "absolute":
+            plotMatrix = summary.copy()
+
+        else:
+            raise ValueError(f"Unknown heatmap mode: {heatmapMode}")
+
+        summaryDf = plotMatrix.reset_index().rename(columns={"PINT_Leiden_cluster": "Cluster"})
+
+        return plotMatrix, summaryDf
+
+    def _get_equal_axis_plot_geometry(
+        plotDf: pd.DataFrame,
+        x_col: str,
+        y_col: str,
+        *,
+        width_px: int = 800,
+        min_height_px: int = 350,
+        max_height_px: int = 1100,
+    ) -> tuple[tuple[float, float], tuple[float, float], int]:
+        """
+        Calculate rounded x/y limits and a plot height that preserves equal axis scaling.
+
+        Example:
+        If x ranges from -21.4 to 24.5, limits become -23 to 26.
+        The height is scaled from the y/x range while keeping fixed plot width.
+        """
+        if plotDf is None or plotDf.empty:
+            return (-1.0, 1.0), (-1.0, 1.0), 500
+
+        x = pd.to_numeric(plotDf[x_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        y = pd.to_numeric(plotDf[y_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+        valid = x.notna() & y.notna()
+
+        if not valid.any():
+            return (-1.0, 1.0), (-1.0, 1.0), 500
+
+        x = x.loc[valid]
+        y = y.loc[valid]
+
+        x_min = float(np.floor(x.min()) - 1)
+        x_max = float(np.ceil(x.max()) + 1)
+
+        y_min = float(np.floor(y.min()) - 1)
+        y_max = float(np.ceil(y.max()) + 1)
+
+        if x_max <= x_min:
+            x_min -= 1
+            x_max += 1
+
+        if y_max <= y_min:
+            y_min -= 1
+            y_max += 1
+
+        x_span = x_max - x_min
+        y_span = y_max - y_min
+
+        height_px = int(round(width_px * (y_span / x_span)))
+        height_px = max(min_height_px, min(max_height_px, height_px))
+
+        return (x_min, x_max), (y_min, y_max), height_px
+
+    def _get_embedding_plot_width_px() -> int:
+        """
+        Shared display width for PCA and PaCMAP plots.
+
+        Keeps the plot large enough on wide screens without forcing full-width stretching.
+        """
+        try:
+            widthPx = int(input.clustering_embedding_plot_width() or 1200)
+        except Exception:
+            widthPx = 1200
+
+        return max(600, min(1800, widthPx))
+
+
+    def _make_cluster_marker_heatmap_figure(
+        plotMatrix: pd.DataFrame,
+        *,
+        palette: str = "viridis",
+        title: str = "Cluster marker heatmap",
+    ):
+        """
+        Create a marker × cluster heatmap figure.
+
+        Input plotMatrix is cluster × marker.
+        For display, it is transposed so:
+        - X axis = clusters
+        - Y axis = markers/channels
+        """
+        if plotMatrix is None or plotMatrix.empty:
+            raise ValueError("No heatmap matrix available.")
+
+        displayMatrix = plotMatrix.T.copy()
+
+        values = displayMatrix.to_numpy(dtype=float)
+
+        nMarkers, nClusters = values.shape
+
+        figWidth = max(6.0, min(24.0, 2.0 + nClusters * 0.45))
+        figHeight = max(6.0, min(30.0, 2.0 + nMarkers * 0.32))
+
+        fig, ax = plt.subplots(figsize=(figWidth, figHeight), dpi=200)
+
+        heatmapMode = input.clustering_heatmap_mode() or "absolute"
+
+        if heatmapMode == "zscore":
+            zClip = float(input.clustering_heatmap_z_clip() or 2)
+            vmin = -zClip if zClip > 0 else None
+            vmax = zClip if zClip > 0 else None
+        else:
+            vmin = None
+            vmax = None
+
+        im = ax.imshow(
+            values,
+            aspect="auto",
+            interpolation="nearest",
+            cmap=palette,
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+        ax.set_xticks(np.arange(nClusters))
+        ax.set_xticklabels(
+            displayMatrix.columns.astype(str).tolist(),
+            rotation=90,
+            fontsize=8,
+        )
+
+        ax.set_yticks(np.arange(nMarkers))
+        ax.set_yticklabels(
+            displayMatrix.index.astype(str).tolist(),
+            fontsize=8,
+        )
+
+        ax.set_xlabel("Leiden cluster")
+        ax.set_ylabel("Marker / channel")
+        ax.set_title(title)
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+
+        if heatmapMode == "zscore":
+            cbar.set_label("Z-score")
+        else:
+            cbar.set_label("Expression")
+
+        plt.tight_layout()
+
+        return fig
+
+    def _get_current_leiden_cluster_names() -> list[str]:
+        """
+        Return current original PINT Leiden cluster names.
+        """
+        labelsDf = clustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            return []
+
+        if "PINT_Leiden_cluster" not in labelsDf.columns:
+            return []
+
+        names = labelsDf["PINT_Leiden_cluster"].dropna().astype(str).unique().tolist()
+        return sorted(names, key=_cluster_sort_key)
+
+
+    def _get_cluster_name_lookup() -> dict[str, str]:
+        """
+        Return mapping from original PINT cluster name to user annotation.
+        """
+        nameMap = clustering_cluster_name_map.get()
+
+        if nameMap is None or nameMap.empty:
+            return {}
+
+        required = ["OldClusterName", "NewClusterName"]
+        if any(c not in nameMap.columns for c in required):
+            return {}
+
+        clean = nameMap[required].copy()
+        clean["OldClusterName"] = clean["OldClusterName"].astype(str).str.strip()
+        clean["NewClusterName"] = clean["NewClusterName"].astype(str).str.strip()
+
+        clean = clean.loc[clean["OldClusterName"] != ""].copy()
+        clean = clean.loc[clean["NewClusterName"] != ""].copy()
+
+        clean = clean.drop_duplicates(subset=["OldClusterName"], keep="first")
+
+        return dict(zip(clean["OldClusterName"], clean["NewClusterName"]))
+
+
+    def _get_annotated_cluster_labels() -> pd.DataFrame:
+        """
+        Return PINT_Cell_ID + original Leiden cluster + user-facing cluster name.
+        """
+        labelsDf = clustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            return pd.DataFrame(
+                columns=[PINT_CELL_ID_COL, "PINT_Leiden_cluster", "PINT_ClusterName"]
+            )
+
+        if "PINT_Leiden_cluster" not in labelsDf.columns:
+            return pd.DataFrame(
+                columns=[PINT_CELL_ID_COL, "PINT_Leiden_cluster", "PINT_ClusterName"]
+            )
+
+        lookup = _get_cluster_name_lookup()
+
+        out = labelsDf[[PINT_CELL_ID_COL, "PINT_Leiden_cluster"]].copy()
+        out["PINT_Leiden_cluster"] = out["PINT_Leiden_cluster"].astype(str)
+
+        out["PINT_ClusterName"] = out["PINT_Leiden_cluster"].map(lookup)
+        out["PINT_ClusterName"] = out["PINT_ClusterName"].fillna(out["PINT_Leiden_cluster"])
+
+        return out
+
+
+    def _get_annotation_cluster_names() -> list[str]:
+        """
+        Return current display cluster names after annotation mapping.
+        """
+        annDf = _get_annotated_cluster_labels()
+
+        if annDf is None or annDf.empty:
+            return []
+
+        names = annDf["PINT_ClusterName"].dropna().astype(str).unique().tolist()
+        return sorted(names, key=lambda x: x.lower())
+
+
+    def _sync_cluster_annotations_to_master() -> None:
+        """
+        Add/update PINT_ClusterName in clustering_data using PINT_Cell_ID.
+        """
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            return
+
+        annDf = _get_annotated_cluster_labels()
+
+        if annDf is None or annDf.empty:
+            return
+
+        master = df.copy()
+
+        dropCols = [c for c in ["PINT_ClusterName"] if c in master.columns]
+        if dropCols:
+            master = master.drop(columns=dropCols)
+
+        master = master.merge(
+            annDf[[PINT_CELL_ID_COL, "PINT_ClusterName"]],
+            on=PINT_CELL_ID_COL,
+            how="left",
+        )
+
+        clustering_data.set(master)
+
+    def _build_full_annotation_export_table() -> pd.DataFrame:
+        """
+        Build full cell-level annotation export table.
+
+        Includes:
+        - original clustering_data
+        - PINT_Leiden_cluster
+        - PINT_ClusterName
+        - PaCMAP_1 / PaCMAP_2 if available
+        """
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            raise ValueError("No clustering dataset loaded.")
+
+        if PINT_CELL_ID_COL not in df.columns:
+            raise ValueError("PINT_Cell_ID is missing. Create/validate cell IDs first.")
+
+        out = df.copy()
+
+        annDf = _get_annotated_cluster_labels()
+
+        if annDf is not None and not annDf.empty:
+            dropCols = [
+                c for c in ["PINT_Leiden_cluster", "PINT_ClusterName"]
+                if c in out.columns
+            ]
+
+            if dropCols:
+                out = out.drop(columns=dropCols)
+
+            out = out.merge(
+                annDf[[PINT_CELL_ID_COL, "PINT_Leiden_cluster", "PINT_ClusterName"]],
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+
+        embDf = clustering_pacmap_embedding.get()
+
+        if embDf is not None and not embDf.empty:
+            dropCols = [
+                c for c in ["PaCMAP_1", "PaCMAP_2"]
+                if c in out.columns
+            ]
+
+            if dropCols:
+                out = out.drop(columns=dropCols)
+
+            out = out.merge(
+                embDf[[PINT_CELL_ID_COL, "PaCMAP_1", "PaCMAP_2"]],
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+
+        return out
+
+    def _make_pacmap_publication_figure(
+        *,
+        width_in: float = 8,
+        dpi: int = 1000,
+        include_legend: bool = True,
+    ):
+        """
+        Build a publication/export PaCMAP figure.
+
+        Uses the current PaCMAP embedding, annotated cluster names, and active color map.
+        """
+        embDf = clustering_pacmap_embedding.get()
+
+        if embDf is None or embDf.empty:
+            raise ValueError("No PaCMAP embedding available. Run PaCMAP first.")
+
+        plotDf = embDf.copy()
+
+        annDf = _get_annotated_cluster_labels()
+
+        if annDf is not None and not annDf.empty:
+            plotDf = plotDf.merge(
+                annDf[[PINT_CELL_ID_COL, "PINT_Leiden_cluster", "PINT_ClusterName"]],
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+        else:
+            plotDf["PINT_Leiden_cluster"] = "Unclustered"
+            plotDf["PINT_ClusterName"] = "Unclustered"
+
+        plotDf["PINT_Leiden_cluster"] = (
+            plotDf["PINT_Leiden_cluster"]
+            .fillna("Unclustered")
+            .astype(str)
+        )
+
+        plotDf["PINT_ClusterName"] = (
+            plotDf["PINT_ClusterName"]
+            .fillna(plotDf["PINT_Leiden_cluster"])
+            .fillna("Unclustered")
+            .astype(str)
+        )
+
+        # Use export width to calculate proportional height.
+        widthPx = int(float(width_in) * int(dpi))
+
+        xlim, ylim, heightPx = _get_equal_axis_plot_geometry(
+            plotDf,
+            "PaCMAP_1",
+            "PaCMAP_2",
+            width_px=widthPx,
+            min_height_px=int(3 * dpi),
+            max_height_px=int(20 * dpi),
+        )
+
+        height_in = heightPx / dpi
+
+        fig, ax = plt.subplots(
+            figsize=(float(width_in), height_in),
+            dpi=dpi,
+        )
+
+        colorMap = active_annotation_cluster_color_map()
+
+        if not colorMap:
+            clusterNames = sorted(
+                plotDf["PINT_ClusterName"].dropna().astype(str).unique().tolist(),
+                key=lambda x: x.lower(),
+            )
+
+            colorMap = make_palette_color_map(
+                clusterNames,
+                input.annotation_cluster_color_palette() or "viridis",
+            )
+
+        pointColors = (
+            plotDf["PINT_ClusterName"]
+            .map(colorMap)
+            .fillna("#808080")
+            .tolist()
+        )
+
+        ax.scatter(
+            plotDf["PaCMAP_1"],
+            plotDf["PaCMAP_2"],
+            c=pointColors,
+            s=float(input.clustering_pacmap_point_size() or 2),
+            alpha=float(input.clustering_pacmap_alpha() or 0.7),
+            linewidths=0,
+            rasterized=True,
+        )
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
+
+        ax.set_xlabel("PaCMAP 1")
+        ax.set_ylabel("PaCMAP 2")
+        ax.set_title("PaCMAP embedding")
+
+        clusterNames = sorted(
+            plotDf["PINT_ClusterName"].dropna().astype(str).unique().tolist(),
+            key=lambda x: x.lower(),
+        )
+
+        if include_legend and 0 < len(clusterNames) <= 40:
+            handles = [
+                Patch(
+                    facecolor=colorMap.get(name, "#808080"),
+                    edgecolor="none",
+                    label=name,
+                )
+                for name in clusterNames
+            ]
+
+            ax.legend(
+                handles=handles,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                frameon=False,
+                fontsize=7,
+                markerscale=3,
+            )
+
+        plt.tight_layout()
+
+        return fig
 
     def _build_mask_visualization_figure(
             maskPath: str,
@@ -2981,6 +3590,8 @@ def server(input, output, session):
 
             clustering_leiden_labels.set(pd.DataFrame())
             clustering_marker_summary.set(pd.DataFrame())
+            clustering_pacmap_embedding.set(pd.DataFrame())
+            clustering_annotation_status.set("PCA was rerun. Run Leiden/PaCMAP again for updated annotation visualizations.")
 
             msg = (
                 f"PCA complete: {nCells:,} cells × {nFeatures:,} features, "
@@ -2997,6 +3608,57 @@ def server(input, output, session):
             msg = f"PCA failed: {e}"
             clustering_analysis_status.set(msg)
             print(f"❌ {msg}", flush=True)
+
+    @output
+    @render.ui
+    def clustering_pca_plot_ui():
+        pcaDf = clustering_pca_scores.get()
+
+        widthPx = _get_embedding_plot_width_px()
+        heightPx = 500
+
+        if pcaDf is not None and not pcaDf.empty and {"PC_1", "PC_2"}.issubset(pcaDf.columns):
+            _, _, heightPx = _get_equal_axis_plot_geometry(
+                pcaDf,
+                "PC_1",
+                "PC_2",
+                width_px=widthPx,
+            )
+
+        return ui.tags.div(
+            ui.output_plot(
+                "clustering_pca_plot",
+                width=f"{widthPx}px",
+                height=f"{heightPx}px",
+            ),
+            style="max-width: 100%; overflow-x: auto;",
+        )
+
+
+    @output
+    @render.ui
+    def clustering_pacmap_plot_ui():
+        embDf = clustering_pacmap_embedding.get()
+
+        widthPx = _get_embedding_plot_width_px()
+        heightPx = 500
+
+        if embDf is not None and not embDf.empty and {"PaCMAP_1", "PaCMAP_2"}.issubset(embDf.columns):
+            _, _, heightPx = _get_equal_axis_plot_geometry(
+                embDf,
+                "PaCMAP_1",
+                "PaCMAP_2",
+                width_px=widthPx,
+            )
+
+        return ui.tags.div(
+            ui.output_plot(
+                "clustering_pacmap_plot",
+                width=f"{widthPx}px",
+                height=f"{heightPx}px",
+            ),
+            style="max-width: 100%; overflow-x: auto;",
+        )
 
     @reactive.Effect
     @reactive.event(input.export_pca_loadings_plot)
@@ -3236,9 +3898,8 @@ def server(input, output, session):
         pcaDf = clustering_pca_scores.get()
         labelsDf = clustering_leiden_labels.get()
 
-        fig, ax = plt.subplots(figsize=(8, 6), dpi=140)
-
         if pcaDf is None or pcaDf.empty:
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
             ax.text(0.5, 0.5, "Run PCA to show PC plot", ha="center", va="center")
             ax.set_axis_off()
             return fig
@@ -3251,9 +3912,24 @@ def server(input, output, session):
             plotDf["PINT_Leiden_cluster"] = "Unclustered"
 
         if "PC_1" not in plotDf.columns or "PC_2" not in plotDf.columns:
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
             ax.text(0.5, 0.5, "PC_1 / PC_2 not available", ha="center", va="center")
             ax.set_axis_off()
             return fig
+
+        widthPx = _get_embedding_plot_width_px()
+
+        xlim, ylim, heightPx = _get_equal_axis_plot_geometry(
+            plotDf,
+            "PC_1",
+            "PC_2",
+            width_px=widthPx,
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(widthPx / 100, heightPx / 100),
+            dpi=100,
+        )
 
         clusters = plotDf["PINT_Leiden_cluster"].fillna("Unclustered").astype(str)
         clusterCodes, clusterNames = pd.factorize(clusters)
@@ -3268,13 +3944,631 @@ def server(input, output, session):
             linewidths=0,
         )
 
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
+
         ax.set_xlabel("PC 1")
         ax.set_ylabel("PC 2")
         ax.set_title("PCA")
 
+        plt.tight_layout()
+
         return fig
 
+    @reactive.Effect
+    @reactive.event(input.run_clustering_pacmap)
+    def _run_clustering_pacmap():
+        try:
+            if not PACMAP_AVAILABLE:
+                raise ImportError(
+                    "PaCMAP requires the pacmap package. Install with: pip install pacmap"
+                )
 
+            pcaDf = clustering_pca_scores.get()
+
+            if pcaDf is None or pcaDf.empty:
+                raise ValueError("Run PCA before PaCMAP.")
+
+            pcCols = [c for c in pcaDf.columns if c.startswith("PC_")]
+
+            if len(pcCols) < 2:
+                raise ValueError("PCA scores do not contain enough PC columns.")
+
+            nDims = int(input.clustering_pacmap_n_dims() or 10)
+            usePcCols = pcCols[: min(nDims, len(pcCols))]
+
+            Xpca = pcaDf.loc[:, usePcCols].to_numpy(dtype=np.float32, copy=True)
+
+            nNeighbors = int(input.clustering_pacmap_n_neighbors() or 10)
+            mnRatio = float(input.clustering_pacmap_mn_ratio() or 0.5)
+            fpRatio = float(input.clustering_pacmap_fp_ratio() or 2.0)
+            seed = int(input.clustering_random_seed() or 1)
+
+            nCells = Xpca.shape[0]
+
+            if nCells < 3:
+                raise ValueError("Need at least 3 cells for PaCMAP.")
+
+            clustering_annotation_status.set(
+                f"Running PaCMAP on {nCells:,} cells using {len(usePcCols)} PCs..."
+            )
+
+            print(
+                f"▶️ Running PaCMAP: {nCells:,} cells, "
+                f"{len(usePcCols)} PCs, n_neighbors={nNeighbors}, "
+                f"MN_ratio={mnRatio}, FP_ratio={fpRatio}",
+                flush=True,
+            )
+
+            reducer = pacmap.PaCMAP(
+                n_components=2,
+                n_neighbors=nNeighbors,
+                MN_ratio=mnRatio,
+                FP_ratio=fpRatio,
+                random_state=seed,
+            )
+
+            embedding = reducer.fit_transform(Xpca, init="pca")
+
+            embDf = pcaDf[[PINT_CELL_ID_COL]].copy()
+            embDf["PaCMAP_1"] = embedding[:, 0].astype(np.float32)
+            embDf["PaCMAP_2"] = embedding[:, 1].astype(np.float32)
+
+            clustering_pacmap_embedding.set(embDf)
+
+            # Add PaCMAP columns back to master clustering_data.
+            master = clustering_data.get().copy()
+
+            dropCols = [c for c in ["PaCMAP_1", "PaCMAP_2"] if c in master.columns]
+            if dropCols:
+                master = master.drop(columns=dropCols)
+
+            master = master.merge(
+                embDf,
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+
+            clustering_data.set(master)
+
+            msg = f"PaCMAP complete: {nCells:,} cells using {len(usePcCols)} PCs."
+            clustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"PaCMAP failed: {e}"
+            clustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(input.export_cluster_heatmap)
+    def _export_cluster_heatmap():
+        try:
+            plotMatrix, summaryDf = _build_cluster_marker_matrix()
+
+            palette = input.clustering_heatmap_palette() or "viridis"
+            heatmapMode = input.clustering_heatmap_mode() or "absolute"
+            aggregationMode = input.clustering_heatmap_aggregation() or "mean"
+
+            outDir = pick_folder_dialog()
+
+            if not outDir:
+                print("🛑 Cluster heatmap export canceled.")
+                return
+
+            outDir = Path(outDir)
+            outDir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            stem = f"PINT_cluster_heatmap_{aggregationMode}_{heatmapMode}_{palette}_{timestamp}"
+
+            pngPath = outDir / f"{stem}.png"
+            csvPath = outDir / f"{stem}.csv"
+
+            title = f"Leiden cluster marker heatmap | {aggregationMode} | {heatmapMode}"
+
+            fig = _make_cluster_marker_heatmap_figure(
+                plotMatrix,
+                palette=palette,
+                title=title,
+            )
+
+            fig.savefig(
+                pngPath,
+                dpi=400,
+                bbox_inches="tight",
+            )
+
+            plt.close(fig)
+
+            summaryDf.to_csv(csvPath, index=False)
+
+            clustering_marker_summary.set(summaryDf)
+
+            msg = f"Exported cluster heatmap to: {pngPath}; matrix to: {csvPath}"
+            clustering_annotation_status.set(msg)
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Cluster heatmap export failed: {e}"
+            clustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+
+    @output
+    @render.ui
+    def clustering_annotation_summary():
+        embDf = clustering_pacmap_embedding.get()
+        markerDf = clustering_marker_summary.get()
+        status = clustering_annotation_status.get()
+
+        parts = [
+            ui.tags.div(status, class_="compact-small-line"),
+        ]
+
+        if embDf is not None and not embDf.empty:
+            parts.append(
+                ui.tags.div(
+                    f"PaCMAP cells: {len(embDf):,}",
+                    class_="compact-small-line",
+                )
+            )
+
+        if markerDf is not None and not markerDf.empty:
+            nClusters = markerDf["Cluster"].nunique() if "Cluster" in markerDf.columns else len(markerDf)
+            nMarkers = max(0, len(markerDf.columns) - 1)
+            parts.append(
+                ui.tags.div(
+                    f"Last heatmap matrix: {nClusters:,} clusters × {nMarkers:,} markers",
+                    class_="compact-small-line",
+                )
+            )
+
+        return ui.div(*parts)
+
+
+    @output
+    @render.plot
+    def clustering_pacmap_plot():
+        embDf = clustering_pacmap_embedding.get()
+
+        if embDf is None or embDf.empty:
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
+            ax.text(0.5, 0.5, "Run PaCMAP to show embedding", ha="center", va="center")
+            ax.set_axis_off()
+            return fig
+
+        plotDf = embDf.copy()
+
+        annDf = _get_annotated_cluster_labels()
+
+        if annDf is not None and not annDf.empty:
+            plotDf = plotDf.merge(
+                annDf[[PINT_CELL_ID_COL, "PINT_Leiden_cluster", "PINT_ClusterName"]],
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+        else:
+            plotDf["PINT_Leiden_cluster"] = "Unclustered"
+            plotDf["PINT_ClusterName"] = "Unclustered"
+
+        plotDf["PINT_Leiden_cluster"] = (
+            plotDf["PINT_Leiden_cluster"]
+            .fillna("Unclustered")
+            .astype(str)
+        )
+
+        plotDf["PINT_ClusterName"] = (
+            plotDf["PINT_ClusterName"]
+            .fillna(plotDf["PINT_Leiden_cluster"])
+            .fillna("Unclustered")
+            .astype(str)
+        )
+
+        widthPx = _get_embedding_plot_width_px()
+
+        xlim, ylim, heightPx = _get_equal_axis_plot_geometry(
+            plotDf,
+            "PaCMAP_1",
+            "PaCMAP_2",
+            width_px=widthPx,
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(widthPx / 100, heightPx / 100),
+            dpi=100,
+        )
+
+        colorMap = active_annotation_cluster_color_map()
+
+        if not colorMap:
+            clusterNames = sorted(
+                plotDf["PINT_ClusterName"].dropna().astype(str).unique().tolist(),
+                key=lambda x: x.lower(),
+            )
+
+            colorMap = make_palette_color_map(
+                clusterNames,
+                input.annotation_cluster_color_palette() or "viridis",
+            )
+
+        pointColors = (
+            plotDf["PINT_ClusterName"]
+            .map(colorMap)
+            .fillna("#808080")
+            .tolist()
+        )
+
+        ax.scatter(
+            plotDf["PaCMAP_1"],
+            plotDf["PaCMAP_2"],
+            c=pointColors,
+            s=float(input.clustering_pacmap_point_size() or 2),
+            alpha=float(input.clustering_pacmap_alpha() or 0.7),
+            linewidths=0,
+        )
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
+
+        ax.set_xlabel("PaCMAP 1")
+        ax.set_ylabel("PaCMAP 2")
+        ax.set_title("PaCMAP embedding")
+
+        clusterNames = sorted(
+            plotDf["PINT_ClusterName"].dropna().astype(str).unique().tolist(),
+            key=lambda x: x.lower(),
+        )
+
+        if 0 < len(clusterNames) <= 30:
+            handles = [
+                Patch(
+                    facecolor=colorMap.get(name, "#808080"),
+                    edgecolor="none",
+                    label=name,
+                )
+                for name in clusterNames
+            ]
+
+            ax.legend(
+                handles=handles,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                frameon=False,
+                fontsize=8,
+                markerscale=3,
+            )
+
+        plt.tight_layout()
+
+        return fig
+
+    @reactive.Effect
+    @reactive.event(input.export_pacmap_figure)
+    def _export_pacmap_figure():
+        try:
+            embDf = clustering_pacmap_embedding.get()
+
+            if embDf is None or embDf.empty:
+                raise ValueError("No PaCMAP embedding available. Run PaCMAP first.")
+
+            outDir = pick_folder_dialog()
+
+            if not outDir:
+                print("🛑 PaCMAP figure export canceled.")
+                return
+
+            outDir = Path(outDir)
+            outDir.mkdir(parents=True, exist_ok=True)
+
+            dpi = int(input.annotation_export_dpi() or 1000)
+            dpi = max(100, min(2000, dpi))
+
+            widthIn = float(input.annotation_export_width() or 8)
+            widthIn = max(2, min(20, widthIn))
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            pngPath = outDir / f"PINT_PaCMAP_embedding_{timestamp}.png"
+            svgPath = outDir / f"PINT_PaCMAP_embedding_{timestamp}.svg"
+
+            fig = _make_pacmap_publication_figure(
+                width_in=widthIn,
+                dpi=dpi,
+                include_legend=True,
+            )
+
+            fig.savefig(
+                pngPath,
+                dpi=dpi,
+                bbox_inches="tight",
+            )
+
+            fig.savefig(
+                svgPath,
+                format="svg",
+                bbox_inches="tight",
+            )
+
+            plt.close(fig)
+
+            msg = f"Exported PaCMAP figure to: {pngPath}; {svgPath}"
+            clustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"PaCMAP figure export failed: {e}"
+            clustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(input.export_annotation_csv)
+    def _export_annotation_csv():
+        try:
+            outDf = _build_full_annotation_export_table()
+
+            outDir = pick_folder_dialog()
+
+            if not outDir:
+                print("🛑 Annotation CSV export canceled.")
+                return
+
+            outDir = Path(outDir)
+            outDir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            csvPath = outDir / f"PINT_clustering_annotation_export_{timestamp}.csv"
+
+            outDf.to_csv(csvPath, index=False)
+
+            msg = (
+                f"Exported annotation CSV to: {csvPath}. "
+                f"Rows: {len(outDf):,}; columns: {len(outDf.columns):,}."
+            )
+
+            colorMap = active_annotation_cluster_color_map()
+
+            if colorMap:
+                colorDf = pd.DataFrame(
+                    {
+                        "PINT_ClusterName": list(colorMap.keys()),
+                        "Color": list(colorMap.values()),
+                    }
+                )
+
+                colorPath = outDir / f"PINT_cluster_color_map_{timestamp}.csv"
+                colorDf.to_csv(colorPath, index=False)
+
+                msg += f" Color map: {colorPath}."
+
+            clustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Annotation CSV export failed: {e}"
+            clustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+
+    @output
+    @render.data_frame
+    def clustering_marker_summary_preview():
+        df = clustering_marker_summary.get()
+
+        if df is None or df.empty:
+            empty = pd.DataFrame({"Message": ["No heatmap matrix generated yet."]})
+            return render.DataGrid(empty, height="250px", filters=False)
+
+        show = df.copy()
+
+        numCols = show.select_dtypes(include=["number"]).columns
+        if len(numCols) > 0:
+            show[numCols] = show[numCols].round(3)
+
+        return render.DataGrid(show, height="300px", filters=False)
+
+    @reactive.Effect
+    @reactive.event(input.export_cluster_name_template)
+    def _export_cluster_name_template():
+        clusterNames = _get_current_leiden_cluster_names()
+
+        if not clusterNames:
+            msg = "No Leiden clusters available. Run Leiden clustering first."
+            clustering_annotation_status.set(msg)
+            print(f"⚠️ {msg}")
+            return
+
+        templateDf = pd.DataFrame(
+            {
+                "OldClusterName": clusterNames,
+                "NewClusterName": clusterNames,
+            }
+        )
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        savePath = pick_save_csv_dialog(
+            initialdir=initdir,
+            initialfile="PINT_cluster_name_template.csv",
+        )
+
+        if not savePath:
+            print("🛑 Cluster-name template export canceled.")
+            return
+
+        try:
+            templateDf.to_csv(savePath, index=False)
+
+            msg = f"Exported cluster-name template to: {savePath}"
+            clustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            msg = f"Could not export cluster-name template: {e}"
+            clustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @output
+    @render.data_frame
+    def clustering_cluster_name_map_preview():
+        annDf = _get_annotated_cluster_labels()
+
+        if annDf is None or annDf.empty:
+            empty = pd.DataFrame(
+                {"Message": ["No cluster annotations available. Run Leiden clustering first."]}
+            )
+            return render.DataGrid(empty, height="220px", filters=False)
+
+        out = (
+            annDf
+            .groupby(["PINT_Leiden_cluster", "PINT_ClusterName"], sort=False)
+            .size()
+            .reset_index(name="n_cells")
+            .sort_values("PINT_Leiden_cluster", key=lambda s: s.map(_cluster_sort_key))
+        )
+
+        return render.DataGrid(out, height="260px", filters=False)
+
+
+    @reactive.Effect
+    @reactive.event(input.import_cluster_name_map)
+    def _import_cluster_name_map():
+        labelsDf = clustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            msg = "No Leiden clusters available. Run Leiden clustering before importing annotations."
+            clustering_annotation_status.set(msg)
+            print(f"⚠️ {msg}")
+            return
+
+        folder = last_loaded_folder.get() or (input.path() or "").strip()
+        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+
+        csvPath = pick_open_csv_dialog(initialdir=initdir)
+
+        if not csvPath:
+            print("🛑 Cluster-name map import canceled.")
+            return
+
+        try:
+            raw = pd.read_csv(csvPath)
+
+            # Accept a few common variants, but normalize internally.
+            normalizedCols = {
+                c.lower().replace(" ", "").replace("_", ""): c
+                for c in raw.columns
+            }
+
+            oldCol = None
+            newCol = None
+
+            for key in ["oldclustername", "oldcluster", "pintleidencluster", "cluster", "oldname"]:
+                if key in normalizedCols:
+                    oldCol = normalizedCols[key]
+                    break
+
+            for key in ["newclustername", "newcluster", "clustername", "annotation", "newname"]:
+                if key in normalizedCols:
+                    newCol = normalizedCols[key]
+                    break
+
+            if oldCol is None or newCol is None:
+                raise ValueError(
+                    "Cluster-name CSV must contain columns OldClusterName and NewClusterName."
+                )
+
+            nameMap = raw[[oldCol, newCol]].copy()
+            nameMap.columns = ["OldClusterName", "NewClusterName"]
+
+            nameMap["OldClusterName"] = nameMap["OldClusterName"].astype(str).str.strip()
+            nameMap["NewClusterName"] = nameMap["NewClusterName"].astype(str).str.strip()
+
+            nameMap = nameMap.loc[nameMap["OldClusterName"] != ""].copy()
+            nameMap = nameMap.loc[nameMap["NewClusterName"] != ""].copy()
+            nameMap = nameMap.drop_duplicates(subset=["OldClusterName"], keep="first")
+
+            currentClusters = set(_get_current_leiden_cluster_names())
+            mappedClusters = set(nameMap["OldClusterName"].astype(str))
+
+            missingInCurrent = sorted(mappedClusters - currentClusters, key=_cluster_sort_key)
+            notAnnotated = sorted(currentClusters - mappedClusters, key=_cluster_sort_key)
+
+            clustering_cluster_name_map.set(nameMap)
+
+            _sync_cluster_annotations_to_master()
+
+            msg = (
+                f"Imported cluster-name map: {len(nameMap):,} rows. "
+                f"Annotated {len(currentClusters - set(notAnnotated)):,}/{len(currentClusters):,} current clusters."
+            )
+
+            if missingInCurrent:
+                msg += f" Ignored/non-current old cluster names: {len(missingInCurrent):,}."
+
+            if notAnnotated:
+                msg += f" Unannotated clusters keep their original names: {len(notAnnotated):,}."
+
+            clustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Cluster-name map import failed: {e}"
+            clustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @reactive.calc
+    def active_annotation_cluster_color_map() -> dict[str, str]:
+        clusterNames = _get_annotation_cluster_names()
+
+        if not clusterNames:
+            return {}
+
+        paletteName = input.annotation_cluster_color_palette() or "viridis"
+
+        if paletteName == "custom":
+            colorMap = {}
+
+            for i, clusterName in enumerate(clusterNames):
+                inputId = f"annotation_cluster_color_{i}"
+
+                try:
+                    currentValue = getattr(input, inputId)()
+                except Exception:
+                    currentValue = None
+
+                if not currentValue:
+                    currentValue = "#808080"
+
+                colorMap[clusterName] = currentValue
+
+            return colorMap
+
+        return make_palette_color_map(
+            clusterNames,
+            paletteName,
+        )
+    
     @reactive.Effect
     @reactive.event(input.push_mesmer_to_mask_visualization)
     def _push_mesmer_to_mask_visualization():
@@ -3593,6 +4887,89 @@ def server(input, output, session):
                 title="Mesmer mask",
                 errorMessage=f"Mesmer mask preview error:\n{e}",
             )
+
+    @output
+    @render.ui
+    def annotation_cluster_custom_color_ui():
+        clusterNames = _get_annotation_cluster_names()
+
+        if not clusterNames:
+            return ui.tags.small(
+                "Run Leiden clustering first. Custom colors will appear once clusters exist.",
+                class_="text-muted",
+            )
+
+        paletteName = input.annotation_cluster_color_palette() or "viridis"
+
+        if paletteName != "custom":
+            return ui.tags.small(
+                "Set the palette to custom to choose colors manually.",
+                class_="text-muted",
+            )
+
+        rows = [
+            ui.tags.small(
+                "Custom colors start as grey. Pick colors for the annotated cluster names.",
+                class_="text-muted",
+            ),
+            ui.tags.div(
+                f"Cluster names: {len(clusterNames):,}",
+                class_="compact-small-line mb-2",
+            ),
+        ]
+
+        for i, clusterName in enumerate(clusterNames):
+            inputId = f"annotation_cluster_color_{i}"
+
+            try:
+                currentValue = getattr(input, inputId)()
+            except Exception:
+                currentValue = None
+
+            if not currentValue:
+                currentValue = "#808080"
+
+            rows.append(
+                ui.row(
+                    ui.column(
+                        7,
+                        ui.tags.div(
+                            clusterName,
+                            class_="small",
+                            title=clusterName,
+                            style=(
+                                "white-space: nowrap; "
+                                "overflow: hidden; "
+                                "text-overflow: ellipsis;"
+                            ),
+                        ),
+                    ),
+                    ui.column(
+                        5,
+                        ui.tags.input(
+                            id=inputId,
+                            type="color",
+                            value=currentValue,
+                            oninput=(
+                                f"Shiny.setInputValue('{inputId}', this.value, "
+                                "{priority: 'event'});"
+                            ),
+                            onchange=(
+                                f"Shiny.setInputValue('{inputId}', this.value, "
+                                "{priority: 'event'});"
+                            ),
+                            style="width: 100%; height: 32px;",
+                        ),
+                    ),
+                    class_="gx-1 gy-1 align-items-center",
+                )
+            )
+
+        return ui.tags.div(
+            *rows,
+            class_="compact-stack",
+            style="max-height: 350px; overflow-y: auto;",
+        )
 
 
     @reactive.Effect

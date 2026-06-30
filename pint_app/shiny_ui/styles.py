@@ -389,6 +389,42 @@ def app_styles():
             }
                       
 
+            /* ------------------------------------------------------------
+            Clustering workspace scroll behavior, should fix the problem with the right card not scrolling to visibility...
+            ------------------------------------------------------------ */
+
+            .clustering-main-column {
+                min-width: 0;
+                max-height: calc(100vh - 255px);
+                overflow-y: auto;
+                overflow-x: auto;
+                padding-right: 0.75rem;
+                padding-bottom: 5rem;
+            }
+
+            .clustering-control-column {
+                max-width: 430px;
+                max-height: calc(100vh - 255px);
+                overflow-y: auto;
+                overflow-x: hidden;
+                padding-right: 0.5rem;
+                padding-bottom: 5rem;
+                margin-left: auto;
+            }
+
+            /* Prevent the last card/button from being hidden behind viewport bottom. */
+            .clustering-control-column::after,
+            .clustering-main-column::after {
+                content: "";
+                display: block;
+                height: 3rem;
+            }
+
+            /* Compact action buttons that do not stretch across the whole card. */
+            .compact-action-button {
+                width: 230px;
+                max-width: 100%;
+            }
 
 
             .mask-section-title {
