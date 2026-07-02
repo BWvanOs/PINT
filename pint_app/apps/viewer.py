@@ -248,6 +248,24 @@ def server(input, output, session):
     clustering_active_cell_ids = reactive.Value(None)
     clustering_cluster_name_map = reactive.Value(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
 
+    ##Subcluster reactive effects
+    subclustering_status = reactive.Value("No subclustering run yet.")
+    subclustering_annotation_status = reactive.Value("No subcluster annotations available yet.")
+    subclustering_parent_cluster = reactive.Value("")
+    subclustering_output_column = reactive.Value("")
+    subclustering_active_cell_ids = reactive.Value(None)
+    subclustering_feature_matrix = reactive.Value(None)
+    subclustering_feature_source_columns = reactive.Value([])
+    subclustering_feature_display_columns = reactive.Value([])
+    subclustering_pca_scores = reactive.Value(pd.DataFrame())
+    subclustering_pca_loadings = reactive.Value(pd.DataFrame())
+    subclustering_pca_variance = reactive.Value(pd.DataFrame())
+    subclustering_leiden_labels = reactive.Value(pd.DataFrame())
+    subclustering_pacmap_embedding = reactive.Value(pd.DataFrame())
+    subclustering_cluster_name_map = reactive.Value(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
+    subclustering_marker_summary = reactive.Value(pd.DataFrame())
+    subclustering_pushed_columns = reactive.Value([])
+
     mask_input_df = reactive.Value(pd.DataFrame())
     mask_files_df = reactive.Value(pd.DataFrame())
     mask_match_df = reactive.Value(pd.DataFrame())
@@ -1163,8 +1181,45 @@ def server(input, output, session):
             ].copy()
 
         return validMap.reset_index(drop=True)
+    
+    def _get_subclustering_pca_feature_map() -> pd.DataFrame:
+        """
+        Return marker/channel feature map for subclustering PCA.
 
-    def _prepare_clustering_feature_matrix() -> tuple[np.ndarray, pd.DataFrame, list[str], list[str]]:
+        Uses the same imported clustering column map, but can optionally restrict
+        to a manually entered subclustering marker list.
+        """
+        validMap = _get_valid_clustering_column_map()
+
+        expectedCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+
+        if validMap is None or validMap.empty:
+            return pd.DataFrame(columns=expectedCols)
+
+        mode = input.subclustering_pca_feature_mode() or "all_mapped"
+
+        if mode == "manual_subset":
+            requested = _parse_feature_list_text(input.subclustering_pca_feature_list())
+
+            if not requested:
+                return pd.DataFrame(columns=expectedCols)
+
+            requestedSet = set(requested)
+
+            validMap = validMap.loc[
+                validMap["ChannelNamesForClustering"].isin(requestedSet)
+                | validMap["ChannelNameToDisplay"].isin(requestedSet)
+            ].copy()
+
+        return validMap.reset_index(drop=True)
+
+    def _prepare_clustering_feature_matrix(
+        active_cell_ids=None,
+        feature_map: pd.DataFrame | None = None,
+        transform: str | None = None,
+        cofactor: float | None = None,
+        scale_data: bool | None = None,
+    ) -> tuple[np.ndarray, pd.DataFrame, list[str], list[str]]:
         """
         Build the numeric feature matrix for PCA/clustering.
 
@@ -1182,7 +1237,10 @@ def server(input, output, session):
         if PINT_CELL_ID_COL not in df.columns:
             raise ValueError("Create/validate PINT_Cell_ID before running PCA.")
 
-        featureMap = _get_pca_feature_map()
+        if feature_map is None:
+            featureMap = _get_pca_feature_map()
+        else:
+            featureMap = feature_map.copy()
 
         if featureMap is None or featureMap.empty:
             raise ValueError("No valid feature columns selected for PCA/clustering.")
@@ -1197,14 +1255,19 @@ def server(input, output, session):
                 + ", ".join(missingCols)
             )
 
-        # Optional future subclustering.
-        activeIds = clustering_active_cell_ids.get()
+        # Optional subclustering.
+        # Main clustering calls this with active_cell_ids=None.
+        # Subclustering calls this with active_cell_ids=subclustering_active_cell_ids.get().
+        if active_cell_ids is None:
+            active_cell_ids = clustering_active_cell_ids.get()
 
-        if activeIds is not None:
-            activeIds = set(map(str, activeIds))
-            useDf = df.loc[df[PINT_CELL_ID_COL].astype(str).isin(activeIds)].copy()
+        if active_cell_ids is not None:
+            active_cell_ids = set(map(str, active_cell_ids))
+            useDf = df.loc[
+                df[PINT_CELL_ID_COL].astype(str).isin(active_cell_ids)
+            ].copy()
         else:
-            useDf = df
+            useDf = df.copy()
 
         if useDf.empty:
             raise ValueError("No cells available for the current clustering run.")
@@ -1232,8 +1295,13 @@ def server(input, output, session):
         medians = Xdf.median(axis=0, numeric_only=True)
         Xdf = Xdf.fillna(medians).fillna(0)
 
-        transform = input.clustering_transform() or "asinh"
-        cofactor = float(input.clustering_asinh_cofactor() or 5)
+        if transform is None:
+            transform = input.clustering_transform() or "asinh"
+
+        if cofactor is None:
+            cofactor = float(input.clustering_asinh_cofactor() or 5)
+        else:
+            cofactor = float(cofactor)
 
         X = Xdf.to_numpy(dtype=np.float32, copy=True)
 
@@ -1252,7 +1320,10 @@ def server(input, output, session):
         else:
             raise ValueError(f"Unknown transform: {transform}")
 
-        if bool(input.clustering_scale_data()):
+        if scale_data is None:
+            scale_data = bool(input.clustering_scale_data())
+
+        if bool(scale_data):
             scaler = StandardScaler(copy=True)
             X = scaler.fit_transform(X).astype(np.float32, copy=False)
 
@@ -1804,10 +1875,17 @@ def server(input, output, session):
         Build full cell-level annotation export table.
 
         Includes:
-        - original clustering_data
+        - original/current clustering_data
         - PINT_Leiden_cluster
         - PINT_ClusterName
         - PaCMAP_1 / PaCMAP_2 if available
+        - any pushed subclustering columns, for example:
+            <OutputColumn>
+            <OutputColumn>_ParentClusterName
+            <OutputColumn>_ParentLeidenCluster
+            <OutputColumn>_SubclusterID
+            <OutputColumn>_PaCMAP_1
+            <OutputColumn>_PaCMAP_2
         """
         df = clustering_data.get()
 
@@ -1982,6 +2060,211 @@ def server(input, output, session):
         plt.tight_layout()
 
         return fig
+
+    def _get_main_cluster_label_table() -> pd.DataFrame:
+        """
+        Return PINT_Cell_ID + original Leiden cluster + current display cluster name.
+        """
+        labelsDf = clustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            return pd.DataFrame(
+                columns=[PINT_CELL_ID_COL, "PINT_Leiden_cluster", "PINT_ClusterName"]
+            )
+
+        annDf = _get_annotated_cluster_labels()
+
+        if annDf is not None and not annDf.empty:
+            return annDf[
+                [PINT_CELL_ID_COL, "PINT_Leiden_cluster", "PINT_ClusterName"]
+            ].copy()
+
+        out = labelsDf[[PINT_CELL_ID_COL, "PINT_Leiden_cluster"]].copy()
+        out["PINT_ClusterName"] = out["PINT_Leiden_cluster"].astype(str)
+
+        return out
+
+
+    def _get_main_cluster_choices_for_subclustering() -> dict[str, str]:
+        labelDf = _get_main_cluster_label_table()
+
+        if labelDf is None or labelDf.empty:
+            return {}
+
+        summary = (
+            labelDf
+            .groupby(["PINT_Leiden_cluster", "PINT_ClusterName"], dropna=False)
+            .size()
+            .reset_index(name="n_cells")
+        )
+
+        summary["choice_value"] = summary["PINT_ClusterName"].astype(str)
+        summary["choice_label"] = (
+            summary["PINT_ClusterName"].astype(str)
+            + " ["
+            + summary["PINT_Leiden_cluster"].astype(str)
+            + ", n="
+            + summary["n_cells"].map(lambda x: f"{x:,}")
+            + "]"
+        )
+
+        summary = summary.sort_values(
+            "PINT_Leiden_cluster",
+            key=lambda s: s.map(_cluster_sort_key),
+        )
+
+        return dict(zip(summary["choice_value"], summary["choice_label"]))
+
+    def _drop_subclustering_columns_from_master():
+        """
+        Remove subclustering columns that were pushed into clustering_data.
+
+        This is called when main PCA or main Leiden is rerun, because old
+        subclusters no longer belong to the new main clustering.
+        """
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            return
+
+        pushedCols = subclustering_pushed_columns.get() or []
+
+        dropCols = [c for c in pushedCols if c in df.columns]
+
+        if not dropCols:
+            return
+
+        clustering_data.set(df.drop(columns=dropCols))
+
+        print(
+            "🧹 Removed subclustering columns from master dataset: "
+            + ", ".join(dropCols),
+            flush=True,
+        )
+
+
+    def _clear_all_subclustering_state():
+        """
+        Clear all temporary subclustering state.
+
+        This does not clear the main clustering results.
+        """
+        subclustering_status.set("Subclustering cleared because main clustering was rerun.")
+        subclustering_annotation_status.set("No subcluster annotations available yet.")
+
+        subclustering_parent_cluster.set("")
+        subclustering_output_column.set("")
+        subclustering_active_cell_ids.set(None)
+
+        subclustering_feature_matrix.set(None)
+        subclustering_feature_source_columns.set([])
+        subclustering_feature_display_columns.set([])
+
+        subclustering_pca_scores.set(pd.DataFrame())
+        subclustering_pca_loadings.set(pd.DataFrame())
+        subclustering_pca_variance.set(pd.DataFrame())
+
+        subclustering_leiden_labels.set(pd.DataFrame())
+        subclustering_pacmap_embedding.set(pd.DataFrame())
+
+        subclustering_cluster_name_map.set(
+            pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+        )
+
+        subclustering_marker_summary.set(pd.DataFrame())
+
+        subclustering_pushed_columns.set([])
+
+    def _get_current_subcluster_names() -> list[str]:
+        """
+        Return current original sub-Leiden cluster names.
+        """
+        labelsDf = subclustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            return []
+
+        if "PINT_SubLeiden_cluster" not in labelsDf.columns:
+            return []
+
+        names = labelsDf["PINT_SubLeiden_cluster"].dropna().astype(str).unique().tolist()
+
+        def sub_sort_key(value):
+            value = str(value)
+            if value.startswith("Subcluster_"):
+                try:
+                    return (0, int(value.replace("Subcluster_", "")))
+                except Exception:
+                    pass
+            return (1, value.lower())
+
+        return sorted(names, key=sub_sort_key)
+
+
+    def _get_subcluster_name_lookup() -> dict[str, str]:
+        """
+        Return mapping from original subcluster name to user annotation.
+        """
+        nameMap = subclustering_cluster_name_map.get()
+
+        if nameMap is None or nameMap.empty:
+            return {}
+
+        required = ["OldClusterName", "NewClusterName"]
+        if any(c not in nameMap.columns for c in required):
+            return {}
+
+        clean = nameMap[required].copy()
+        clean["OldClusterName"] = clean["OldClusterName"].astype(str).str.strip()
+        clean["NewClusterName"] = clean["NewClusterName"].astype(str).str.strip()
+
+        clean = clean.loc[clean["OldClusterName"] != ""].copy()
+        clean = clean.loc[clean["NewClusterName"] != ""].copy()
+        clean = clean.drop_duplicates(subset=["OldClusterName"], keep="first")
+
+        return dict(zip(clean["OldClusterName"], clean["NewClusterName"]))
+
+
+    def _get_subcluster_annotated_labels() -> pd.DataFrame:
+        """
+        Return PINT_Cell_ID + original sub-Leiden cluster + user-facing subcluster name.
+        """
+        labelsDf = subclustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            return pd.DataFrame(
+                columns=[PINT_CELL_ID_COL, "PINT_SubLeiden_cluster", "PINT_SubClusterName"]
+            )
+
+        if "PINT_SubLeiden_cluster" not in labelsDf.columns:
+            return pd.DataFrame(
+                columns=[PINT_CELL_ID_COL, "PINT_SubLeiden_cluster", "PINT_SubClusterName"]
+            )
+
+        lookup = _get_subcluster_name_lookup()
+
+        out = labelsDf[[PINT_CELL_ID_COL, "PINT_SubLeiden_cluster"]].copy()
+        out["PINT_SubLeiden_cluster"] = out["PINT_SubLeiden_cluster"].astype(str)
+
+        out["PINT_SubClusterName"] = out["PINT_SubLeiden_cluster"].map(lookup)
+        out["PINT_SubClusterName"] = out["PINT_SubClusterName"].fillna(
+            out["PINT_SubLeiden_cluster"]
+        )
+
+        return out
+
+
+    def _get_subcluster_display_names() -> list[str]:
+        """
+        Return current display subcluster names after annotation mapping.
+        """
+        annDf = _get_subcluster_annotated_labels()
+
+        if annDf is None or annDf.empty:
+            return []
+
+        names = annDf["PINT_SubClusterName"].dropna().astype(str).unique().tolist()
+        return sorted(names, key=lambda x: x.lower())
 
     def _build_mask_visualization_figure(
             maskPath: str,
@@ -3536,6 +3819,9 @@ def server(input, output, session):
     @reactive.event(input.run_clustering_pca)
     def _run_clustering_pca():
         try:
+            _drop_subclustering_columns_from_master()
+            _clear_all_subclustering_state()
+
             X, obs, sourceCols, displayCols = _prepare_clustering_feature_matrix()
 
             nCells, nFeatures = X.shape
@@ -3591,7 +3877,14 @@ def server(input, output, session):
             clustering_leiden_labels.set(pd.DataFrame())
             clustering_marker_summary.set(pd.DataFrame())
             clustering_pacmap_embedding.set(pd.DataFrame())
-            clustering_annotation_status.set("PCA was rerun. Run Leiden/PaCMAP again for updated annotation visualizations.")
+
+            clustering_cluster_name_map.set(
+                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+            )
+
+            clustering_annotation_status.set(
+                "Main PCA was rerun. Leiden clusters, annotations, PaCMAP, heatmaps, and subclusters were cleared."
+            )
 
             msg = (
                 f"PCA complete: {nCells:,} cells × {nFeatures:,} features, "
@@ -3721,6 +4014,9 @@ def server(input, output, session):
     @reactive.event(input.run_leiden_clustering)
     def _run_leiden_clustering():
         try:
+            _drop_subclustering_columns_from_master()
+            _clear_all_subclustering_state()
+
             if not LEIDEN_AVAILABLE:
                 raise ImportError(
                     "Leiden clustering requires python-igraph and leidenalg. "
@@ -3775,7 +4071,6 @@ def server(input, output, session):
             weights = []
 
             for i in range(nCells):
-                # Skip first neighbor because it is usually the cell itself.
                 for j, dist in zip(indices[i, 1:], distances[i, 1:]):
                     if i == j:
                         continue
@@ -3788,7 +4083,6 @@ def server(input, output, session):
                     else:
                         edges.append((b, a))
 
-                    # Convert distance to a simple positive similarity weight.
                     weights.append(float(1.0 / (1.0 + dist)))
 
             if not edges:
@@ -3797,14 +4091,16 @@ def server(input, output, session):
             edgeDf = pd.DataFrame(edges, columns=["source", "target"])
             edgeDf["weight"] = weights
 
-            # Collapse duplicate undirected edges.
             edgeDf = (
                 edgeDf
                 .groupby(["source", "target"], as_index=False)["weight"]
                 .max()
             )
 
-            graph = ig.Graph(n=nCells, edges=list(map(tuple, edgeDf[["source", "target"]].to_numpy())))
+            graph = ig.Graph(
+                n=nCells,
+                edges=list(map(tuple, edgeDf[["source", "target"]].to_numpy())),
+            )
             graph.es["weight"] = edgeDf["weight"].tolist()
 
             partition = leidenalg.find_partition(
@@ -3824,11 +4120,21 @@ def server(input, output, session):
 
             clustering_leiden_labels.set(labelsDf)
 
-            # Add cluster labels back to the master dataset by PINT_Cell_ID.
             master = clustering_data.get().copy()
 
-            if "PINT_Leiden_cluster" in master.columns:
-                master = master.drop(columns=["PINT_Leiden_cluster"])
+            # Drop downstream main clustering/annotation columns before writing new labels.
+            dropCols = [
+                c for c in [
+                    "PINT_Leiden_cluster",
+                    "PINT_ClusterName",
+                    "PaCMAP_1",
+                    "PaCMAP_2",
+                ]
+                if c in master.columns
+            ]
+
+            if dropCols:
+                master = master.drop(columns=dropCols)
 
             master = master.merge(
                 labelsDf,
@@ -3838,14 +4144,26 @@ def server(input, output, session):
 
             clustering_data.set(master)
 
+            # Clear main annotation state that depended on old Leiden labels.
+            clustering_cluster_name_map.set(
+                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+            )
+
+            clustering_pacmap_embedding.set(pd.DataFrame())
+            clustering_marker_summary.set(pd.DataFrame())
+
             nClusters = labelsDf["PINT_Leiden_cluster"].nunique()
 
             msg = (
                 f"Leiden clustering complete: {nCells:,} cells, "
-                f"{nClusters:,} clusters."
+                f"{nClusters:,} clusters. Previous annotations, PaCMAP, heatmaps, and subclusters were cleared."
             )
 
             clustering_analysis_status.set(msg)
+            clustering_annotation_status.set(
+                "Main Leiden clustering was rerun. Cluster annotations, PaCMAP, heatmaps, and subclusters were cleared."
+            )
+
             print(f"✅ {msg}", flush=True)
 
         except Exception as e:
@@ -4569,6 +4887,1278 @@ def server(input, output, session):
             paletteName,
         )
     
+    @reactive.calc
+    def active_subcluster_color_map() -> dict[str, str]:
+        subclusterNames = _get_subcluster_display_names()
+
+        if not subclusterNames:
+            return {}
+
+        paletteName = input.subcluster_color_palette() or "viridis"
+
+        if paletteName == "custom":
+            colorMap = {}
+
+            for i, subclusterName in enumerate(subclusterNames):
+                inputId = f"subcluster_color_{i}"
+
+                try:
+                    currentValue = getattr(input, inputId)()
+                except Exception:
+                    currentValue = None
+
+                if not currentValue:
+                    currentValue = "#808080"
+
+                colorMap[subclusterName] = currentValue
+
+            return colorMap
+
+        return make_palette_color_map(
+            subclusterNames,
+            paletteName,
+        )
+
+
+    @output
+    @render.ui
+    def subcluster_custom_color_ui():
+        subclusterNames = _get_subcluster_display_names()
+
+        if not subclusterNames:
+            return ui.tags.small(
+                "Run sub-Leiden first. Custom colors will appear once subclusters exist.",
+                class_="text-muted",
+            )
+
+        paletteName = input.subcluster_color_palette() or "viridis"
+
+        if paletteName != "custom":
+            return ui.tags.small(
+                "Set the palette to custom colors to choose colors manually.",
+                class_="text-muted",
+            )
+
+        rows = [
+            ui.tags.small(
+                "Custom colors start as grey. Pick colors for the annotated subcluster names.",
+                class_="text-muted",
+            ),
+            ui.tags.div(
+                f"Subcluster names: {len(subclusterNames):,}",
+                class_="compact-small-line mb-2",
+            ),
+        ]
+
+        for i, subclusterName in enumerate(subclusterNames):
+            inputId = f"subcluster_color_{i}"
+
+            try:
+                currentValue = getattr(input, inputId)()
+            except Exception:
+                currentValue = None
+
+            if not currentValue:
+                currentValue = "#808080"
+
+            rows.append(
+                ui.row(
+                    ui.column(
+                        7,
+                        ui.tags.div(
+                            subclusterName,
+                            class_="small",
+                            title=subclusterName,
+                            style=(
+                                "white-space: nowrap; "
+                                "overflow: hidden; "
+                                "text-overflow: ellipsis;"
+                            ),
+                        ),
+                    ),
+                    ui.column(
+                        5,
+                        ui.tags.input(
+                            id=inputId,
+                            type="color",
+                            value=currentValue,
+                            oninput=(
+                                f"Shiny.setInputValue('{inputId}', this.value, "
+                                "{priority: 'event'});"
+                            ),
+                            onchange=(
+                                f"Shiny.setInputValue('{inputId}', this.value, "
+                                "{priority: 'event'});"
+                            ),
+                            style="width: 100%; height: 32px;",
+                        ),
+                    ),
+                    class_="gx-1 gy-1 align-items-center",
+                )
+            )
+
+        return ui.tags.div(
+            *rows,
+            class_="compact-stack",
+            style="max-height: 350px; overflow-y: auto;",
+        )
+
+
+    @output
+    @render.ui
+    def subclustering_parent_cluster_ui():
+        choices = _get_main_cluster_choices_for_subclustering()
+
+        if not choices:
+            return ui.tags.small(
+                "Run main Leiden clustering first. If desired, annotate the main clusters before subclustering.",
+                class_="text-muted",
+            )
+
+        firstValue = next(iter(choices.keys()))
+
+        return ui.input_select(
+            "subclustering_parent_cluster_name",
+            "Parent cluster",
+            choices=choices,
+            selected=firstValue,
+        )
+    
+    def _clean_column_name(value: str) -> str:
+        value = str(value or "").strip()
+
+        if not value:
+            value = "Subclusters"
+
+        cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in value)
+        cleaned = cleaned.strip("_")
+
+        if not cleaned:
+            cleaned = "Subclusters"
+
+        return cleaned
+
+
+    @reactive.Effect
+    @reactive.event(input.prepare_subclustering_subset)
+    def _prepare_subclustering_subset():
+        try:
+            labelDf = _get_main_cluster_label_table()
+
+            if labelDf is None or labelDf.empty:
+                raise ValueError("No main clustering labels available. Run main Leiden first.")
+
+            parentName = str(input.subclustering_parent_cluster_name() or "").strip()
+
+            if not parentName:
+                raise ValueError("No parent cluster selected.")
+
+            outputCol = _clean_column_name(input.subclustering_output_column_name())
+
+            selected = (
+                labelDf.loc[
+                    labelDf["PINT_ClusterName"].astype(str) == parentName,
+                    PINT_CELL_ID_COL,
+                ]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+
+            if not selected:
+                raise ValueError(f"No cells found for parent cluster: {parentName}")
+
+            subclustering_parent_cluster.set(parentName)
+            subclustering_output_column.set(outputCol)
+            subclustering_active_cell_ids.set(set(selected))
+
+            # Clear current subclustering analysis, but do not touch main clustering.
+            subclustering_feature_matrix.set(None)
+            subclustering_feature_source_columns.set([])
+            subclustering_feature_display_columns.set([])
+
+            subclustering_pca_scores.set(pd.DataFrame())
+            subclustering_pca_loadings.set(pd.DataFrame())
+            subclustering_pca_variance.set(pd.DataFrame())
+            subclustering_leiden_labels.set(pd.DataFrame())
+            subclustering_pacmap_embedding.set(pd.DataFrame())
+            subclustering_cluster_name_map.set(
+                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+            )
+
+            msg = (
+                f"Prepared subclustering subset: {parentName}; "
+                f"{len(selected):,} cells; output column: {outputCol}."
+            )
+
+            subclustering_status.set(msg)
+            subclustering_annotation_status.set("Subset prepared. Run sub-PCA next.")
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Subclustering subset preparation failed: {e}"
+            subclustering_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(input.run_subclustering_pca)
+    def _run_subclustering_pca():
+        try:
+            activeIds = subclustering_active_cell_ids.get()
+
+            if not activeIds:
+                raise ValueError("Prepare a subclustering subset first.")
+
+            featureMap = _get_subclustering_pca_feature_map()
+
+            if featureMap is None or featureMap.empty:
+                raise ValueError("No valid features selected for subclustering PCA.")
+
+            X, obs, sourceCols, displayCols = _prepare_clustering_feature_matrix(
+                active_cell_ids=activeIds,
+                feature_map=featureMap,
+            )
+
+            nCells, nFeatures = X.shape
+            requestedPcs = int(input.subclustering_n_pcs() or 20)
+            nPcs = max(2, min(requestedPcs, nFeatures, nCells - 1))
+
+            if nPcs < 2:
+                raise ValueError("Need at least 2 PCs. Check number of cells/features.")
+
+            seed = int(input.subclustering_random_seed() or 1)
+
+            subclustering_status.set(
+                f"Running sub-PCA on {nCells:,} cells × {nFeatures:,} features..."
+            )
+
+            print(
+                f"▶️ Running sub-PCA: {nCells:,} cells × {nFeatures:,} features, "
+                f"{nPcs} PCs.",
+                flush=True,
+            )
+
+            pca = PCA(n_components=nPcs, random_state=seed)
+            scores = pca.fit_transform(X)
+
+            scoreCols = [f"PC_{i}" for i in range(1, nPcs + 1)]
+
+            scoresDf = obs.copy()
+            for i, col in enumerate(scoreCols):
+                scoresDf[col] = scores[:, i].astype(np.float32)
+
+            loadingsDf = pd.DataFrame(
+                pca.components_.T,
+                columns=scoreCols,
+            )
+            loadingsDf.insert(0, "Feature", displayCols)
+            loadingsDf.insert(0, "SourceColumn", sourceCols)
+
+            varianceDf = pd.DataFrame(
+                {
+                    "PC": scoreCols,
+                    "ExplainedVarianceRatio": pca.explained_variance_ratio_,
+                    "ExplainedVariancePercent": pca.explained_variance_ratio_ * 100,
+                    "CumulativeVariancePercent": np.cumsum(
+                        pca.explained_variance_ratio_
+                    ) * 100,
+                }
+            )
+
+            subclustering_feature_matrix.set(X)
+            subclustering_feature_source_columns.set(sourceCols)
+            subclustering_feature_display_columns.set(displayCols)
+
+            subclustering_pca_scores.set(scoresDf)
+            subclustering_pca_loadings.set(loadingsDf)
+            subclustering_pca_variance.set(varianceDf)
+
+            # Clear downstream subclustering state.
+            subclustering_leiden_labels.set(pd.DataFrame())
+            subclustering_pacmap_embedding.set(pd.DataFrame())
+            subclustering_cluster_name_map.set(
+                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+            )
+
+            msg = (
+                f"Sub-PCA complete: {nCells:,} cells × {nFeatures:,} features, "
+                f"{nPcs:,} PCs."
+            )
+
+            subclustering_status.set(msg)
+            subclustering_annotation_status.set(
+                "Sub-PCA was rerun. Run sub-Leiden and sub-PaCMAP again."
+            )
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Sub-PCA failed: {e}"
+            subclustering_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(input.run_subleiden_clustering)
+    def _run_subleiden_clustering():
+        try:
+            if not LEIDEN_AVAILABLE:
+                raise ImportError(
+                    "Leiden clustering requires python-igraph and leidenalg. "
+                    "Install with: pip install python-igraph leidenalg"
+                )
+
+            pcaDf = subclustering_pca_scores.get()
+
+            if pcaDf is None or pcaDf.empty:
+                raise ValueError("Run sub-PCA before sub-Leiden clustering.")
+
+            nDims = int(input.subclustering_leiden_n_dims() or 10)
+            nNeighbors = int(input.subclustering_leiden_n_neighbors() or 15)
+            resolution = float(input.subclustering_leiden_resolution() or 1.0)
+            seed = int(input.subclustering_random_seed() or 1)
+
+            pcCols = [c for c in pcaDf.columns if c.startswith("PC_")]
+
+            if len(pcCols) < 2:
+                raise ValueError("Sub-PCA scores do not contain enough PC columns.")
+
+            usePcCols = pcCols[: min(nDims, len(pcCols))]
+            Xpca = pcaDf.loc[:, usePcCols].to_numpy(dtype=np.float32, copy=True)
+
+            nCells = Xpca.shape[0]
+
+            if nCells < 3:
+                raise ValueError("Need at least 3 cells for subgraph clustering.")
+
+            nNeighbors = max(2, min(nNeighbors, nCells - 1))
+
+            subclustering_status.set(
+                f"Building sub-kNN graph using {len(usePcCols)} PCs and {nNeighbors} neighbors..."
+            )
+
+            print(
+                f"▶️ Sub-Leiden clustering: {nCells:,} cells, "
+                f"{len(usePcCols)} PCs, k={nNeighbors}, resolution={resolution}",
+                flush=True,
+            )
+
+            nn = NearestNeighbors(
+                n_neighbors=nNeighbors + 1,
+                metric="euclidean",
+                algorithm="auto",
+            )
+            nn.fit(Xpca)
+
+            distances, indices = nn.kneighbors(Xpca)
+
+            edges = []
+            weights = []
+
+            for i in range(nCells):
+                for j, dist in zip(indices[i, 1:], distances[i, 1:]):
+                    if i == j:
+                        continue
+
+                    a = int(i)
+                    b = int(j)
+
+                    if a < b:
+                        edges.append((a, b))
+                    else:
+                        edges.append((b, a))
+
+                    weights.append(float(1.0 / (1.0 + dist)))
+
+            if not edges:
+                raise ValueError("No subgraph edges were created.")
+
+            edgeDf = pd.DataFrame(edges, columns=["source", "target"])
+            edgeDf["weight"] = weights
+
+            edgeDf = (
+                edgeDf
+                .groupby(["source", "target"], as_index=False)["weight"]
+                .max()
+            )
+
+            graph = ig.Graph(
+                n=nCells,
+                edges=list(map(tuple, edgeDf[["source", "target"]].to_numpy())),
+            )
+            graph.es["weight"] = edgeDf["weight"].tolist()
+
+            partition = leidenalg.find_partition(
+                graph,
+                leidenalg.RBConfigurationVertexPartition,
+                weights=graph.es["weight"],
+                resolution_parameter=resolution,
+                seed=seed,
+            )
+
+            labels = np.array(partition.membership, dtype=int)
+
+            labelsDf = pcaDf[[PINT_CELL_ID_COL]].copy()
+            labelsDf["PINT_SubLeiden_cluster"] = [
+                f"Subcluster_{x}" for x in labels
+            ]
+
+            subclustering_leiden_labels.set(labelsDf)
+
+            # Clear downstream sub-annotation state.
+            subclustering_pacmap_embedding.set(pd.DataFrame())
+            subclustering_cluster_name_map.set(
+                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+            )
+
+            nClusters = labelsDf["PINT_SubLeiden_cluster"].nunique()
+
+            msg = (
+                f"Sub-Leiden complete: {nCells:,} cells, "
+                f"{nClusters:,} subclusters."
+            )
+
+            subclustering_status.set(msg)
+            subclustering_annotation_status.set(
+                "Sub-Leiden was rerun. Subcluster annotations and sub-PaCMAP were cleared."
+            )
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Sub-Leiden clustering failed: {e}"
+            subclustering_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(input.run_subclustering_pacmap)
+    def _run_subclustering_pacmap():
+        try:
+            if not PACMAP_AVAILABLE:
+                raise ImportError(
+                    "PaCMAP requires the pacmap package. Install with: pip install pacmap"
+                )
+
+            pcaDf = subclustering_pca_scores.get()
+
+            if pcaDf is None or pcaDf.empty:
+                raise ValueError("Run sub-PCA before sub-PaCMAP.")
+
+            pcCols = [c for c in pcaDf.columns if c.startswith("PC_")]
+
+            if len(pcCols) < 2:
+                raise ValueError("Sub-PCA scores do not contain enough PC columns.")
+
+            nDims = int(input.subclustering_pacmap_n_dims() or 10)
+            usePcCols = pcCols[: min(nDims, len(pcCols))]
+
+            Xpca = pcaDf.loc[:, usePcCols].to_numpy(dtype=np.float32, copy=True)
+
+            nNeighbors = int(input.subclustering_pacmap_n_neighbors() or 10)
+            mnRatio = float(input.subclustering_pacmap_mn_ratio() or 0.5)
+            fpRatio = float(input.subclustering_pacmap_fp_ratio() or 2.0)
+            seed = int(input.subclustering_random_seed() or 1)
+
+            nCells = Xpca.shape[0]
+
+            if nCells < 3:
+                raise ValueError("Need at least 3 cells for sub-PaCMAP.")
+
+            nNeighbors = max(2, min(nNeighbors, nCells - 1))
+
+            subclustering_annotation_status.set(
+                f"Running sub-PaCMAP on {nCells:,} cells using {len(usePcCols)} PCs..."
+            )
+
+            print(
+                f"▶️ Running sub-PaCMAP: {nCells:,} cells, "
+                f"{len(usePcCols)} PCs, n_neighbors={nNeighbors}, "
+                f"MN_ratio={mnRatio}, FP_ratio={fpRatio}",
+                flush=True,
+            )
+
+            reducer = pacmap.PaCMAP(
+                n_components=2,
+                n_neighbors=nNeighbors,
+                MN_ratio=mnRatio,
+                FP_ratio=fpRatio,
+                random_state=seed,
+            )
+
+            embedding = reducer.fit_transform(Xpca, init="pca")
+
+            embDf = pcaDf[[PINT_CELL_ID_COL]].copy()
+            embDf["SubPaCMAP_1"] = embedding[:, 0].astype(np.float32)
+            embDf["SubPaCMAP_2"] = embedding[:, 1].astype(np.float32)
+
+            subclustering_pacmap_embedding.set(embDf)
+
+            print(
+                "✅ Stored sub-PaCMAP embedding:",
+                embDf.shape,
+                embDf.columns.tolist(),
+                flush=True,
+            )
+
+            msg = f"Sub-PaCMAP complete: {nCells:,} cells using {len(usePcCols)} PCs."
+            subclustering_annotation_status.set(msg)
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Sub-PaCMAP failed: {e}"
+            subclustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+
+
+    def _clear_all_subclustering_state():
+        subclustering_status.set("Subclustering cleared because main clustering was rerun.")
+        subclustering_annotation_status.set("No subcluster annotations available yet.")
+
+        subclustering_parent_cluster.set("")
+        subclustering_output_column.set("")
+        subclustering_active_cell_ids.set(None)
+
+        subclustering_feature_matrix.set(None)
+        subclustering_feature_source_columns.set([])
+        subclustering_feature_display_columns.set([])
+
+        subclustering_pca_scores.set(pd.DataFrame())
+        subclustering_pca_loadings.set(pd.DataFrame())
+        subclustering_pca_variance.set(pd.DataFrame())
+
+        subclustering_leiden_labels.set(pd.DataFrame())
+        subclustering_pacmap_embedding.set(pd.DataFrame())
+
+        subclustering_cluster_name_map.set(
+            pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+        )
+
+        subclustering_marker_summary.set(pd.DataFrame())
+
+
+    def _drop_subclustering_columns_from_master():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            return
+
+        protected = {
+            PINT_CELL_ID_COL,
+            "PINT_Leiden_cluster",
+            "PINT_ClusterName",
+            "PaCMAP_1",
+            "PaCMAP_2",
+        }
+
+        # Conservative: only drop columns created by known subcluster output column.
+        outputCol = subclustering_output_column.get()
+
+        if not outputCol:
+            return
+
+        outputCol = _clean_column_name(outputCol)
+
+        candidates = [
+            outputCol,
+            f"{outputCol}_ParentCluster",
+            f"{outputCol}_SubclusterID",
+            f"{outputCol}_PaCMAP_1",
+            f"{outputCol}_PaCMAP_2",
+        ]
+
+        dropCols = [c for c in candidates if c in df.columns and c not in protected]
+
+        if not dropCols:
+            return
+
+        clustering_data.set(df.drop(columns=dropCols))
+
+
+
+    @reactive.Effect
+    @reactive.event(input.push_subcluster_annotations_to_main)
+    def _push_subcluster_annotations_to_main():
+        try:
+            master = clustering_data.get()
+
+            if master is None or master.empty:
+                raise ValueError("No master clustering dataset loaded.")
+
+            if PINT_CELL_ID_COL not in master.columns:
+                raise ValueError("PINT_Cell_ID is missing from master dataset.")
+
+            annDf = _get_subcluster_annotated_labels()
+
+            if annDf is None or annDf.empty:
+                raise ValueError("No subcluster annotations available. Run sub-Leiden first.")
+
+            outputCol = _clean_column_name(
+                subclustering_output_column.get()
+                or input.subclustering_output_column_name()
+                or "Subclusters"
+            )
+
+            parentName = subclustering_parent_cluster.get() or ""
+
+            labelDf = _get_main_cluster_label_table()
+
+            parentLeiden = ""
+
+            if labelDf is not None and not labelDf.empty and parentName:
+                matched = labelDf.loc[
+                    labelDf["PINT_ClusterName"].astype(str) == str(parentName),
+                    "PINT_Leiden_cluster",
+                ].dropna().astype(str).unique().tolist()
+
+                if matched:
+                    parentLeiden = matched[0]
+
+            pushDf = annDf.copy()
+
+            pushDf[f"{outputCol}_ParentClusterName"] = parentName
+            pushDf[f"{outputCol}_ParentLeidenCluster"] = parentLeiden
+
+            embDf = subclustering_pacmap_embedding.get()
+
+            if embDf is not None and not embDf.empty:
+                pushDf = pushDf.merge(
+                    embDf[[PINT_CELL_ID_COL, "SubPaCMAP_1", "SubPaCMAP_2"]],
+                    on=PINT_CELL_ID_COL,
+                    how="left",
+                )
+
+                pushDf = pushDf.rename(
+                    columns={
+                        "SubPaCMAP_1": f"{outputCol}_PaCMAP_1",
+                        "SubPaCMAP_2": f"{outputCol}_PaCMAP_2",
+                    }
+                )
+
+            pushDf = pushDf.rename(
+                columns={
+                    "PINT_SubLeiden_cluster": f"{outputCol}_SubclusterID",
+                    "PINT_SubClusterName": outputCol,
+                }
+            )
+
+            keepCols = [
+                PINT_CELL_ID_COL,
+                outputCol,
+                f"{outputCol}_ParentClusterName",
+                f"{outputCol}_ParentLeidenCluster",
+                f"{outputCol}_SubclusterID",
+                f"{outputCol}_PaCMAP_1",
+                f"{outputCol}_PaCMAP_2",
+            ]
+
+            keepCols = [c for c in keepCols if c in pushDf.columns]
+            pushDf = pushDf[keepCols].copy()
+
+            master = master.copy()
+
+            # Replace columns from earlier push with same output column.
+            dropCols = [c for c in keepCols if c != PINT_CELL_ID_COL and c in master.columns]
+
+            if dropCols:
+                master = master.drop(columns=dropCols)
+
+            master = master.merge(
+                pushDf,
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+
+            clustering_data.set(master)
+
+            createdCols = [c for c in keepCols if c != PINT_CELL_ID_COL]
+
+            existing = subclustering_pushed_columns.get() or []
+            subclustering_pushed_columns.set(sorted(set(existing + createdCols)))
+
+            msg = (
+                f"Pushed subcluster annotations to master dataset. "
+                f"Output column: {outputCol}; cells updated: {len(pushDf):,}; "
+                f"parent cluster: {parentName}."
+            )
+
+            subclustering_annotation_status.set(msg)
+            clustering_annotation_status.set(msg)
+
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Push subcluster annotations failed: {e}"
+            subclustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+    @output
+    @render.ui
+    def subclustering_status_summary():
+        return ui.tags.div(
+            subclustering_status.get(),
+            class_="compact-small-line",
+        )
+
+
+    @output
+    @render.ui
+    def subclustering_annotation_summary():
+        return ui.tags.div(
+            subclustering_annotation_status.get(),
+            class_="compact-small-line",
+        )
+
+
+    @output
+    @render.ui
+    def subclustering_subset_summary():
+        activeIds = subclustering_active_cell_ids.get()
+        parentName = subclustering_parent_cluster.get()
+        outputCol = subclustering_output_column.get()
+
+        if not activeIds:
+            return ui.tags.small(
+                "No subclustering subset prepared yet.",
+                class_="text-muted",
+            )
+
+        return ui.tags.div(
+            f"Prepared {len(activeIds):,} cells from {parentName}. Output column: {outputCol}.",
+            class_="compact-small-line",
+        )
+
+
+    @output
+    @render.ui
+    def subcluster_pushback_summary():
+        outputCol = subclustering_output_column.get()
+
+        if not outputCol:
+            return ui.tags.small(
+                "No subcluster output column selected yet.",
+                class_="text-muted",
+            )
+
+        return ui.tags.small(
+            f"Current output column: {outputCol}",
+            class_="text-muted",
+        )
+
+    @output
+    @render.data_frame
+    def subclustering_pca_variance_preview():
+        df = subclustering_pca_variance.get()
+
+        if df is None or df.empty:
+            empty = pd.DataFrame({"Message": ["No sub-PCA variance available yet."]})
+            return render.DataGrid(empty, height="260px", filters=False)
+
+        show = df.copy()
+        numCols = show.select_dtypes(include=["number"]).columns
+        show[numCols] = show[numCols].round(3)
+
+        return render.DataGrid(show, height="260px", filters=False)
+
+
+    @output
+    @render.data_frame
+    def subclustering_leiden_counts_preview():
+        labelsDf = subclustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            empty = pd.DataFrame({"Message": ["No sub-Leiden clusters available yet."]})
+            return render.DataGrid(empty, height="260px", filters=False)
+
+        out = (
+            labelsDf
+            .groupby("PINT_SubLeiden_cluster", dropna=False)
+            .size()
+            .reset_index(name="n_cells")
+        )
+
+        return render.DataGrid(out, height="260px", filters=False)
+
+
+    @output
+    @render.data_frame
+    def subcluster_name_map_preview():
+        annDf = _get_subcluster_annotated_labels()
+
+        if annDf is None or annDf.empty:
+            empty = pd.DataFrame({"Message": ["No subcluster annotations available yet."]})
+            return render.DataGrid(empty, height="260px", filters=False)
+
+        out = (
+            annDf
+            .groupby(["PINT_SubLeiden_cluster", "PINT_SubClusterName"], dropna=False)
+            .size()
+            .reset_index(name="n_cells")
+        )
+
+        return render.DataGrid(out, height="260px", filters=False)
+
+
+    @output
+    @render.data_frame
+    def subcluster_pushback_preview():
+        annDf = _get_subcluster_annotated_labels()
+        embDf = subclustering_pacmap_embedding.get()
+
+        outputCol = subclustering_output_column.get() or "Subclusters"
+        outputCol = _clean_column_name(outputCol)
+
+        if annDf is None or annDf.empty:
+            empty = pd.DataFrame({"Message": ["No subcluster result available to push back yet."]})
+            return render.DataGrid(empty, height="260px", filters=False)
+
+        out = annDf.copy()
+
+        out = out.rename(
+            columns={
+                "PINT_SubLeiden_cluster": f"{outputCol}_SubclusterID",
+                "PINT_SubClusterName": outputCol,
+            }
+        )
+
+        parentName = subclustering_parent_cluster.get() or ""
+
+        out[f"{outputCol}_ParentClusterName"] = parentName
+
+        if embDf is not None and not embDf.empty:
+            out = out.merge(
+                embDf[[PINT_CELL_ID_COL, "SubPaCMAP_1", "SubPaCMAP_2"]],
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+
+            out = out.rename(
+                columns={
+                    "SubPaCMAP_1": f"{outputCol}_PaCMAP_1",
+                    "SubPaCMAP_2": f"{outputCol}_PaCMAP_2",
+                }
+            )
+
+        preferredCols = [
+            PINT_CELL_ID_COL,
+            outputCol,
+            f"{outputCol}_ParentClusterName",
+            f"{outputCol}_SubclusterID",
+            f"{outputCol}_PaCMAP_1",
+            f"{outputCol}_PaCMAP_2",
+        ]
+
+        preferredCols = [c for c in preferredCols if c in out.columns]
+
+        return render.DataGrid(out[preferredCols].head(500), height="300px", filters=False)
+
+    @output
+    @render.ui
+    def subclustering_pca_plot_ui():
+        return ui.output_plot(
+            "subclustering_pca_plot",
+            width="100%",
+            height="500px",
+        )
+
+
+    @output
+    @render.ui
+    def subclustering_pacmap_plot_ui():
+        embDf = subclustering_pacmap_embedding.get()
+
+        widthPx = 1200
+        heightPx = 500
+
+        try:
+            widthPx = int(input.subclustering_embedding_plot_width() or 1200)
+            widthPx = max(600, min(1800, widthPx))
+        except Exception:
+            widthPx = 1200
+
+        if (
+            embDf is not None
+            and not embDf.empty
+            and {"SubPaCMAP_1", "SubPaCMAP_2"}.issubset(embDf.columns)
+        ):
+            _, _, heightPx = _get_equal_axis_plot_geometry(
+                embDf,
+                "SubPaCMAP_1",
+                "SubPaCMAP_2",
+                width_px=widthPx,
+            )
+
+        return ui.tags.div(
+            ui.output_plot(
+                "subclustering_pacmap_plot",
+                width=f"{widthPx}px",
+                height=f"{heightPx}px",
+            ),
+            style="max-width: 100%; overflow-x: auto;",
+        )
+
+    @output
+    @render.plot
+    def subclustering_pacmap_plot():
+        embDf = subclustering_pacmap_embedding.get()
+
+        if embDf is None or embDf.empty:
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
+            ax.text(
+                0.5,
+                0.5,
+                "Run sub-PaCMAP to show embedding",
+                ha="center",
+                va="center",
+            )
+            ax.set_axis_off()
+            return fig
+
+        if not {"SubPaCMAP_1", "SubPaCMAP_2"}.issubset(embDf.columns):
+            fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
+            ax.text(
+                0.5,
+                0.5,
+                "Sub-PaCMAP embedding exists,\nbut SubPaCMAP_1 / SubPaCMAP_2 columns are missing.",
+                ha="center",
+                va="center",
+            )
+            ax.set_axis_off()
+            return fig
+
+        annDf = _get_subcluster_annotated_labels()
+
+        plotDf = embDf.copy()
+
+        if annDf is not None and not annDf.empty:
+            plotDf = plotDf.merge(
+                annDf[[PINT_CELL_ID_COL, "PINT_SubLeiden_cluster", "PINT_SubClusterName"]],
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
+        else:
+            plotDf["PINT_SubLeiden_cluster"] = "Unclustered"
+            plotDf["PINT_SubClusterName"] = "Unclustered"
+
+        plotDf["PINT_SubLeiden_cluster"] = (
+            plotDf["PINT_SubLeiden_cluster"]
+            .fillna("Unclustered")
+            .astype(str)
+        )
+
+        plotDf["PINT_SubClusterName"] = (
+            plotDf["PINT_SubClusterName"]
+            .fillna(plotDf["PINT_SubLeiden_cluster"])
+            .fillna("Unclustered")
+            .astype(str)
+        )
+
+        widthPx = 1200
+
+        try:
+            widthPx = int(input.subclustering_embedding_plot_width() or 1200)
+            widthPx = max(600, min(1800, widthPx))
+        except Exception:
+            widthPx = 1200
+
+        xlim, ylim, heightPx = _get_equal_axis_plot_geometry(
+            plotDf,
+            "SubPaCMAP_1",
+            "SubPaCMAP_2",
+            width_px=widthPx,
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(widthPx / 100, heightPx / 100),
+            dpi=100,
+        )
+
+        colorMap = active_subcluster_color_map()
+
+        if not colorMap:
+            subclusterNames = sorted(
+                plotDf["PINT_SubClusterName"].dropna().astype(str).unique().tolist(),
+                key=lambda x: x.lower(),
+            )
+
+            colorMap = make_palette_color_map(
+                subclusterNames,
+                input.subcluster_color_palette() or "viridis",
+            )
+
+        pointColors = (
+            plotDf["PINT_SubClusterName"]
+            .map(colorMap)
+            .fillna("#808080")
+            .tolist()
+        )
+
+        ax.scatter(
+            plotDf["SubPaCMAP_1"],
+            plotDf["SubPaCMAP_2"],
+            c=pointColors,
+            s=float(input.subclustering_plot_point_size() or 2),
+            alpha=float(input.subclustering_plot_alpha() or 0.7),
+            linewidths=0,
+        )
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
+
+        ax.set_xlabel("Sub-PaCMAP 1")
+        ax.set_ylabel("Sub-PaCMAP 2")
+        ax.set_title("Subclustering PaCMAP")
+
+        subclusterNames = sorted(
+            plotDf["PINT_SubClusterName"].dropna().astype(str).unique().tolist(),
+            key=lambda x: x.lower(),
+        )
+
+        if 0 < len(subclusterNames) <= 30:
+            handles = [
+                Patch(
+                    facecolor=colorMap.get(name, "#808080"),
+                    edgecolor="none",
+                    label=name,
+                )
+                for name in subclusterNames
+            ]
+
+            ax.legend(
+                handles=handles,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                frameon=False,
+                fontsize=8,
+                markerscale=3,
+            )
+
+        plt.tight_layout()
+
+        return fig
+
+    @output
+    @render.plot
+    def subclustering_pca_plot():
+        pcaDf = subclustering_pca_scores.get()
+        labelsDf = subclustering_leiden_labels.get()
+
+        fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
+
+        if pcaDf is None or pcaDf.empty:
+            ax.text(0.5, 0.5, "Run sub-PCA to show plot", ha="center", va="center")
+            ax.set_axis_off()
+            return fig
+
+        plotDf = pcaDf.copy()
+
+        if labelsDf is not None and not labelsDf.empty:
+            plotDf = plotDf.merge(labelsDf, on=PINT_CELL_ID_COL, how="left")
+        else:
+            plotDf["PINT_SubLeiden_cluster"] = "Unclustered"
+
+        clusters = plotDf["PINT_SubLeiden_cluster"].fillna("Unclustered").astype(str)
+        clusterCodes, _ = pd.factorize(clusters)
+
+        ax.scatter(
+            plotDf["PC_1"],
+            plotDf["PC_2"],
+            c=clusterCodes,
+            s=float(input.subclustering_plot_point_size() or 2),
+            alpha=float(input.subclustering_plot_alpha() or 0.7),
+            cmap=input.subclustering_scatter_palette() or "viridis",
+            linewidths=0,
+        )
+
+        ax.set_xlabel("sub-PC 1")
+        ax.set_ylabel("sub-PC 2")
+        ax.set_title("Subclustering PCA")
+
+        return fig
+
+
+    @output
+    @render.plot
+    def subclustering_pacmap_plot():
+        embDf = subclustering_pacmap_embedding.get()
+        labelsDf = subclustering_leiden_labels.get()
+
+        fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
+
+        if embDf is None or embDf.empty:
+            ax.text(0.5, 0.5, "Run sub-PaCMAP to show embedding", ha="center", va="center")
+            ax.set_axis_off()
+            return fig
+
+        plotDf = embDf.copy()
+
+        if labelsDf is not None and not labelsDf.empty:
+            plotDf = plotDf.merge(labelsDf, on=PINT_CELL_ID_COL, how="left")
+        else:
+            plotDf["PINT_SubLeiden_cluster"] = "Unclustered"
+
+        clusters = plotDf["PINT_SubLeiden_cluster"].fillna("Unclustered").astype(str)
+        clusterCodes, _ = pd.factorize(clusters)
+
+        ax.scatter(
+            plotDf["SubPaCMAP_1"],
+            plotDf["SubPaCMAP_2"],
+            c=clusterCodes,
+            s=float(input.subclustering_plot_point_size() or 2),
+            alpha=float(input.subclustering_plot_alpha() or 0.7),
+            cmap=input.subclustering_scatter_palette() or "viridis",
+            linewidths=0,
+        )
+
+        ax.set_xlabel("Sub-PaCMAP 1")
+        ax.set_ylabel("Sub-PaCMAP 2")
+        ax.set_title("Subclustering PaCMAP")
+
+        return fig
+
+    @reactive.Effect
+    @reactive.event(input.export_subcluster_name_template)
+    def _export_subcluster_name_template():
+        subclusterNames = _get_current_subcluster_names()
+
+        if not subclusterNames:
+            msg = "No sub-Leiden clusters available. Run sub-Leiden first."
+            subclustering_annotation_status.set(msg)
+            print(f"⚠️ {msg}", flush=True)
+            return
+
+        templateDf = pd.DataFrame(
+            {
+                "OldClusterName": subclusterNames,
+                "NewClusterName": subclusterNames,
+            }
+        )
+
+        outDir = pick_folder_dialog()
+
+        if not outDir:
+            print("🛑 Subcluster-name template export canceled.")
+            return
+
+        try:
+            outDir = Path(outDir)
+            outDir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = outDir / f"PINT_subcluster_name_template_{timestamp}.csv"
+
+            templateDf.to_csv(path, index=False)
+
+            msg = f"Exported subcluster-name template to: {path}"
+            subclustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Could not export subcluster-name template: {e}"
+            subclustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
+
+
+    @reactive.Effect
+    @reactive.event(input.import_subcluster_name_map)
+    def _import_subcluster_name_map():
+        labelsDf = subclustering_leiden_labels.get()
+
+        if labelsDf is None or labelsDf.empty:
+            msg = "No sub-Leiden clusters available. Run sub-Leiden before importing names."
+            subclustering_annotation_status.set(msg)
+            print(f"⚠️ {msg}", flush=True)
+            return
+
+        csvPath = pick_open_csv_dialog()
+
+        if not csvPath:
+            print("🛑 Subcluster-name map import canceled.")
+            return
+
+        try:
+            raw = pd.read_csv(csvPath)
+
+            normalizedCols = {
+                c.lower().replace(" ", "").replace("_", ""): c
+                for c in raw.columns
+            }
+
+            oldCol = None
+            newCol = None
+
+            for key in ["oldclustername", "oldcluster", "subcluster", "oldname"]:
+                if key in normalizedCols:
+                    oldCol = normalizedCols[key]
+                    break
+
+            for key in ["newclustername", "newcluster", "clustername", "annotation", "newname"]:
+                if key in normalizedCols:
+                    newCol = normalizedCols[key]
+                    break
+
+            if oldCol is None or newCol is None:
+                raise ValueError(
+                    "Subcluster-name CSV must contain columns OldClusterName and NewClusterName."
+                )
+
+            nameMap = raw[[oldCol, newCol]].copy()
+            nameMap.columns = ["OldClusterName", "NewClusterName"]
+
+            nameMap["OldClusterName"] = nameMap["OldClusterName"].astype(str).str.strip()
+            nameMap["NewClusterName"] = nameMap["NewClusterName"].astype(str).str.strip()
+
+            nameMap = nameMap.loc[nameMap["OldClusterName"] != ""].copy()
+            nameMap = nameMap.loc[nameMap["NewClusterName"] != ""].copy()
+            nameMap = nameMap.drop_duplicates(subset=["OldClusterName"], keep="first")
+
+            currentClusters = set(_get_current_subcluster_names())
+            mappedClusters = set(nameMap["OldClusterName"].astype(str))
+
+            notAnnotated = sorted(currentClusters - mappedClusters)
+
+            subclustering_cluster_name_map.set(nameMap)
+
+            msg = (
+                f"Imported subcluster-name map: {len(nameMap):,} rows. "
+                f"Annotated {len(currentClusters - set(notAnnotated)):,}/{len(currentClusters):,} subclusters."
+            )
+
+            if notAnnotated:
+                msg += f" Unannotated subclusters keep their original names: {len(notAnnotated):,}."
+
+            subclustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Subcluster-name map import failed: {e}"
+            subclustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)    
+
+
     @reactive.Effect
     @reactive.event(input.push_mesmer_to_mask_visualization)
     def _push_mesmer_to_mask_visualization():

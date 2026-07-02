@@ -38,6 +38,9 @@ open issues/to do
 0.6.6 
     -Aligned the interfaces of the last 2 tabs with the rest.
     -Included a custom color picker! 
+0.6.7
+    -Finished clustering adn subclustering logic
+    -Added custom color picker in neigborhood tab
 
 
 

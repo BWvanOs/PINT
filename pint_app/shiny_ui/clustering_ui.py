@@ -646,6 +646,336 @@ def annotation_export_controls_card():
         class_="mb-2",
     )
 
+def subclustering_setup_card():
+    return ui.card(
+        ui.card_header("Subclustering setup"),
+
+        ui.tags.p(
+            "Select one annotated main cluster to recluster. The result can later be pushed "
+            "back into the master dataset as a new column.",
+            class_="text-muted",
+        ),
+
+        ui.output_ui("subclustering_parent_cluster_ui"),
+
+        ui.input_text(
+            "subclustering_output_column_name",
+            "Output column name",
+            value="ImmuneCellSubclusters",
+            placeholder="For example: ImmuneCellSubclusters",
+        ),
+
+        ui.input_action_button(
+            "prepare_subclustering_subset",
+            "Prepare selected cells",
+            class_="btn btn-primary compact-action-button mb-2",
+        ),
+
+        ui.output_ui("subclustering_subset_summary"),
+
+        class_="mb-2",
+    )
+
+
+def subclustering_pca_controls_card():
+    return ui.card(
+        ui.card_header("Subclustering PCA"),
+
+        ui.tags.p(
+            "Run PCA only on the selected parent cluster.",
+            class_="text-muted",
+        ),
+
+        ui.input_select(
+            "subclustering_pca_feature_mode",
+            "PCA feature mode",
+            choices={
+                "all_mapped": "Use all mapped clustering features",
+                "manual_subset": "Use manually entered feature list",
+            },
+            selected="all_mapped",
+        ),
+
+        ui.input_text_area(
+            "subclustering_pca_feature_list",
+            "Manual PCA feature list",
+            value="",
+            placeholder="One feature per line, or comma-separated.",
+            rows=3,
+        ),
+
+        ui.row(
+            ui.column(
+                6,
+                ui.input_numeric(
+                    "subclustering_n_pcs",
+                    "Number of PCs",
+                    value=20,
+                    min=2,
+                    step=1,
+                ),
+            ),
+            ui.column(
+                6,
+                ui.input_numeric(
+                    "subclustering_random_seed",
+                    "Random seed",
+                    value=1,
+                    min=1,
+                    step=1,
+                ),
+            ),
+        ),
+
+        ui.input_action_button(
+            "run_subclustering_pca",
+            "Run sub-PCA",
+            class_="btn btn-primary compact-action-button mb-2",
+        ),
+
+        class_="mb-2",
+    )
+
+
+def subclustering_leiden_controls_card():
+    return ui.card(
+        ui.card_header("Subclustering Leiden"),
+
+        ui.tags.p(
+            "Build a k-nearest-neighbor graph from sub-PCA scores and run Leiden clustering.",
+            class_="text-muted",
+        ),
+
+        ui.row(
+            ui.column(
+                4,
+                ui.input_numeric(
+                    "subclustering_leiden_n_dims",
+                    "PC dimensions",
+                    value=10,
+                    min=2,
+                    step=1,
+                ),
+            ),
+            ui.column(
+                4,
+                ui.input_numeric(
+                    "subclustering_leiden_n_neighbors",
+                    "k-nearest neighbors",
+                    value=15,
+                    min=2,
+                    step=1,
+                ),
+            ),
+            ui.column(
+                4,
+                ui.input_numeric(
+                    "subclustering_leiden_resolution",
+                    "Resolution",
+                    value=1.0,
+                    min=0.01,
+                    step=0.1,
+                ),
+            ),
+        ),
+
+        ui.input_action_button(
+            "run_subleiden_clustering",
+            "Run sub-Leiden",
+            class_="btn btn-primary compact-action-button mb-2",
+        ),
+
+        class_="mb-2",
+    )
+
+
+def subclustering_embedding_display_controls_card():
+    return ui.card(
+        ui.card_header("Subclustering display"),
+
+        ui.tags.p(
+            "Display controls for the sub-PCA and sub-PaCMAP plots.",
+            class_="text-muted",
+        ),
+
+        ui.row(
+            ui.column(
+                4,
+                ui.input_select(
+                    "subclustering_scatter_palette",
+                    "Palette",
+                    choices=VIRIDIS_CHOICES,
+                    selected="viridis",
+                ),
+            ),
+            ui.column(
+                4,
+                ui.input_numeric(
+                    "subclustering_embedding_plot_width",
+                    "Plot width",
+                    value=1200,
+                    min=600,
+                    max=1800,
+                    step=100,
+                ),
+            ),
+            ui.column(
+                2,
+                ui.input_numeric(
+                    "subclustering_plot_point_size",
+                    "Point size",
+                    value=2,
+                    min=0.1,
+                    step=0.5,
+                ),
+            ),
+            ui.column(
+                2,
+                ui.input_numeric(
+                    "subclustering_plot_alpha",
+                    "Alpha",
+                    value=0.7,
+                    min=0.05,
+                    max=1,
+                    step=0.05,
+                ),
+            ),
+        ),
+
+        class_="mb-2",
+    )
+
+
+def subclustering_pacmap_controls_card():
+    return ui.card(
+        ui.card_header("Subclustering PaCMAP"),
+
+        ui.tags.p(
+            "Run PaCMAP on sub-PCA scores. This embedding is separate from the main PaCMAP.",
+            class_="text-muted",
+        ),
+
+        ui.row(
+            ui.column(
+                3,
+                ui.input_numeric(
+                    "subclustering_pacmap_n_dims",
+                    "PC dimensions",
+                    value=10,
+                    min=2,
+                    step=1,
+                ),
+            ),
+            ui.column(
+                3,
+                ui.input_numeric(
+                    "subclustering_pacmap_n_neighbors",
+                    "n_neighbors",
+                    value=10,
+                    min=2,
+                    step=1,
+                ),
+            ),
+            ui.column(
+                3,
+                ui.input_numeric(
+                    "subclustering_pacmap_mn_ratio",
+                    "MN_ratio",
+                    value=0.5,
+                    min=0.0,
+                    step=0.1,
+                ),
+            ),
+            ui.column(
+                3,
+                ui.input_numeric(
+                    "subclustering_pacmap_fp_ratio",
+                    "FP_ratio",
+                    value=2.0,
+                    min=0.1,
+                    step=0.1,
+                ),
+            ),
+        ),
+
+        ui.input_action_button(
+            "run_subclustering_pacmap",
+            "Run sub-PaCMAP",
+            class_="btn btn-primary compact-action-button mb-2",
+        ),
+
+        class_="mb-2",
+    )
+
+
+def subcluster_annotation_controls_card():
+    return ui.card(
+        ui.card_header("Subcluster names and colors"),
+
+        ui.tags.p(
+            "Import a subcluster-name CSV with columns OldClusterName and NewClusterName. "
+            "OldClusterName should match Subcluster_0, Subcluster_1, etc.",
+            class_="text-muted",
+        ),
+
+        ui.input_action_button(
+            "export_subcluster_name_template",
+            "Export subcluster-name template",
+            class_="btn btn-secondary compact-action-button mb-2",
+        ),
+
+        ui.input_action_button(
+            "import_subcluster_name_map",
+            "Import subcluster names",
+            class_="btn btn-primary compact-action-button mb-2",
+        ),
+
+        ui.hr(),
+
+        ui.input_select(
+            "subcluster_color_palette",
+            "Subcluster color palette",
+            choices={
+                "viridis": "viridis",
+                "magma": "magma",
+                "plasma": "plasma",
+                "inferno": "inferno",
+                "cividis": "cividis",
+                "turbo": "turbo",
+                "custom": "custom colors",
+            },
+            selected="viridis",
+        ),
+
+        ui.output_ui("subcluster_custom_color_ui"),
+
+        class_="mb-2",
+    )
+
+
+def subcluster_pushback_card():
+    return ui.card(
+        ui.card_header("Push subclusters to master dataset"),
+
+        ui.tags.p(
+            "Write the current subcluster annotations and sub-PaCMAP coordinates back into "
+            "the master dataset using the selected output column name.",
+            class_="text-muted",
+        ),
+
+        ui.input_action_button(
+            "push_subcluster_annotations_to_main",
+            "Push subclusters to master",
+            class_="btn btn-primary compact-action-button mb-2",
+        ),
+
+        ui.output_ui("subcluster_pushback_summary"),
+
+        class_="mb-2",
+    )
+
+
+
 def clustering_panel():
     return ui.nav_panel(
         "Clustering",
@@ -834,6 +1164,131 @@ def clustering_panel():
                             ),
                         ),
 
+                        ui.nav_panel(
+                            "Subclustering",
+                            ui.tags.div(
+                                ui.output_ui("subclustering_status_summary"),
+
+                                ui.hr(),
+
+                                ui.row(
+                                    # Main output column
+                                    ui.column(
+                                        8,
+                                        ui.tags.div(
+                                            "Sub-PCA plot",
+                                            class_="mask-section-title",
+                                        ),
+
+                                        ui.output_ui("subclustering_pca_plot_ui"),
+
+                                        ui.hr(),
+
+                                        ui.row(
+                                            ui.column(
+                                                8,
+                                                ui.tags.div(
+                                                    "Sub-PCA variance",
+                                                    class_="mask-section-title",
+                                                ),
+                                                ui.output_data_frame("subclustering_pca_variance_preview"),
+                                            ),
+                                            ui.column(
+                                                4,
+                                                ui.tags.div(
+                                                    "Sub-Leiden counts",
+                                                    class_="mask-section-title",
+                                                ),
+                                                ui.output_data_frame("subclustering_leiden_counts_preview"),
+                                            ),
+                                        ),
+
+                                        class_="clustering-main-column",
+                                    ),
+
+                                    # Right control column
+                                    ui.column(
+                                        4,
+                                        ui.tags.div(
+                                            subclustering_setup_card(),
+                                            subclustering_pca_controls_card(),
+                                            subclustering_leiden_controls_card(),
+                                            subclustering_embedding_display_controls_card(),
+                                            class_="clustering-control-column ms-auto",
+                                        ),
+                                    ),
+                                ),
+
+                                class_="compact-stack",
+                            ),
+                        ),
+
+                        ui.nav_panel(
+                            "Subcl. Annotation",
+                            ui.tags.div(
+                                ui.output_ui("subclustering_annotation_summary"),
+
+                                ui.hr(),
+
+                                ui.row(
+                                    # Main output column
+                                    ui.column(
+                                        8,
+                                        ui.tags.div(
+                                            "Subcluster annotations",
+                                            class_="mask-section-title",
+                                        ),
+
+                                        ui.output_data_frame("subcluster_name_map_preview"),
+
+                                        ui.hr(),
+
+                                        ui.tags.div(
+                                            "Sub-PaCMAP embedding",
+                                            class_="mask-section-title",
+                                        ),
+
+                                        ui.tags.p(
+                                            "Sub-PaCMAP is calculated from sub-PCA scores and colored by the current subcluster names.",
+                                            class_="text-muted",
+                                        ),
+
+                                        ui.output_ui("subclustering_pacmap_plot_ui"),
+
+                                        ui.hr(),
+
+                                        ui.tags.div(
+                                            "Preview of columns to push back",
+                                            class_="mask-section-title",
+                                        ),
+
+                                        ui.tags.p(
+                                            "This preview shows how the subcluster annotations will be written back to the master dataset.",
+                                            class_="text-muted",
+                                        ),
+
+                                        ui.output_data_frame("subcluster_pushback_preview"),
+
+                                        class_="clustering-main-column",
+                                    ),
+
+                                    # Right control column
+                                    ui.column(
+                                        4,
+                                        ui.tags.div(
+                                            subcluster_annotation_controls_card(),
+                                            subclustering_pacmap_controls_card(),
+                                            subclustering_embedding_display_controls_card(),
+                                            subcluster_pushback_card(),
+                                            class_="clustering-control-column ms-auto",
+                                        ),
+                                    ),
+                                ),
+
+                                class_="compact-stack",
+                            ),
+                        ),
+                        
                         id="clustering_workspace_mode",
                     ),
 
