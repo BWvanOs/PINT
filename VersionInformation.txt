@@ -15,6 +15,7 @@ open issues/to do
         -Anndata?
         -make the push button transfer ownership of the data from segmentation to clustering to save data
     -Let user free up RAM by removing objects. Eg masks or data tables.
+        --Viewer is not present. Cannot interact with it yet
 
 0.6.0.1
     -Started with manual (readme.md) on how to use it
@@ -39,8 +40,9 @@ open issues/to do
     -Aligned the interfaces of the last 2 tabs with the rest.
     -Included a custom color picker! 
 0.6.7
-    -Finished clustering adn subclustering logic
+    -Finished clustering adn subclustering logic (beta)
     -Added custom color picker in neigborhood tab
+    -Viewer to see what's hogging RAM
 
 
 
