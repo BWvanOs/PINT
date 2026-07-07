@@ -89,6 +89,7 @@ from pint_app.core.mask_colors import (
     get_sorted_cluster_names,
     make_palette_color_map,
     make_custom_color_map,
+    is_custom_palette,
 )
 
 from pint_app.core.mask_neighbors_stats import (

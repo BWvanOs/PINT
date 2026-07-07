@@ -2,19 +2,28 @@ from __future__ import annotations
 
 from typing import Iterable
 
-import matplotlib.cm as cm
+import matplotlib as mpl
 import matplotlib.colors as mcolors
 
 
-VIRIDIS_PALETTES = {
-    "viridis",
-    "plasma",
-    "inferno",
-    "magma",
-    "cividis",
-    "turbo",
-}
+import matplotlib as mpl
+import matplotlib.colors as mcolors
 
+DEFAULT_PALETTE = "viridis"
+CUSTOM_PALETTE_NAMES = {"custom", "manual"}
+
+
+def is_custom_palette(palette_name: str | None) -> bool:
+    return str(palette_name or "").strip().lower() in CUSTOM_PALETTE_NAMES
+
+
+def resolve_matplotlib_palette_name(palette_name: str | None) -> str:
+    palette_name = str(palette_name or "").strip()
+
+    if palette_name in mpl.colormaps:
+        return palette_name
+
+    return DEFAULT_PALETTE
 
 def normalize_cluster_name(value: object) -> str:
     if value is None:
@@ -40,14 +49,7 @@ def make_palette_color_map(
     cluster_names: list[str],
     palette_name: str,
 ) -> dict[str, str]:
-    """
-    Create a stable cluster_name -> hex color mapping.
 
-    Important:
-    - Uses sorted cluster names.
-    - Samples evenly across the selected matplotlib colormap.
-    - Does not depend on which mask/image is currently shown.
-    """
     cluster_names = sorted(
         [normalize_cluster_name(x) for x in cluster_names],
         key=lambda x: x.lower(),
@@ -56,12 +58,8 @@ def make_palette_color_map(
     if len(cluster_names) == 0:
         return {}
 
-    palette_name = palette_name or "viridis"
-
-    if palette_name not in VIRIDIS_PALETTES:
-        palette_name = "viridis"
-
-    cmap = cm.get_cmap(palette_name)
+    palette_name = resolve_matplotlib_palette_name(palette_name)
+    cmap = mpl.colormaps[palette_name]
 
     if len(cluster_names) == 1:
         positions = [0.5]
