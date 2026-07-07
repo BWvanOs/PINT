@@ -23,4 +23,5 @@ dependencies:
       - uvicorn[standard]==0.35.0
       - htmltools==0.6.0
       - ome-types>=0.5.0
+      - annoy>=1.17
       - pacmap==0.9.1
