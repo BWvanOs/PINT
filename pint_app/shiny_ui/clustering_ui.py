@@ -102,7 +102,9 @@ def column_selection_card():
         ),
 
         ui.tags.p(
-            "Expected columns: ChannelNamesForClustering and ChannelNameToDisplay.",
+            "Expected columns: ChannelNamesForClustering and ChannelNameToDisplay."
+            "Export a template, edit it, then import it back into PINT. "
+            "CSV, tab-separated TXT/TSV, and Excel files are supported.",
             class_="text-muted",
         ),
 
@@ -114,7 +116,7 @@ def column_selection_card():
 
         ui.input_action_button(
             "import_clustering_column_map",
-            "Import edited column-name template",
+            "Import edited column-name table",
             class_="btn btn-primary compact-action-button mb-2",
         ),
 
@@ -952,6 +954,97 @@ def subcluster_annotation_controls_card():
         class_="mb-2",
     )
 
+def subcluster_heatmap_controls_card():
+    return ui.card(
+        ui.card_header("Subcluster heatmap export"),
+
+        ui.tags.p(
+            "Export subcluster × marker heatmaps from the current sub-Leiden clusters. "
+            "Use absolute expression to inspect marker abundance, or z-scores to emphasize "
+            "differences between subclusters.",
+            class_="text-muted",
+        ),
+
+        ui.row(
+            ui.column(
+                4,
+                ui.input_select(
+                    "subclustering_heatmap_aggregation",
+                    "Subcluster expression summary",
+                    choices={
+                        "mean": "Mean expression",
+                        "median": "Median expression",
+                    },
+                    selected="mean",
+                ),
+            ),
+            ui.column(
+                4,
+                ui.input_select(
+                    "subclustering_heatmap_mode",
+                    "Heatmap value mode",
+                    choices={
+                        "absolute": "Absolute expression",
+                        "zscore": "Z-score per marker across subclusters",
+                    },
+                    selected="absolute",
+                ),
+            ),
+            ui.column(
+                4,
+                ui.input_select(
+                    "subclustering_heatmap_palette",
+                    "Heatmap palette",
+                    choices=VIRIDIS_CHOICES,
+                    selected="viridis",
+                ),
+            ),
+        ),
+
+        ui.row(
+            ui.column(
+                6,
+                ui.input_select(
+                    "subclustering_heatmap_feature_mode",
+                    "Heatmap features",
+                    choices={
+                        "all_mapped": "Use all mapped clustering features",
+                        "manual_subset": "Use manually entered feature list",
+                    },
+                    selected="all_mapped",
+                ),
+            ),
+            ui.column(
+                6,
+                ui.input_numeric(
+                    "subclustering_heatmap_z_clip",
+                    "Z-score clip",
+                    value=2,
+                    min=0.1,
+                    step=0.25,
+                ),
+            ),
+        ),
+
+        ui.input_text_area(
+            "subclustering_heatmap_feature_list",
+            "Manual heatmap feature list",
+            value="",
+            placeholder=(
+                "One marker per line, or comma-separated. "
+                "May use source column names or display names."
+            ),
+            rows=5,
+        ),
+
+        ui.input_action_button(
+            "export_subcluster_heatmap",
+            "Export subcluster heatmap",
+            class_="btn btn-secondary compact-action-button mb-2",
+        ),
+
+        class_="mb-2",
+    )
 
 def subcluster_pushback_card():
     return ui.card(
@@ -1258,6 +1351,25 @@ def clustering_panel():
                                         ui.hr(),
 
                                         ui.tags.div(
+                                            "Last exported subcluster heatmap matrix",
+                                            class_="mask-section-title",
+                                        ),
+
+                                        ui.tags.p(
+                                            "This table shows the most recently exported subcluster × marker heatmap matrix.",
+                                            class_="text-muted",
+                                        ),
+
+                                        ui.output_data_frame("subclustering_marker_summary_preview"),
+
+                                        ui.hr(),
+
+                                        ui.tags.div(
+                                            "Preview of columns to push back",
+                                            class_="mask-section-title",
+                                        ),
+
+                                        ui.tags.div(
                                             "Preview of columns to push back",
                                             class_="mask-section-title",
                                         ),
@@ -1279,6 +1391,7 @@ def clustering_panel():
                                             subcluster_annotation_controls_card(),
                                             subclustering_pacmap_controls_card(),
                                             subclustering_embedding_display_controls_card(),
+                                            subcluster_heatmap_controls_card(),
                                             subcluster_pushback_card(),
                                             class_="clustering-control-column ms-auto",
                                         ),

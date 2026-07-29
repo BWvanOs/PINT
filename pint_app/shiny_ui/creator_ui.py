@@ -1,30 +1,18 @@
 from shiny import ui
+import json
 
 from pint_app.core.composites import (
     COMPOSITE_COLOR_CHOICES,
     COMPOSITE_EMPTY_CHOICE,
     MAX_COMPOSITE_CHANNELS,
+    composite_color_to_hex,
 )
 
 
 def make_composite_slot(slotIdx: int):
     defaultColor = COMPOSITE_COLOR_CHOICES[(slotIdx - 1) % len(COMPOSITE_COLOR_CHOICES)]
 
-    defaultHexByColor = {
-        "red": "#ff0000",
-        "green": "#00ff00",
-        "blue": "#0000ff",
-        "cyan": "#00ffff",
-        "magenta": "#ff00ff",
-        "yellow": "#ffff00",
-        "white": "#ffffff",
-        "gray": "#808080",
-        "grey": "#808080",
-        "orange": "#ff9900",
-        "purple": "#9900ff",
-    }
-
-    defaultHex = defaultHexByColor.get(str(defaultColor).lower(), "#ffffff")
+    defaultHex = composite_color_to_hex(defaultColor)
 
     return ui.row(
         ui.column(
@@ -84,6 +72,13 @@ def make_composite_slot(slotIdx: int):
 
 
 def creator_panel():
+    presetHexMap = {
+    colorName: composite_color_to_hex(colorName)
+    for colorName in COMPOSITE_COLOR_CHOICES
+    }
+
+    presetHexMapJson = json.dumps(presetHexMap)
+    
     return ui.nav_panel(
         "Image creator",
         ui.tags.div(
@@ -174,46 +169,120 @@ def creator_panel():
 
             class_="pint-main-layout",
         ),
-        ui.tags.script("""
-        document.addEventListener("input", function(event) {
-            if (!event.target.classList.contains("creator-color-picker")) {
-                return;
-            }
+        ui.tags.script(
+            f"""
+            const creatorPresetHexMap = {presetHexMapJson};
 
-            const targetId = event.target.dataset.target;
-            if (!targetId) {
-                return;
-            }
+            /*
+            * Custom picker → custom text field.
+            * Use "change" so Chromium does not flood Shiny while dragging.
+            */
+            document.addEventListener("change", function(event) {{
+                if (!event.target.classList.contains("creator-color-picker")) {{
+                    return;
+                }}
 
-            const textInput = document.getElementById(targetId);
-            if (!textInput) {
-                return;
-            }
+                const targetId = event.target.dataset.target;
 
-            textInput.value = event.target.value;
-            textInput.dispatchEvent(new Event("input", { bubbles: true }));
-            textInput.dispatchEvent(new Event("change", { bubbles: true }));
-        });
+                if (!targetId) {{
+                    return;
+                }}
 
-        document.addEventListener("change", function(event) {
-            if (!event.target.id || !event.target.id.startsWith("comp_hex_")) {
-                return;
-            }
+                const textInput = document.getElementById(targetId);
 
-            const value = event.target.value.trim();
+                if (!textInput) {{
+                    return;
+                }}
 
-            if (!/^#[0-9A-Fa-f]{6}$/.test(value)) {
-                return;
-            }
+                textInput.value = event.target.value;
+                textInput.dispatchEvent(
+                    new Event("input", {{ bubbles: true }})
+                );
+                textInput.dispatchEvent(
+                    new Event("change", {{ bubbles: true }})
+                );
+            }});
 
-            const pickerId = event.target.id.replace("comp_hex_", "comp_color_picker_");
-            const picker = document.getElementById(pickerId);
+            /*
+            * Custom text field → custom picker.
+            */
+            document.addEventListener("change", function(event) {{
+                if (
+                    !event.target.id ||
+                    !event.target.id.startsWith("comp_hex_")
+                ) {{
+                    return;
+                }}
 
-            if (picker) {
-                picker.value = value;
-            }
-        });
-        """),
+                const value = event.target.value.trim();
+
+                if (!/^#[0-9A-Fa-f]{{6}}$/.test(value)) {{
+                    return;
+                }}
+
+                const pickerId = event.target.id.replace(
+                    "comp_hex_",
+                    "comp_color_picker_"
+                );
+
+                const picker = document.getElementById(pickerId);
+
+                if (picker) {{
+                    picker.value = value;
+                }}
+            }});
+
+            /*
+            * Preset selector → custom text field and picker.
+            *
+            * This deliberately overwrites an existing custom value because the
+            * user explicitly selected a preset.
+            */
+            document.addEventListener("change", function(event) {{
+                if (
+                    !event.target.id ||
+                    !event.target.id.startsWith("comp_color_") ||
+                    event.target.id.startsWith("comp_color_picker_")
+                ) {{
+                    return;
+                }}
+
+                const presetName = event.target.value;
+                const presetHex = creatorPresetHexMap[presetName];
+
+                if (!presetHex) {{
+                    return;
+                }}
+
+                const slotIndex = event.target.id.replace(
+                    "comp_color_",
+                    ""
+                );
+
+                const textInput = document.getElementById(
+                    `comp_hex_${{slotIndex}}`
+                );
+
+                const picker = document.getElementById(
+                    `comp_color_picker_${{slotIndex}}`
+                );
+
+                if (picker) {{
+                    picker.value = presetHex;
+                }}
+
+                if (textInput) {{
+                    textInput.value = presetHex;
+                    textInput.dispatchEvent(
+                        new Event("input", {{ bubbles: true }})
+                    );
+                    textInput.dispatchEvent(
+                        new Event("change", {{ bubbles: true }})
+                    );
+                }}
+            }});
+            """
+        ),
 
         value="creator",
     )

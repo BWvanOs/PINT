@@ -5,6 +5,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import pandas as pd
+import base64
+import io
+
+from PIL import Image
 
 from shiny import App, ui, render, reactive
 from shiny.types import SilentException
@@ -46,6 +50,9 @@ from pint_app.core.dialogs import (
     pick_save_csv_dialog,
     pick_save_png_dialog,
     pick_save_tiff_dialog,
+    pick_open_table_dialog,
+    pick_open_mcd_dialog,
+    pick_open_mcd_files_dialog
 )
 from pint_app.core.processing import (
     clamp01,
@@ -72,6 +79,14 @@ from pint_app.core.load_masks import (
     match_cellmask_names_to_files,
     split_mask_matches,
     get_cells_for_mask_name,
+)
+
+from pint_app.core.mcd_backend import (
+    export_mcd_acquisitions_as_ome_tiff,
+    export_mcd_panoramas,
+    inspect_mcd_file,
+    inspect_mcd_files,
+    load_mcd_acquisitions,
 )
 
 from pint_app.core.mask_render_cache import (
@@ -120,8 +135,7 @@ from pint_app.core.segmentation_quantification import quantify_mesmer_masks_for_
 ##CSS UI module
 from pint_app.shiny_ui.styles import app_styles
 ##Rest of the ui panels
-from pint_app.shiny_ui.creator_ui import creator_panel
-from pint_app.shiny_ui.PINT_ui import pint_panel
+from pint_app.shiny_ui.image_handler_ui import image_handler_panel
 from pint_app.shiny_ui.segmentation_ui import segmentation_panel
 from pint_app.shiny_ui.clustering_ui import clustering_panel
 from pint_app.shiny_ui.mask_visualization_ui import mask_visualization_panel
@@ -152,28 +166,26 @@ app_ui = ui.page_sidebar(
                 # Toolbar + panels (so essentially everything but the table)
                 ui.tags.div(
                     ui.navset_tab(
-                        ##------->PINT panel of the shiny app<------##
-                        pint_panel(),
-
-                        ##------->Creator panel of the shiny app<------##
-                        creator_panel(),
+                        ##------->Image viewing, creation, and thumbnail tools<------##
+                        image_handler_panel(),
 
                         ##------->MESMER segmentation panel of the shiny app<------##
                         segmentation_panel(),
-                        
+
                         ##------->Clustering and annotation panel of the shiny app<------##
                         clustering_panel(),
 
-                        ##------->Mask visulaization and niegborhood preperation panel of the shiny app<------##
+                        ##------->Mask visualization and neighborhood preparation panel<------##
                         mask_visualization_panel(),
 
-                        ##------->Touching neigborhood panel of the shiny app<------##
+                        ##------->Touching neighborhood panel of the shiny app<------##
                         neighborhood_panel(),
-  
+
                         ##------->Advanced settings and memory diagnostics panel<------##
                         advanced_settings_panel(),
+
                         id="viewer_mode",
-                    ),
+                    )
                 ),
             ),
         ),
@@ -200,6 +212,12 @@ def server(input, output, session):
     data_loaded = reactive.Value(False)
     last_loaded_folder = reactive.Value("")  #This stores the last path used to load images so saving throws them into the same folder update here If you want this to cahnge
     
+    mcd_file_registry = reactive.Value(pd.DataFrame(columns=["MCD file index", "MCD file name", "MCD file path",]))
+    mcd_acquisition_metadata = reactive.Value(pd.DataFrame())
+    mcd_panorama_metadata = reactive.Value(pd.DataFrame())
+    mcd_file_summary = reactive.Value({})
+    mcd_loading_status = reactive.Value("No MCD file selected.")
+
     segmentation_mesmer_mask = reactive.Value(None)
     segmentation_mesmer_result = reactive.Value(None)
     segmentation_mesmer_mask_path = reactive.Value("")
@@ -209,6 +227,9 @@ def server(input, output, session):
     segmentation_cell_table_path = reactive.Value("")
     segmentation_mask_table_path = reactive.Value("")
     segmentation_quantification_status = reactive.Value("No Mesmer mask quantification run yet.")
+
+    thumbnail_cache = reactive.Value({})
+    thumbnail_status = reactive.Value("No thumbnails generated yet.")
 
     # Shared clustering dataset state.
     # This is intentionally one central object used by all clustering sub-tabs:
@@ -300,6 +321,249 @@ def server(input, output, session):
 
 
     ## <----------------> Helper functions <-------------------> ##
+    def _get_selected_mcd_acquisition_rows() -> pd.DataFrame:
+        """
+        Return the currently selected rows from the displayed MCD table.
+
+        Using data_view(selected=True) keeps the selection correct after
+        filtering or sorting the DataGrid.
+        """
+        selectedDf = (
+            mcd_acquisition_table.data_view(selected=True)
+        )
+
+        if (
+            selectedDf is None
+            or selectedDf.empty
+        ):
+            return pd.DataFrame()
+
+        return (
+            pd.DataFrame(selectedDf)
+            .copy()
+            .reset_index(drop=True)
+        )
+
+    def _get_mcd_path_for_index(
+        mcdFileIndex: int,
+    ) -> str:
+        registryDf = mcd_file_registry.get()
+
+        if (
+            registryDf is None
+            or registryDf.empty
+        ):
+            raise ValueError(
+                "No MCD file registry is available."
+            )
+
+        matches = registryDf.loc[
+            pd.to_numeric(
+                registryDf["MCD file index"],
+                errors="coerce",
+            )
+            == int(mcdFileIndex)
+        ]
+
+        if len(matches) != 1:
+            raise ValueError(
+                "Could not uniquely resolve MCD file index "
+                f"{mcdFileIndex}."
+            )
+
+        return str(
+            matches.iloc[0]["MCD file path"]
+        )
+
+    def _activate_loaded_image_library(
+        imgs: dict,
+        chs: dict,
+        *,
+        sourceFolder: str | None = None,
+        sourceLabel: str = "image library",
+    ) -> None:
+        """
+        Activate a PINT-compatible image/channel dictionary.
+
+        Used by both ordinary OME-TIFF loading and MCD acquisition loading.
+        """
+        if not imgs:
+            raise ValueError(
+                "The image library is empty."
+            )
+
+        samples = list(imgs.keys())
+
+        firstSample = samples[0]
+        firstChannelList = list(
+            chs.get(firstSample, [])
+        )
+
+        if not firstChannelList:
+            raise ValueError(
+                f"The first image '{firstSample}' "
+                "does not contain channel names."
+            )
+
+        firstChannel = firstChannelList[0]
+
+        images.set(imgs)
+        channels.set(chs)
+
+        # Cached processing and thumbnails refer to the
+        # previously loaded image library.
+        _invalidate_global_cache()
+        thumbnail_cache.set({})
+
+        thumbnail_status.set(
+            f"New {sourceLabel} loaded. "
+            "Generate thumbnails when ready."
+        )
+
+        canonical_channels.set(
+            firstChannelList
+        )
+
+        _prefill_params(
+            firstChannelList
+        )
+
+        setting_selects.set(True)
+
+        try:
+            ui.update_select(
+                "sample",
+                choices=samples,
+                selected=firstSample,
+                session=session,
+            )
+
+            ui.update_select(
+                "creator_sample_display",
+                choices=samples,
+                selected=firstSample,
+                session=session,
+            )
+
+            ui.update_select(
+                "thumbnail_sample_display",
+                choices=samples,
+                selected=firstSample,
+                session=session,
+            )
+
+            ui.update_select(
+                "channel",
+                choices=firstChannelList,
+                selected=firstChannel,
+                session=session,
+            )
+
+        finally:
+            setting_selects.set(False)
+
+        _sync_composite_channel_choices(
+            firstSample,
+            overwriteDefaults=True,
+        )
+
+        _sync_controls_from_table(
+            firstChannel
+        )
+
+        data_loaded.set(True)
+
+        if sourceFolder:
+            last_loaded_folder.set(
+                sourceFolder
+            )
+
+        print(
+            f"✅ Activated {sourceLabel}: "
+            f"{len(samples):,} image(s), "
+            f"{len(firstChannelList):,} channels.",
+            flush=True,
+        )
+
+    def _validate_loaded_image_channel_layouts(
+        channelsBySample: dict[str, list[str]],
+    ) -> None:
+        if not channelsBySample:
+            raise ValueError(
+                "No channel layouts are available."
+            )
+
+        items = list(
+            channelsBySample.items()
+        )
+
+        referenceName, referenceChannels = (
+            items[0]
+        )
+
+        referenceNormalized = [
+            str(value).strip().casefold()
+            for value in referenceChannels
+        ]
+
+        mismatches = []
+
+        for sampleName, channelNames in items[1:]:
+            normalized = [
+                str(value).strip().casefold()
+                for value in channelNames
+            ]
+
+            if normalized == referenceNormalized:
+                continue
+
+            mismatchDescription = (
+                f"{len(channelNames)} channels"
+            )
+
+            if len(channelNames) == len(
+                referenceChannels
+            ):
+                firstDifference = next(
+                    (
+                        index
+                        for index, (
+                            observed,
+                            expected,
+                        ) in enumerate(
+                            zip(
+                                normalized,
+                                referenceNormalized,
+                            )
+                        )
+                        if observed != expected
+                    ),
+                    None,
+                )
+
+                if firstDifference is not None:
+                    mismatchDescription = (
+                        "first difference at channel "
+                        f"{firstDifference + 1}: "
+                        f"'{channelNames[firstDifference]}' "
+                        "versus "
+                        f"'{referenceChannels[firstDifference]}'"
+                    )
+
+            mismatches.append(
+                f"- {sampleName}: "
+                f"{mismatchDescription}"
+            )
+
+        if mismatches:
+            raise ValueError(
+                "The selected ROIs do not share one "
+                "consistent channel layout.\n\n"
+                f"Reference: {referenceName}\n"
+                + "\n".join(mismatches)
+            )
+
+
     def _get_winsor_settings():
         """
         Reads the UI winsor settings, which is clamped to [0,1]. 
@@ -551,6 +815,486 @@ def server(input, output, session):
             winsor_min_upper_bound=WINSOR_MIN_UPPER_BOUND,
         )
     
+    THUMBNAIL_MAX_WIDTH = 250
+    THUMBNAIL_MAX_HEIGHT = 350
+
+
+    def _thumbnail_target_shape(
+        source_height: int,
+        source_width: int,
+        *,
+        max_width: int = THUMBNAIL_MAX_WIDTH,
+        max_height: int = THUMBNAIL_MAX_HEIGHT,
+    ) -> tuple[int, int]:
+        """
+        Calculate thumbnail dimensions while preserving aspect ratio.
+
+        Images are never enlarged beyond their original dimensions.
+        """
+        source_height = int(source_height)
+        source_width = int(source_width)
+
+        if source_height < 1 or source_width < 1:
+            raise ValueError(
+                "Thumbnail source image has invalid dimensions."
+            )
+
+        scale = min(
+            float(max_width) / float(source_width),
+            float(max_height) / float(source_height),
+            1.0,
+        )
+
+        target_width = max(
+            1,
+            int(round(source_width * scale)),
+        )
+
+        target_height = max(
+            1,
+            int(round(source_height * scale)),
+        )
+
+        return target_height, target_width
+
+    def _generate_sample_thumbnails(
+        sampleName: str,
+        renderMode: str,
+        cache: dict,
+        *,
+        progress=None,
+        progressOffset: int = 0,
+        totalWork: int | None = None,
+    ) -> tuple[dict, int, int, list[str], int]:
+        """
+        Generate all channel thumbnails for one sample.
+
+        Returns:
+        - updated cache
+        - number generated
+        - number reused
+        - failure messages
+        - number of channels processed
+        """
+        channelNames = channels.get().get(
+            sampleName,
+            [],
+        )
+
+        nGenerated = 0
+        nReused = 0
+        failures = []
+
+        for channelIndex, channelName in enumerate(
+            channelNames,
+            start=1,
+        ):
+            completedWork = (
+                progressOffset
+                + channelIndex
+                - 1
+            )
+
+            if progress is not None:
+                progress.set(
+                    value=completedWork,
+                    message=(
+                        f"Generating thumbnails for "
+                        f"{sampleName}"
+                    ),
+                    detail=(
+                        f"{channelName} "
+                        f"({completedWork + 1}/{totalWork})"
+                    ),
+                )
+
+            cacheKey = _make_thumbnail_cache_key(
+                sampleName,
+                channelName,
+                renderMode,
+            )
+
+            if cacheKey in cache:
+                nReused += 1
+
+            else:
+                try:
+                    cache[cacheKey] = (
+                        _build_thumbnail_cache_entry(
+                            sampleName,
+                            channelName,
+                            renderMode,
+                        )
+                    )
+
+                    nGenerated += 1
+
+                except Exception as e:
+                    failures.append(
+                        f"{sampleName} / {channelName}: {e}"
+                    )
+
+            if progress is not None:
+                progress.set(
+                    value=progressOffset + channelIndex
+                )
+
+        return (
+            cache,
+            nGenerated,
+            nReused,
+            failures,
+            len(channelNames),
+        )
+
+    def _processed_image_to_uint8(
+        image: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Convert a processed two-dimensional image to display-ready uint8.
+
+        PINT-normalized arrays are already in [0, 1]. If normalization was
+        disabled, this reproduces Matplotlib's automatic min/max display scaling.
+        """
+        image = np.asarray(
+            image,
+            dtype=np.float32,
+        )
+
+        ##Catch if input is incorrect
+        if image.ndim != 2:
+            raise ValueError(
+                "Thumbnail input must be a two-dimensional channel image."
+            )
+
+        finiteMask = np.isfinite(image)
+
+        if not finiteMask.any():
+            return np.zeros(
+                image.shape,
+                dtype=np.uint8,
+            )
+
+        finiteValues = image[finiteMask]
+
+        imageMin = float(np.min(finiteValues))
+        imageMax = float(np.max(finiteValues))
+
+        if imageMax <= imageMin:
+            return np.zeros(
+                image.shape,
+                dtype=np.uint8,
+            )
+
+        # Normalized PINT images can be converted directly. Non-normalized
+        # images are scaled as Matplotlib would scale them for display.
+        if imageMin >= 0.0 and imageMax <= 1.0:
+            scaled = image
+        else:
+            scaled = (
+                image - imageMin
+            ) / (
+                imageMax - imageMin
+            )
+
+        scaled = np.nan_to_num(
+            scaled,
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+        scaled = np.clip(
+            scaled,
+            0.0,
+            1.0,
+        )
+
+        return np.round(
+            scaled * 255.0
+        ).astype(np.uint8)
+
+    def _max_pool_uint8_to_shape(
+        image: np.ndarray,
+        target_height: int,
+        target_width: int,
+    ) -> np.ndarray:
+        """
+        Downscale a uint8 image using variable-size maximum-pooling regions.
+
+        Every source pixel belongs to one output region. Small bright structures
+        are therefore retained rather than averaged away.
+        """
+        image = np.asarray(
+            image,
+            dtype=np.uint8,
+        )
+
+        source_height, source_width = image.shape
+
+        target_height = min(
+            int(target_height),
+            source_height,
+        )
+
+        target_width = min(
+            int(target_width),
+            source_width,
+        )
+
+        if (
+            target_height == source_height
+            and target_width == source_width
+        ):
+            return image.copy()
+
+        rowStarts = np.floor(
+            np.arange(target_height)
+            * source_height
+            / target_height
+        ).astype(np.int64)
+
+        colStarts = np.floor(
+            np.arange(target_width)
+            * source_width
+            / target_width
+        ).astype(np.int64)
+
+        # np.maximum.reduceat reduces each interval from one start index
+        # up to the next. The final interval continues to the image boundary.
+        # This handles images without integer scaling (eg 1100x700 into 250x~)
+        pooledRows = np.maximum.reduceat(
+            image,
+            rowStarts,
+            axis=0,
+        )
+
+        pooled = np.maximum.reduceat(
+            pooledRows,
+            colStarts,
+            axis=1,
+        )
+
+        return pooled[
+            :target_height,
+            :target_width,
+        ].astype(
+            np.uint8,
+            copy=False,
+        )
+
+    ##Downscale to unint8 to prevent the cache from exploding in size
+    def _area_downscale_uint8(
+        image: np.ndarray,
+        target_height: int,
+        target_width: int,
+    ) -> np.ndarray:
+        """
+        Downscale uint8 image using area averaging.
+
+        This produces a smooth, anti-aliased overview but can dilute isolated
+        bright structures.
+        """
+        image = np.asarray(
+            image,
+            dtype=np.uint8,
+        )
+
+        source_height, source_width = image.shape
+
+        target_height = min(
+            int(target_height),
+            source_height,
+        )
+
+        target_width = min(
+            int(target_width),
+            source_width,
+        )
+
+        if (
+            target_height == source_height
+            and target_width == source_width
+        ):
+            return image.copy()
+
+        pilImage = Image.fromarray(
+            image,
+            mode="L",
+        )
+
+        resized = pilImage.resize(
+            (
+                target_width,
+                target_height,
+            ),
+            resample=Image.Resampling.BOX,
+        )
+
+        return np.asarray(
+            resized,
+            dtype=np.uint8,
+        )
+
+    def _uint8_thumbnail_to_png_bytes(
+        image: np.ndarray,
+    ) -> bytes:
+        """
+        Encode a grayscale uint8 thumbnail as compressed PNG bytes.
+        """
+        buffer = io.BytesIO()
+
+        Image.fromarray(
+            np.asarray(image, dtype=np.uint8),
+            mode="L",
+        ).save(
+            buffer,
+            format="PNG",
+            optimize=True,
+        )
+
+        return buffer.getvalue()
+
+    def _png_bytes_to_data_uri(
+        pngBytes: bytes,
+    ) -> str:
+        encoded = base64.b64encode(
+            pngBytes
+        ).decode("ascii")
+
+        return (
+            "data:image/png;base64,"
+            + encoded
+        )
+    
+    THUMBNAIL_PARAM_COLUMNS = (
+        "DoWinsor",
+        "Low",
+        "High",
+        "DoThr",
+        "ThrVal",
+        "DoAbsThr",
+        "AbsThrVal",
+        "Noise",
+        "NStr",
+        "WinSz",
+        "DoNorm",
+        "NormScope",
+        "DoAsinh",
+        "Cofac",
+    )
+
+
+    def _thumbnail_parameter_signature(
+        channelName: str,
+    ) -> tuple:
+        """
+        Return a stable signature for the channel's current processing settings.
+        """
+        row = _get_channel_param_row(
+            channelName
+        )
+
+        if row is None:
+            return ("missing-parameters",)
+
+        return tuple(
+            str(row.get(columnName, ""))
+            for columnName in THUMBNAIL_PARAM_COLUMNS
+        )
+    
+    ##If you change a channel it will only invalidate part of the cache. 
+    def _build_thumbnail_cache_entry(
+        sampleName: str,
+        channelName: str,
+        renderMode: str,
+    ) -> dict:
+        """
+        Process, downscale, and encode one channel thumbnail.
+        """
+        processed = _process_channel_from_table(
+            sampleName,
+            channelName,
+        )
+
+        if processed is None:
+            raise ValueError(
+                f"Could not process channel '{channelName}'."
+            )
+
+        sourceHeight, sourceWidth = processed.shape
+
+        targetHeight, targetWidth = (
+            _thumbnail_target_shape(
+                sourceHeight,
+                sourceWidth,
+            )
+        )
+
+        displayUint8 = (
+            _processed_image_to_uint8(
+                processed
+            )
+        )
+
+        # The full-resolution float array is no longer needed after this point.
+        del processed
+
+        if renderMode == "signal":
+            thumbnailUint8 = (
+                _max_pool_uint8_to_shape(
+                    displayUint8,
+                    targetHeight,
+                    targetWidth,
+                )
+            )
+
+        elif renderMode == "smooth":
+            thumbnailUint8 = (
+                _area_downscale_uint8(
+                    displayUint8,
+                    targetHeight,
+                    targetWidth,
+                )
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown thumbnail rendering mode: {renderMode}"
+            )
+
+        del displayUint8
+
+        pngBytes = (
+            _uint8_thumbnail_to_png_bytes(
+                thumbnailUint8
+            )
+        )
+
+        return {
+            "png_bytes": pngBytes,
+            "width": int(targetWidth),
+            "height": int(targetHeight),
+            "source_width": int(sourceWidth),
+            "source_height": int(sourceHeight),
+        }
+    
+    def _make_thumbnail_cache_key(
+        sampleName: str,
+        channelName: str,
+        renderMode: str,
+    ) -> tuple:
+        return (
+            str(sampleName),
+            str(channelName),
+            str(renderMode),
+            THUMBNAIL_MAX_WIDTH,
+            THUMBNAIL_MAX_HEIGHT,
+            _thumbnail_parameter_signature(
+                channelName
+            ),
+        )
+
 
     def _build_composite_rgb(sampleName: str | None = None):
         if sampleName is None:
@@ -620,7 +1364,9 @@ def server(input, output, session):
             if overwriteDefaults:
                 selectedVal = defaultVal
             else:
-                selectedVal = currentVal if currentVal in ordered else defaultVal
+                # Preserve both real channel selections and an explicit
+                # "Leave blank" selection when changing images. Should resolve the automatic filling of unassigned first channel
+                selectedVal = currentVal if currentVal in choices else defaultVal
 
             ui.update_select(
                 inputId,
@@ -1153,66 +1899,197 @@ def server(input, output, session):
 
     def _get_pca_feature_map() -> pd.DataFrame:
         """
-        Return the feature map used for PCA/clustering.
+        Return the feature map used for main PCA/clustering.
 
-        Starts from the validated clustering column map.
-        Optionally filters to a manually entered feature subset.
-        The manual list may contain either source column names or display names.
+        Manual lists may contain source column names or display names.
+        Every manually entered name must match; otherwise PCA is stopped.
         """
-        validMap = _get_valid_clustering_column_map()
+        expectedCols = [
+            "ChannelNamesForClustering",
+            "ChannelNameToDisplay",
+        ]
 
-        expectedCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+        validMap = _get_valid_clustering_column_map()
 
         if validMap is None or validMap.empty:
             return pd.DataFrame(columns=expectedCols)
 
-        featureMode = input.clustering_pca_feature_mode() or "all_mapped"
+        featureMode = (
+            input.clustering_pca_feature_mode()
+            or "all_mapped"
+        )
 
-        if featureMode == "manual_subset":
-            requested = _parse_feature_list_text(input.clustering_pca_feature_list())
+        if featureMode != "manual_subset":
+            return validMap.reset_index(drop=True)
 
-            if not requested:
-                return pd.DataFrame(columns=expectedCols)
+        requested = _parse_feature_list_text(
+            input.clustering_pca_feature_list()
+        )
 
-            requestedSet = set(requested)
+        if not requested:
+            raise ClusteringInputError(
+                "Manual PCA feature selection is enabled, "
+                "but no feature names were entered."
+            )
 
-            validMap = validMap.loc[
-                validMap["ChannelNamesForClustering"].isin(requestedSet)
-                | validMap["ChannelNameToDisplay"].isin(requestedSet)
-            ].copy()
+        sourceNames = set(
+            validMap["ChannelNamesForClustering"]
+            .astype(str)
+            .str.strip()
+        )
 
-        return validMap.reset_index(drop=True)
+        displayNames = set(
+            validMap["ChannelNameToDisplay"]
+            .astype(str)
+            .str.strip()
+        )
+
+        availableNames = sourceNames | displayNames
+
+        recognized = [
+            name
+            for name in requested
+            if name in availableNames
+        ]
+
+        unmatched = [
+            name
+            for name in requested
+            if name not in availableNames
+        ]
+
+        if unmatched:
+            raise ClusteringInputError(
+                "Manual PCA feature names did not all match the "
+                "clustering column map.\n"
+                f"Recognized: {', '.join(recognized) or 'none'}\n"
+                f"Not found: {', '.join(unmatched)}"
+            )
+
+        requestedSet = set(requested)
+
+        selectedMap = validMap.loc[
+            validMap["ChannelNamesForClustering"]
+            .astype(str)
+            .str.strip()
+            .isin(requestedSet)
+            |
+            validMap["ChannelNameToDisplay"]
+            .astype(str)
+            .str.strip()
+            .isin(requestedSet)
+        ].copy()
+
+        print(
+            "▶️ Main PCA manual features: "
+            + ", ".join(
+                selectedMap["ChannelNameToDisplay"].astype(str)
+            ),
+            flush=True,
+        )
+
+        return selectedMap.reset_index(drop=True)
     
+    class ClusteringInputError(ValueError):
+        """
+        Expected clustering workflow/input error.
+
+        These errors should be shown to the user without a programming traceback.
+        """
+        pass
+
     def _get_subclustering_pca_feature_map() -> pd.DataFrame:
         """
-        Return marker/channel feature map for subclustering PCA.
+        Return the feature map used for subclustering PCA.
 
-        Uses the same imported clustering column map, but can optionally restrict
-        to a manually entered subclustering marker list.
+        Manual lists may contain source column names or display names.
+        Every manually entered name must match; otherwise sub-PCA is stopped.
         """
-        validMap = _get_valid_clustering_column_map()
+        expectedCols = [
+            "ChannelNamesForClustering",
+            "ChannelNameToDisplay",
+        ]
 
-        expectedCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+        validMap = _get_valid_clustering_column_map()
 
         if validMap is None or validMap.empty:
             return pd.DataFrame(columns=expectedCols)
 
-        mode = input.subclustering_pca_feature_mode() or "all_mapped"
+        featureMode = (
+            input.subclustering_pca_feature_mode()
+            or "all_mapped"
+        )
 
-        if mode == "manual_subset":
-            requested = _parse_feature_list_text(input.subclustering_pca_feature_list())
+        if featureMode != "manual_subset":
+            return validMap.reset_index(drop=True)
 
-            if not requested:
-                return pd.DataFrame(columns=expectedCols)
+        requested = _parse_feature_list_text(
+            input.subclustering_pca_feature_list()
+        )
 
-            requestedSet = set(requested)
+        if not requested:
+            raise ClusteringInputError(
+                "Manual sub-PCA feature selection is enabled, "
+                "but no feature names were entered."
+            )
 
-            validMap = validMap.loc[
-                validMap["ChannelNamesForClustering"].isin(requestedSet)
-                | validMap["ChannelNameToDisplay"].isin(requestedSet)
-            ].copy()
+        sourceNames = set(
+            validMap["ChannelNamesForClustering"]
+            .astype(str)
+            .str.strip()
+        )
 
-        return validMap.reset_index(drop=True)
+        displayNames = set(
+            validMap["ChannelNameToDisplay"]
+            .astype(str)
+            .str.strip()
+        )
+
+        availableNames = sourceNames | displayNames
+
+        recognized = [
+            name
+            for name in requested
+            if name in availableNames
+        ]
+
+        unmatched = [
+            name
+            for name in requested
+            if name not in availableNames
+        ]
+
+        if unmatched:
+            raise ClusteringInputError(
+                "Manual sub-PCA feature names did not all match the "
+                "clustering column map.\n"
+                f"Recognized: {', '.join(recognized) or 'none'}\n"
+                f"Not found: {', '.join(unmatched)}"
+            )
+
+        requestedSet = set(requested)
+
+        selectedMap = validMap.loc[
+            validMap["ChannelNamesForClustering"]
+            .astype(str)
+            .str.strip()
+            .isin(requestedSet)
+            |
+            validMap["ChannelNameToDisplay"]
+            .astype(str)
+            .str.strip()
+            .isin(requestedSet)
+        ].copy()
+
+        print(
+            "▶️ Sub-PCA manual features: "
+            + ", ".join(
+                selectedMap["ChannelNameToDisplay"].astype(str)
+            ),
+            flush=True,
+        )
+
+        return selectedMap.reset_index(drop=True)
 
     def _prepare_clustering_feature_matrix(
         active_cell_ids=None,
@@ -1235,8 +2112,15 @@ def server(input, output, session):
         if df is None or df.empty:
             raise ValueError("No clustering dataset loaded.")
 
-        if PINT_CELL_ID_COL not in df.columns:
-            raise ValueError("Create/validate PINT_Cell_ID before running PCA.")
+        idIsValid, idValidationMessage = (
+            _validate_pint_cell_id_column(df)
+        )
+
+        if not idIsValid:
+            raise ValueError(
+                "PINT_Cell_ID validation failed: "
+                + idValidationMessage
+            )
 
         if feature_map is None:
             featureMap = _get_pca_feature_map()
@@ -1475,18 +2359,32 @@ def server(input, output, session):
 
     def _cluster_sort_key(value):
         """
-        Sort Cluster_2 before Cluster_10.
-        Falls back to lowercase string sorting.
+        Naturally sort PINT cluster and subcluster labels.
+
+        Examples:
+        - Cluster_2 before Cluster_10
+        - Subcluster_2 before Subcluster_10
         """
         value = str(value)
 
-        if value.startswith("Cluster_"):
-            try:
-                return (0, int(value.replace("Cluster_", "")))
-            except Exception:
-                pass
+        for prefix in (
+            "Cluster_",
+            "Subcluster_",
+        ):
+            if value.startswith(prefix):
+                try:
+                    return (
+                        0,
+                        prefix,
+                        int(value.removeprefix(prefix)),
+                    )
+                except (TypeError, ValueError):
+                    pass
 
-        return (1, value.lower())
+        return (
+            1,
+            value.lower(),
+        )
 
 
     def _get_heatmap_feature_map() -> pd.DataFrame:
@@ -1519,6 +2417,96 @@ def server(input, output, session):
 
         return validMap.reset_index(drop=True)
 
+    def _get_subclustering_heatmap_feature_map() -> pd.DataFrame:
+        """
+        Return marker/channel feature map for subcluster heatmaps.
+
+        This can use all mapped clustering features or a manually entered subset.
+        The manual list may contain source column names or display names.
+        """
+        expectedCols = [
+            "ChannelNamesForClustering",
+            "ChannelNameToDisplay",
+        ]
+
+        validMap = _get_valid_clustering_column_map()
+
+        if validMap is None or validMap.empty:
+            return pd.DataFrame(columns=expectedCols)
+
+        mode = (
+            input.subclustering_heatmap_feature_mode()
+            or "all_mapped"
+        )
+
+        if mode != "manual_subset":
+            return validMap.reset_index(drop=True)
+
+        requested = _parse_feature_list_text(
+            input.subclustering_heatmap_feature_list()
+        )
+
+        if not requested:
+            print(
+                "⚠️ Manual subcluster heatmap mode is selected, "
+                "but no marker names were entered.",
+                flush=True,
+            )
+
+            return pd.DataFrame(columns=expectedCols)
+
+        sourceNames = set(
+            validMap["ChannelNamesForClustering"]
+            .astype(str)
+            .str.strip()
+        )
+
+        displayNames = set(
+            validMap["ChannelNameToDisplay"]
+            .astype(str)
+            .str.strip()
+        )
+
+        availableNames = sourceNames | displayNames
+
+        validRequested = [
+            name
+            for name in requested
+            if name in availableNames
+        ]
+
+        unmatched = [
+            name
+            for name in requested
+            if name not in availableNames
+        ]
+
+        if unmatched:
+            print(
+                "❌ Subcluster heatmap marker name mismatch.\n"
+                f"   Recognized: {', '.join(validRequested) or 'none'}\n"
+                f"   Not found: {', '.join(unmatched)}",
+                flush=True,
+            )
+
+            return pd.DataFrame(columns=expectedCols)
+
+        requestedSet = set(requested)
+
+        validMap = validMap.loc[
+            validMap["ChannelNamesForClustering"]
+            .astype(str)
+            .str.strip()
+            .isin(requestedSet)
+            |
+            validMap["ChannelNameToDisplay"]
+            .astype(str)
+            .str.strip()
+            .isin(requestedSet)
+        ].copy()
+
+        return validMap.reset_index(drop=True)
+    
 
     def _build_cluster_marker_matrix() -> tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -1621,6 +2609,176 @@ def server(input, output, session):
 
         return plotMatrix, summaryDf
 
+    def _build_subcluster_marker_matrix() -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Build subcluster × marker matrix from the current sub-Leiden clusters.
+
+        Returns:
+        - plotMatrix: subcluster-indexed matrix used for plotting
+        - summaryDf: same matrix with a Subcluster column for CSV and preview
+        """
+        df = clustering_data.get()
+        labelsDf = subclustering_leiden_labels.get()
+
+        if df is None or df.empty:
+            raise ValueError("No clustering dataset loaded.")
+
+        if PINT_CELL_ID_COL not in df.columns:
+            raise ValueError(
+                "PINT_Cell_ID is missing. Create or validate cell IDs first."
+            )
+
+        if labelsDf is None or labelsDf.empty:
+            raise ValueError(
+                "No sub-Leiden clusters available. Run sub-Leiden clustering first."
+            )
+
+        requiredLabelCols = {
+            PINT_CELL_ID_COL,
+            "PINT_SubLeiden_cluster",
+        }
+
+        missingLabelCols = requiredLabelCols - set(labelsDf.columns)
+
+        if missingLabelCols:
+            raise ValueError(
+                "Subclustering labels are missing required columns: "
+                + ", ".join(sorted(missingLabelCols))
+            )
+
+        featureMap = _get_subclustering_heatmap_feature_map()
+
+        if featureMap is None or featureMap.empty:
+            raise ValueError(
+                "No valid marker/channel features selected for the subcluster heatmap."
+            )
+
+        sourceCols = featureMap["ChannelNamesForClustering"].tolist()
+        displayCols = _make_unique_names(
+            featureMap["ChannelNameToDisplay"].tolist()
+        )
+
+        missingCols = [col for col in sourceCols if col not in df.columns]
+
+        if missingCols:
+            raise ValueError(
+                "Subcluster heatmap feature columns are missing from clustering_data: "
+                + ", ".join(missingCols)
+            )
+
+        useDf = df[[PINT_CELL_ID_COL] + sourceCols].copy()
+
+        # Attach sub-Leiden labels using the stable PINT cell identifier.
+        useDf = useDf.merge(
+            labelsDf[
+                [
+                    PINT_CELL_ID_COL,
+                    "PINT_SubLeiden_cluster",
+                ]
+            ],
+            on=PINT_CELL_ID_COL,
+            how="inner",
+        )
+
+        if useDf.empty:
+            raise ValueError(
+                "No cells matched between clustering_data and sub-Leiden labels."
+            )
+
+        for col in sourceCols:
+            useDf[col] = pd.to_numeric(
+                useDf[col],
+                errors="coerce",
+            )
+
+        useDf[sourceCols] = useDf[sourceCols].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+        aggregationMode = (
+            input.subclustering_heatmap_aggregation()
+            or "mean"
+        )
+
+        if aggregationMode == "median":
+            summary = (
+                useDf
+                .groupby(
+                    "PINT_SubLeiden_cluster",
+                    sort=False,
+                )[sourceCols]
+                .median()
+            )
+        elif aggregationMode == "mean":
+            summary = (
+                useDf
+                .groupby(
+                    "PINT_SubLeiden_cluster",
+                    sort=False,
+                )[sourceCols]
+                .mean()
+            )
+        else:
+            raise ValueError(
+                f"Unknown subcluster heatmap aggregation mode: {aggregationMode}"
+            )
+
+        sortedSubclusters = sorted(
+            summary.index.tolist(),
+            key=_cluster_sort_key,
+        )
+
+        summary = summary.loc[sortedSubclusters].copy()
+        summary.columns = displayCols
+
+        heatmapMode = (
+            input.subclustering_heatmap_mode()
+            or "absolute"
+        )
+
+        if heatmapMode == "zscore":
+            markerMean = summary.mean(axis=0)
+            markerStd = summary.std(axis=0).replace(0, np.nan)
+
+            plotMatrix = (summary - markerMean) / markerStd
+            plotMatrix = (
+                plotMatrix
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0)
+            )
+
+            zClip = float(
+                input.subclustering_heatmap_z_clip()
+                or 2
+            )
+
+            if zClip > 0:
+                plotMatrix = plotMatrix.clip(
+                    lower=-zClip,
+                    upper=zClip,
+                )
+
+        elif heatmapMode == "absolute":
+            plotMatrix = summary.copy()
+
+        else:
+            raise ValueError(
+                f"Unknown subcluster heatmap mode: {heatmapMode}"
+            )
+
+        summaryDf = (
+            plotMatrix
+            .reset_index()
+            .rename(
+                columns={
+                    "PINT_SubLeiden_cluster": "Subcluster",
+                }
+            )
+        )
+
+        return plotMatrix, summaryDf
+
     def _get_equal_axis_plot_geometry(
         plotDf: pd.DataFrame,
         x_col: str,
@@ -1692,6 +2850,9 @@ def server(input, output, session):
         *,
         palette: str = "viridis",
         title: str = "Cluster marker heatmap",
+        heatmap_mode: str = "absolute",
+        z_clip: float = 2,
+        cluster_axis_label: str = "Leiden cluster",
     ):
         """
         Create a marker × cluster heatmap figure.
@@ -1715,12 +2876,9 @@ def server(input, output, session):
 
         fig, ax = plt.subplots(figsize=(figWidth, figHeight), dpi=200)
 
-        heatmapMode = input.clustering_heatmap_mode() or "absolute"
-
-        if heatmapMode == "zscore":
-            zClip = float(input.clustering_heatmap_z_clip() or 2)
-            vmin = -zClip if zClip > 0 else None
-            vmax = zClip if zClip > 0 else None
+        if heatmap_mode == "zscore":
+            vmin = -z_clip if z_clip > 0 else None
+            vmax = z_clip if z_clip > 0 else None
         else:
             vmin = None
             vmax = None
@@ -1747,13 +2905,13 @@ def server(input, output, session):
             fontsize=8,
         )
 
-        ax.set_xlabel("Leiden cluster")
+        ax.set_xlabel(cluster_axis_label)
         ax.set_ylabel("Marker / channel")
         ax.set_title(title)
 
         cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
 
-        if heatmapMode == "zscore":
+        if heatmap_mode == "zscore":
             cbar.set_label("Z-score")
         else:
             cbar.set_label("Expression")
@@ -2637,6 +3795,879 @@ def server(input, output, session):
 
 
     @reactive.Effect
+    @reactive.event(input.open_mcd_file)
+    def _open_mcd_file():
+        initialFolder = (
+            last_loaded_folder.get()
+            or (input.path() or "").strip()
+        )
+
+        if (
+            not initialFolder
+            or not os.path.isdir(initialFolder)
+        ):
+            initialFolder = os.getcwd()
+
+        selectedPaths = pick_open_mcd_files_dialog(
+            title="Select one or more MCD files",
+            initialdir=initialFolder,
+        )
+
+        if not selectedPaths:
+            print(
+                "🛑 MCD selection canceled.",
+                flush=True,
+            )
+            return
+
+        mcd_loading_status.set(
+            "Reading MCD metadata..."
+        )
+
+        try:
+            (
+                acquisitionDf,
+                panoramaDf,
+                registryDf,
+                summary,
+            ) = inspect_mcd_files(
+                selectedPaths
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                "Failed to inspect MCD file(s): "
+                f"{e}"
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+            return
+
+        mcd_file_registry.set(
+            registryDf
+        )
+
+        mcd_acquisition_metadata.set(
+            acquisitionDf
+        )
+
+        mcd_panorama_metadata.set(
+            panoramaDf
+        )
+
+        mcd_file_summary.set(
+            summary
+        )
+
+        last_loaded_folder.set(
+            str(
+                Path(selectedPaths[0]).parent
+            )
+        )
+
+        msg = (
+            f"Inspected {summary['files']:,} MCD file(s): "
+            f"{summary['slides']:,} slide(s), "
+            f"{summary['acquisitions']:,} acquisition(s), "
+            f"{summary['panoramas']:,} panorama image(s). "
+            "No image pixels were loaded."
+        )
+
+        mcd_loading_status.set(msg)
+
+        ui.notification_show(
+            msg,
+            type="message",
+            duration=8,
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+
+    @render.data_frame
+    def mcd_acquisition_table():
+        acquisitionDf = (
+            mcd_acquisition_metadata.get()
+        )
+
+        if (
+            acquisitionDf is None
+            or acquisitionDf.empty
+        ):
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No MCD acquisitions loaded."
+                        ]
+                    }
+                )
+            )
+
+        displayColumns = [
+            "MCD file index",
+            "MCD file name",
+            "Slide index",
+            "Slide ID",
+            "Slide description",
+            "Acquisition index",
+            "Acquisition ID",
+            "Acquisition description",
+            "Width (px)",
+            "Height (px)",
+            "Channels",
+        ]
+
+        displayDf = acquisitionDf[
+            [
+                column
+                for column in displayColumns
+                if column in acquisitionDf.columns
+            ]
+        ].copy()
+
+        return render.DataGrid(
+            displayDf,
+            height="520px",
+            filters=True,
+            selection_mode="rows",
+            summary=(
+                "Showing acquisitions "
+                "{start}–{end} of {total}"
+            ),
+        )
+
+    @output
+    @render.ui
+    def mcd_file_status_ui():
+        summary = mcd_file_summary.get()
+
+        selectedDf = (
+            _get_selected_mcd_acquisition_rows()
+        )
+
+        parts = [
+            ui.tags.div(
+                mcd_loading_status.get(),
+                class_="compact-small-line",
+            )
+        ]
+
+        if summary:
+            fileSizeMb = (
+                float(
+                    summary.get(
+                        "file_size_bytes",
+                        0,
+                    )
+                )
+                / (1024 ** 2)
+            )
+
+            parts.append(
+                ui.tags.div(
+                    (
+                        f"File size: {fileSizeMb:,.1f} MB | "
+                        f"Acquisitions: "
+                        f"{summary.get('acquisitions', 0):,} | "
+                        f"Panoramas: "
+                        f"{summary.get('panoramas', 0):,}"
+                    ),
+                    class_=(
+                        "compact-small-line "
+                        "text-muted"
+                    ),
+                )
+            )
+
+        if (
+            selectedDf is not None
+            and not selectedDf.empty
+        ):
+            selectedChannels = sorted(
+                pd.to_numeric(
+                    selectedDf["Channels"],
+                    errors="coerce",
+                )
+                .dropna()
+                .astype(int)
+                .unique()
+                .tolist()
+            )
+
+            channelSummary = (
+                ", ".join(
+                    str(value)
+                    for value in selectedChannels
+                )
+                if selectedChannels
+                else "unknown"
+            )
+
+            parts.append(
+                ui.tags.div(
+                    (
+                        f"Selected acquisitions: "
+                        f"{len(selectedDf):,} | "
+                        f"Channel counts: "
+                        f"{channelSummary}"
+                    ),
+                    class_="compact-small-line",
+                )
+            )
+
+        return ui.tags.div(*parts)
+
+    @reactive.Effect
+    @reactive.event(input.select_all_mcd_rois)
+    async def _select_all_mcd_rois():
+        acquisitionDf = (
+            mcd_acquisition_metadata.get()
+        )
+
+        if (
+            acquisitionDf is None
+            or acquisitionDf.empty
+        ):
+            return
+
+        await (
+            mcd_acquisition_table
+            .update_cell_selection("all")
+        )
+
+    @reactive.Effect
+    @reactive.event(input.clear_mcd_roi_selection)
+    async def _clear_mcd_roi_selection():
+        await (
+            mcd_acquisition_table
+            .update_cell_selection(None)
+        )
+
+    @reactive.Effect
+    @reactive.event(input.export_selected_mcd_rois)
+    def _export_selected_mcd_rois():
+        registryDf = mcd_file_registry.get()
+
+        if (
+            registryDf is None
+            or registryDf.empty
+        ):
+            msg = (
+                "Open one or more MCD files before "
+                "exporting ROIs."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        selectedDf = (
+            _get_selected_mcd_acquisition_rows()
+        )
+
+        if (
+            selectedDf is None
+            or selectedDf.empty
+        ):
+            msg = (
+                "Select at least one MCD acquisition "
+                "from the table."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        if (
+            "MCD file index"
+            not in selectedDf.columns
+        ):
+            msg = (
+                "The selected acquisition table is missing "
+                "the 'MCD file index' column."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=8,
+            )
+            return
+
+        firstMcdPath = _get_mcd_path_for_index(
+            int(
+                selectedDf[
+                    "MCD file index"
+                ].iloc[0]
+            )
+        )
+
+        initialFolder = (
+            last_loaded_folder.get()
+            or str(
+                Path(firstMcdPath).parent
+            )
+        )
+
+        outputFolder = pick_folder_dialog(
+            initialdir=initialFolder
+        )
+
+        if not outputFolder:
+            print(
+                "🛑 MCD ROI export canceled.",
+                flush=True,
+            )
+            return
+
+        selectedGroups = list(
+            selectedDf.groupby(
+                "MCD file index",
+                sort=False,
+            )
+        )
+
+        nSelected = len(selectedDf)
+        nFiles = len(selectedGroups)
+
+        try:
+            exportedPaths = []
+            completedOverall = 0
+
+            with ui.Progress(
+                min=0,
+                max=nSelected,
+                session=session,
+            ) as progress:
+
+                for fileNumber, (
+                    mcdFileIndex,
+                    fileSelectionDf,
+                ) in enumerate(
+                    selectedGroups,
+                    start=1,
+                ):
+                    mcdPath = (
+                        _get_mcd_path_for_index(
+                            int(mcdFileIndex)
+                        )
+                    )
+
+                    mcdFileName = Path(
+                        mcdPath
+                    ).name
+
+                    mcdStem = Path(
+                        mcdPath
+                    ).stem
+
+                    nInFile = len(
+                        fileSelectionDf
+                    )
+
+                    print(
+                        f"▶️ Exporting {nInFile:,} ROI(s) "
+                        f"from {mcdFileName} "
+                        f"({fileNumber}/{nFiles})",
+                        flush=True,
+                    )
+
+                    def updateProgress(
+                        completed: int,
+                        total: int,
+                        roiName: str,
+                    ) -> None:
+                        progress.set(
+                            value=(
+                                completedOverall
+                                + completed
+                            ),
+                            message=(
+                                "Exporting MCD ROIs "
+                                "as OME-TIFF"
+                            ),
+                            detail=(
+                                f"{mcdFileName}: "
+                                f"{roiName} "
+                                f"({completed}/{total})"
+                            ),
+                        )
+
+                    fileExportedPaths = (
+                        export_mcd_acquisitions_as_ome_tiff(
+                            mcdPath,
+                            fileSelectionDf,
+                            outputFolder,
+                            output_subfolder=mcdStem,
+                            progress_callback=updateProgress,
+                        )
+                    )
+
+                    exportedPaths.extend(
+                        fileExportedPaths
+                    )
+
+                    completedOverall += nInFile
+
+                    progress.set(
+                        value=completedOverall,
+                        detail=(
+                            f"Completed {mcdFileName}"
+                        ),
+                    )
+
+            msg = (
+                f"Exported {len(exportedPaths):,} "
+                f"MCD acquisition(s) from "
+                f"{nFiles:,} file(s) as float32 "
+                f"OME-TIFF to: "
+                f"{Path(outputFolder) / 'acquisitions'}"
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=8,
+            )
+
+            last_loaded_folder.set(
+                outputFolder
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                "MCD OME-TIFF export failed: "
+                f"{e}"
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+    @reactive.Effect
+    @reactive.event(input.export_mcd_panoramas)
+    def _export_mcd_panoramas():
+        registryDf = mcd_file_registry.get()
+
+        if (
+            registryDf is None
+            or registryDf.empty
+        ):
+            msg = (
+                "Open one or more MCD files before "
+                "exporting panoramas."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        selectedSlidesOnly = bool(
+            input.mcd_export_selected_slides_only()
+        )
+
+        selectedSlidesByMcd = {}
+
+        if selectedSlidesOnly:
+            selectedDf = (
+                _get_selected_mcd_acquisition_rows()
+            )
+
+            if (
+                selectedDf is None
+                or selectedDf.empty
+            ):
+                msg = (
+                    "Select at least one MCD acquisition, "
+                    "or disable “Only export panoramas from "
+                    "slides containing selected ROIs”."
+                )
+
+                mcd_loading_status.set(msg)
+
+                ui.notification_show(
+                    msg,
+                    type="warning",
+                    duration=8,
+                )
+                return
+
+            requiredColumns = {
+                "MCD file index",
+                "Slide index",
+            }
+
+            missingColumns = (
+                requiredColumns
+                - set(selectedDf.columns)
+            )
+
+            if missingColumns:
+                msg = (
+                    "The selected acquisition table is missing: "
+                    + ", ".join(sorted(missingColumns))
+                )
+
+                mcd_loading_status.set(msg)
+
+                ui.notification_show(
+                    msg,
+                    type="error",
+                    duration=8,
+                )
+                return
+
+            selectedSlidesByMcd = {
+                int(mcdFileIndex): sorted(
+                    pd.to_numeric(
+                        group["Slide index"],
+                        errors="coerce",
+                    )
+                    .dropna()
+                    .astype(int)
+                    .unique()
+                    .tolist()
+                )
+                for mcdFileIndex, group in (
+                    selectedDf.groupby(
+                        "MCD file index",
+                        sort=False,
+                    )
+                )
+            }
+
+        firstMcdPath = str(
+            registryDf.iloc[0]["MCD file path"]
+        )
+
+        initialFolder = (
+            last_loaded_folder.get()
+            or str(
+                Path(firstMcdPath).parent
+            )
+        )
+
+        outputFolder = pick_folder_dialog(
+            initialdir=initialFolder
+        )
+
+        if not outputFolder:
+            print(
+                "🛑 MCD panorama export canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            panoramaDf = (
+                mcd_panorama_metadata.get()
+            )
+
+            if (
+                panoramaDf is None
+                or panoramaDf.empty
+            ):
+                raise ValueError(
+                    "The selected MCD files do not contain "
+                    "any real panorama images."
+                )
+
+            exportJobs = []
+
+            for _, registryRow in (
+                registryDf.iterrows()
+            ):
+                mcdFileIndex = int(
+                    registryRow["MCD file index"]
+                )
+
+                mcdPath = str(
+                    registryRow["MCD file path"]
+                )
+
+                if selectedSlidesOnly:
+                    if (
+                        mcdFileIndex
+                        not in selectedSlidesByMcd
+                    ):
+                        continue
+
+                    slideIndices = (
+                        selectedSlidesByMcd[
+                            mcdFileIndex
+                        ]
+                    )
+
+                else:
+                    slideIndices = None
+
+                if slideIndices is None:
+                    expectedCount = int(
+                        (
+                            pd.to_numeric(
+                                panoramaDf[
+                                    "MCD file index"
+                                ],
+                                errors="coerce",
+                            )
+                            == mcdFileIndex
+                        ).sum()
+                    )
+
+                else:
+                    expectedCount = int(
+                        (
+                            (
+                                pd.to_numeric(
+                                    panoramaDf[
+                                        "MCD file index"
+                                    ],
+                                    errors="coerce",
+                                )
+                                == mcdFileIndex
+                            )
+                            &
+                            (
+                                pd.to_numeric(
+                                    panoramaDf[
+                                        "Slide index"
+                                    ],
+                                    errors="coerce",
+                                )
+                                .isin(slideIndices)
+                            )
+                        ).sum()
+                    )
+
+                if expectedCount == 0:
+                    continue
+
+                exportJobs.append(
+                    {
+                        "mcd_file_index": (
+                            mcdFileIndex
+                        ),
+                        "mcd_path": mcdPath,
+                        "slide_indices": (
+                            slideIndices
+                        ),
+                        "expected_count": (
+                            expectedCount
+                        ),
+                    }
+                )
+
+            if not exportJobs:
+                raise ValueError(
+                    "No panoramas are available for the "
+                    "selected MCD file(s) and slide(s)."
+                )
+
+            totalExpected = sum(
+                job["expected_count"]
+                for job in exportJobs
+            )
+
+            allExportedPaths = []
+            completedOverall = 0
+
+            with ui.Progress(
+                min=0,
+                max=totalExpected,
+                session=session,
+            ) as progress:
+
+                for fileNumber, job in enumerate(
+                    exportJobs,
+                    start=1,
+                ):
+                    mcdPath = job["mcd_path"]
+
+                    mcdFileName = Path(
+                        mcdPath
+                    ).name
+
+                    mcdStem = Path(
+                        mcdPath
+                    ).stem
+
+                    slideIndices = (
+                        job["slide_indices"]
+                    )
+
+                    print(
+                        f"▶️ Exporting panoramas from "
+                        f"{mcdFileName} "
+                        f"({fileNumber}/{len(exportJobs)})",
+                        flush=True,
+                    )
+
+                    def updateProgress(
+                        completed: int,
+                        total: int,
+                        panoramaName: str,
+                    ) -> None:
+                        progress.set(
+                            value=(
+                                completedOverall
+                                + completed
+                            ),
+                            message=(
+                                "Exporting MCD panoramas"
+                            ),
+                            detail=(
+                                f"{mcdFileName}: "
+                                f"{panoramaName} "
+                                f"({completed}/{total})"
+                            ),
+                        )
+
+                    fileExportedPaths = (
+                        export_mcd_panoramas(
+                            mcdPath,
+                            outputFolder,
+                            slide_indices=slideIndices,
+                            output_subfolder=mcdStem,
+                            progress_callback=(
+                                updateProgress
+                            ),
+                        )
+                    )
+
+                    allExportedPaths.extend(
+                        fileExportedPaths
+                    )
+
+                    completedOverall += len(
+                        fileExportedPaths
+                    )
+
+                    progress.set(
+                        value=completedOverall,
+                        detail=(
+                            f"Completed {mcdFileName}"
+                        ),
+                    )
+
+            msg = (
+                f"Exported "
+                f"{len(allExportedPaths):,} "
+                f"MCD panorama image(s) from "
+                f"{len(exportJobs):,} file(s) to: "
+                f"{Path(outputFolder) / 'panoramas'}"
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=8,
+            )
+
+            last_loaded_folder.set(
+                outputFolder
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except ValueError as e:
+            msg = str(e)
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=10,
+            )
+
+            print(
+                f"⚠️ Panorama export not completed: "
+                f"{msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                "MCD panorama export failed: "
+                f"{e}"
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+
+    @reactive.Effect
     @reactive.event(input.save_composite_tiff)
     def _save_composite_tiff():
         rgb, used = _build_composite_rgb()
@@ -2777,6 +4808,297 @@ def server(input, output, session):
 
     ##<--------load images module ---------->
     @reactive.Effect
+    @reactive.event(input.load_selected_mcd_rois)
+    def _load_selected_mcd_rois():
+        if loading.get():
+            return
+
+        registryDf = mcd_file_registry.get()
+
+        if (
+            registryDf is None
+            or registryDf.empty
+        ):
+            msg = (
+                "Open one or more MCD files before "
+                "loading ROIs."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        selectedDf = (
+            _get_selected_mcd_acquisition_rows()
+        )
+
+        if (
+            selectedDf is None
+            or selectedDf.empty
+        ):
+            msg = (
+                "Select at least one MCD acquisition "
+                "from the table."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        if (
+            "MCD file index"
+            not in selectedDf.columns
+        ):
+            msg = (
+                "The selected acquisition table is missing "
+                "the 'MCD file index' column."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=8,
+            )
+            return
+
+        loading.set(True)
+
+        try:
+            nSelected = len(selectedDf)
+
+            selectedGroups = list(
+                selectedDf.groupby(
+                    "MCD file index",
+                    sort=False,
+                )
+            )
+
+            nFiles = len(selectedGroups)
+
+            mcd_loading_status.set(
+                f"Loading {nSelected:,} selected "
+                f"acquisition(s) from {nFiles:,} "
+                "MCD file(s)..."
+            )
+
+            allImages = {}
+            allChannels = {}
+
+            with ui.Progress(
+                min=0,
+                max=nFiles,
+                session=session,
+            ) as progress:
+
+                for fileNumber, (
+                    mcdFileIndex,
+                    fileSelectionDf,
+                ) in enumerate(
+                    selectedGroups,
+                    start=1,
+                ):
+                    mcdPath = (
+                        _get_mcd_path_for_index(
+                            int(mcdFileIndex)
+                        )
+                    )
+
+                    mcdFileName = Path(
+                        mcdPath
+                    ).name
+
+                    progress.set(
+                        value=fileNumber - 1,
+                        message=(
+                            "Loading selected "
+                            "MCD acquisitions"
+                        ),
+                        detail=(
+                            f"{mcdFileName} "
+                            f"({fileNumber}/{nFiles})"
+                        ),
+                    )
+
+                    print(
+                        f"▶️ Loading "
+                        f"{len(fileSelectionDf):,} "
+                        f"selected ROI(s) from "
+                        f"{mcdFileName}",
+                        flush=True,
+                    )
+
+                    try:
+                        fileImages, fileChannels = (
+                            load_mcd_acquisitions(
+                                mcdPath,
+                                fileSelectionDf,
+                            )
+                        )
+
+                    except ValueError as e:
+                        ui.modal_show(
+                            ui.modal(
+                                ui.h4(
+                                    "MCD acquisition "
+                                    "loading failed"
+                                ),
+                                ui.pre(str(e)),
+                                easy_close=True,
+                                footer=ui.modal_button(
+                                    "OK"
+                                ),
+                            ),
+                            session=session,
+                        )
+
+                        mcd_loading_status.set(
+                            f"MCD loading failed: {e}"
+                        )
+
+                        print(
+                            f"❌ MCD loading failed: "
+                            f"{e}",
+                            flush=True,
+                        )
+                        return
+
+                    mcdStem = Path(
+                        mcdPath
+                    ).stem
+
+                    for sampleName, imageArray in (
+                        fileImages.items()
+                    ):
+                        uniqueSampleName = (
+                            sampleName
+                        )
+
+                        if (
+                            uniqueSampleName
+                            in allImages
+                        ):
+                            uniqueSampleName = (
+                                f"{mcdStem}_"
+                                f"{sampleName}"
+                            )
+
+                        baseName = (
+                            uniqueSampleName
+                        )
+
+                        duplicateNumber = 2
+
+                        while (
+                            uniqueSampleName
+                            in allImages
+                        ):
+                            uniqueSampleName = (
+                                f"{baseName}_"
+                                f"{duplicateNumber}"
+                            )
+
+                            duplicateNumber += 1
+
+                        allImages[
+                            uniqueSampleName
+                        ] = imageArray
+
+                        allChannels[
+                            uniqueSampleName
+                        ] = fileChannels[
+                            sampleName
+                        ]
+
+                    progress.set(
+                        value=fileNumber,
+                        detail=(
+                            f"Loaded {mcdFileName}"
+                        ),
+                    )
+
+            _validate_loaded_image_channel_layouts(
+                allChannels
+            )
+
+            firstMcdPath = (
+                _get_mcd_path_for_index(
+                    int(
+                        selectedGroups[0][0]
+                    )
+                )
+            )
+
+            _activate_loaded_image_library(
+                allImages,
+                allChannels,
+                sourceFolder=str(
+                    Path(
+                        firstMcdPath
+                    ).parent
+                ),
+                sourceLabel=(
+                    "selected acquisitions from "
+                    f"{nFiles} MCD file(s)"
+                ),
+            )
+
+            msg = (
+                f"Loaded {len(allImages):,} selected "
+                f"MCD acquisition(s) from "
+                f"{nFiles:,} file(s) into PINT."
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=8,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                "Unexpected MCD loading failure: "
+                f"{e}"
+            )
+
+            mcd_loading_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+        finally:
+            loading.set(False)
+
+    @reactive.Effect
     @reactive.event(input.load)
     def _do_load():
         ##If loading is already in progress don't try to start again!
@@ -2821,45 +5143,19 @@ def server(input, output, session):
                 print("⚠️ No images found in selected folder.")
                 return
 
-            ##Store images and channels
-            images.set(imgs)
-            channels.set(chs)
-            ##Clear the cache. this prevends old settings from similar channal names to remain in memory and prevent from actually processing the images for the viewer
-            _invalidate_global_cache()
-            ##Picks the first images as the default display.
-            samples = list(imgs.keys())
-            first_sample = samples[0]
-            first_chlist = chs[first_sample]
-            first_channel = first_chlist[0] if first_chlist else None
-
-            #set the channel list for the left sided table and fill it will the channels. Each chanel gets a row.
-            canonical_channels.set(list(first_chlist))
-            _prefill_params(first_chlist)
-
-            ##update selects under guard, selects first image
-            setting_selects.set(True)
-            try:
-                ui.update_select("sample", choices=samples, selected=first_sample, session=session)
-
-                ui.update_select(
-                    "creator_sample_display",
-                    choices=samples,
-                    selected=first_sample,
-                    session=session,
+            if not imgs:
+                print(
+                    "⚠️ No images found in selected folder.",
+                    flush=True,
                 )
-                if first_channel:
-                    ui.update_select("channel", choices=first_chlist, selected=first_channel, session=session)
-            finally:
-                setting_selects.set(False)
+                return
 
-            _sync_composite_channel_choices(first_sample, overwriteDefaults=True)
-
-            if first_channel:
-                _sync_controls_from_table(first_channel)
-
-            ##Tell user that everything is loaded and save the foldername for further use
-            data_loaded.set(True)
-            last_loaded_folder.set(folder)
+            _activate_loaded_image_library(
+                imgs,
+                chs,
+                sourceFolder=folder,
+                sourceLabel="OME-TIFF library",
+            )
 
         finally:
             loading.set(False)
@@ -2959,15 +5255,33 @@ def server(input, output, session):
             sel = ordered[0]
 
         setting_selects.set(True)
+
         try:
-            ui.update_select("channel", choices=ordered, selected=sel, session=session)
+            ui.update_select(
+                "channel",
+                choices=ordered,
+                selected=sel,
+                session=session,
+            )
+
+            sampleChoices = list(
+                images.get().keys()
+            )
 
             ui.update_select(
                 "creator_sample_display",
-                choices=list(images.get().keys()),
+                choices=sampleChoices,
                 selected=s,
                 session=session,
             )
+
+            ui.update_select(
+                "thumbnail_sample_display",
+                choices=sampleChoices,
+                selected=s,
+                session=session,
+            )
+
         finally:
             setting_selects.set(False)
 
@@ -3021,6 +5335,37 @@ def server(input, output, session):
         if not c:
             return
         _sync_controls_from_table(c)
+
+    @reactive.Effect
+    @reactive.event(input.clear_thumbnail_cache)
+    def _clear_thumbnail_cache():
+        cache = thumbnail_cache.get()
+
+        totalBytes = sum(
+            len(entry.get("png_bytes", b""))
+            for entry in cache.values()
+        )
+
+        thumbnail_cache.set({})
+
+        msg = (
+            f"Thumbnail cache cleared. "
+            f"Released approximately "
+            f"{totalBytes / (1024 ** 2):.2f} MB."
+        )
+
+        thumbnail_status.set(msg)
+
+        ui.notification_show(
+            msg,
+            type="message",
+            duration=5,
+        )
+
+        print(
+            f"🧹 {msg}",
+            flush=True,
+        )
 
     # <---------- update parameter table ---------->
     ##Below are the effects that tie the buttons to the parameter dataframe
@@ -3148,6 +5493,524 @@ def server(input, output, session):
                 },
             )
         )
+
+    @reactive.Effect
+    @reactive.event(input.generate_thumbnails)
+    def _generate_thumbnails():
+        sampleName = input.sample()
+
+        if not sampleName:
+            msg = "Select an image before generating thumbnails."
+
+            thumbnail_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        channelNames = channels.get().get(
+            sampleName,
+            [],
+        )
+
+        if not channelNames:
+            msg = (
+                f"No channels are available for "
+                f"'{sampleName}'."
+            )
+
+            thumbnail_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        renderMode = (
+            input.thumbnail_render_mode()
+            or "signal"
+        )
+
+        currentCache = dict(
+            thumbnail_cache.get()
+        )
+
+        with ui.Progress(
+            min=0,
+            max=len(channelNames),
+            session=session,
+        ) as progress:
+
+            (
+                currentCache,
+                nGenerated,
+                nReused,
+                failures,
+                _,
+            ) = _generate_sample_thumbnails(
+                sampleName,
+                renderMode,
+                currentCache,
+                progress=progress,
+                progressOffset=0,
+                totalWork=len(channelNames),
+            )
+
+        thumbnail_cache.set(
+            currentCache
+        )
+
+        modeLabel = (
+            "signal preserving"
+            if renderMode == "signal"
+            else "smooth"
+        )
+
+        msg = (
+            f"Thumbnail overview ready for {sampleName}: "
+            f"{nGenerated:,} generated, "
+            f"{nReused:,} loaded from cache using "
+            f"{modeLabel} rendering."
+        )
+
+        if failures:
+            msg += (
+                f" {len(failures):,} channel(s) failed."
+            )
+
+            print(
+                "⚠️ Thumbnail failures:\n"
+                + "\n".join(failures),
+                flush=True,
+            )
+
+        thumbnail_status.set(msg)
+
+        ui.notification_show(
+            msg,
+            type=(
+                "warning"
+                if failures
+                else "message"
+            ),
+            duration=8,
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+
+
+
+    @reactive.Effect
+    @reactive.event(input.generate_all_thumbnails)
+    def _generate_all_thumbnails():
+        imageData = images.get()
+        channelData = channels.get()
+
+        if not imageData:
+            msg = (
+                "No images are loaded. "
+                "Load an image dataset first."
+            )
+
+            thumbnail_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        sampleNames = list(
+            imageData.keys()
+        )
+
+        totalChannels = sum(
+            len(channelData.get(sampleName, []))
+            for sampleName in sampleNames
+        )
+
+        if totalChannels == 0:
+            msg = (
+                "The loaded images do not contain any "
+                "available channels."
+            )
+
+            thumbnail_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        renderMode = (
+            input.thumbnail_render_mode()
+            or "signal"
+        )
+
+        currentCache = dict(
+            thumbnail_cache.get()
+        )
+
+        totalGenerated = 0
+        totalReused = 0
+        allFailures = []
+        progressOffset = 0
+
+        with ui.Progress(
+            min=0,
+            max=totalChannels,
+            session=session,
+        ) as progress:
+
+            for sampleIndex, sampleName in enumerate(
+                sampleNames,
+                start=1,
+            ):
+                progress.set(
+                    value=progressOffset,
+                    message=(
+                        "Generating thumbnails for all images"
+                    ),
+                    detail=(
+                        f"{sampleName} "
+                        f"({sampleIndex}/{len(sampleNames)})"
+                    ),
+                )
+
+                (
+                    currentCache,
+                    nGenerated,
+                    nReused,
+                    failures,
+                    nProcessed,
+                ) = _generate_sample_thumbnails(
+                    sampleName,
+                    renderMode,
+                    currentCache,
+                    progress=progress,
+                    progressOffset=progressOffset,
+                    totalWork=totalChannels,
+                )
+
+                totalGenerated += nGenerated
+                totalReused += nReused
+                allFailures.extend(failures)
+                progressOffset += nProcessed
+
+        # Update the reactive cache only once, after the full batch.
+        thumbnail_cache.set(
+            currentCache
+        )
+
+        modeLabel = (
+            "signal preserving"
+            if renderMode == "signal"
+            else "smooth"
+        )
+
+        msg = (
+            f"All-image thumbnail generation complete: "
+            f"{len(sampleNames):,} images, "
+            f"{totalChannels:,} channels; "
+            f"{totalGenerated:,} generated and "
+            f"{totalReused:,} loaded from cache using "
+            f"{modeLabel} rendering."
+        )
+
+        if allFailures:
+            msg += (
+                f" {len(allFailures):,} channel(s) failed."
+            )
+
+            print(
+                "⚠️ Thumbnail failures:\n"
+                + "\n".join(allFailures),
+                flush=True,
+            )
+
+        thumbnail_status.set(msg)
+
+        ui.notification_show(
+            msg,
+            type=(
+                "warning"
+                if allFailures
+                else "message"
+            ),
+            duration=10,
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+    
+
+    @output
+    @render.ui
+    def thumbnail_grid():
+        sampleName = input.sample()
+
+        if not sampleName:
+            return ui.tags.div(
+                "Load images and select a sample.",
+                class_="text-muted p-3",
+            )
+
+        channelNames = channels.get().get(
+            sampleName,
+            [],
+        )
+
+        if not channelNames:
+            return ui.tags.div(
+                "No channels are available for this sample.",
+                class_="text-muted p-3",
+            )
+
+        renderMode = (
+            input.thumbnail_render_mode()
+            or "signal"
+        )
+
+        cache = thumbnail_cache.get()
+
+        cards = []
+        missingChannels = []
+
+        for channelName in channelNames:
+            cacheKey = _make_thumbnail_cache_key(
+                sampleName,
+                channelName,
+                renderMode,
+            )
+
+            entry = cache.get(cacheKey)
+
+            if entry is None:
+                missingChannels.append(channelName)
+                continue
+
+            dataUri = _png_bytes_to_data_uri(
+                entry["png_bytes"]
+            )
+
+            cards.append(
+                ui.tags.div(
+                    ui.tags.div(
+                        ui.tags.img(
+                            src=dataUri,
+                            alt=(
+                                f"{channelName} thumbnail "
+                                f"for {sampleName}"
+                            ),
+                            class_="thumbnail-image",
+                            loading="lazy",
+                        ),
+                        class_="thumbnail-image-frame",
+                    ),
+
+                    ui.tags.div(
+                        channelName,
+                        title=channelName,
+                        class_="thumbnail-label",
+                    ),
+
+                    ui.tags.div(
+                        (
+                            f"{entry['source_width']} × "
+                            f"{entry['source_height']} → "
+                            f"{entry['width']} × "
+                            f"{entry['height']}"
+                        ),
+                        class_="thumbnail-dimensions",
+                    ),
+
+                    class_="thumbnail-card",
+                )
+            )
+
+        if not cards:
+            return ui.tags.div(
+                ui.tags.p(
+                    (
+                        f"No cached {renderMode} thumbnails exist "
+                        f"for {sampleName}."
+                    )
+                ),
+                ui.tags.p(
+                    "Press “Generate thumbnails” to create them.",
+                    class_="text-muted",
+                ),
+                class_="p-3",
+            )
+
+        content = [
+            ui.tags.div(
+                *cards,
+                class_="thumbnail-grid",
+            )
+        ]
+
+        if missingChannels:
+            content.insert(
+                0,
+                ui.tags.div(
+                    (
+                        f"{len(missingChannels):,} channel(s) do not "
+                        f"have a current cached thumbnail. "
+                        f"Press “Generate thumbnails” to update them."
+                    ),
+                    class_="alert alert-warning py-2",
+                ),
+            )
+
+        return ui.tags.div(*content)
+    
+    @output
+    @render.ui
+    def thumbnail_status_ui():
+        cache = thumbnail_cache.get()
+
+        totalBytes = sum(
+            len(entry.get("png_bytes", b""))
+            for entry in cache.values()
+        )
+
+        return ui.tags.div(
+            ui.tags.div(
+                thumbnail_status.get(),
+                class_="compact-small-line",
+            ),
+
+            ui.tags.div(
+                (
+                    f"Cached thumbnails: {len(cache):,} | "
+                    f"Compressed cache size: "
+                    f"{totalBytes / (1024 ** 2):.2f} MB"
+                ),
+                class_="compact-small-line text-muted",
+            ),
+        )
+
+    @reactive.Effect
+    @reactive.event(input.thumbnail_next_sample)
+    def _thumbnail_next_sample():
+        if loading.get() or not images.get():
+            return
+
+        samples = list(
+            images.get().keys()
+        )
+
+        current = (
+            input.sample()
+            or input.thumbnail_sample_display()
+            or (
+                samples[0]
+                if samples
+                else None
+            )
+        )
+
+        nextSample = _cycle(
+            samples,
+            current,
+            +1,
+        )
+
+        if nextSample:
+            ui.update_select(
+                "sample",
+                choices=samples,
+                selected=nextSample,
+                session=session,
+            )
+
+            ui.update_select(
+                "thumbnail_sample_display",
+                choices=samples,
+                selected=nextSample,
+                session=session,
+            )
+
+    @reactive.Effect
+    @reactive.event(input.thumbnail_prev_sample)
+    def _thumbnail_prev_sample():
+        if loading.get() or not images.get():
+            return
+
+        samples = list(
+            images.get().keys()
+        )
+
+        current = (
+            input.sample()
+            or input.thumbnail_sample_display()
+            or (
+                samples[0]
+                if samples
+                else None
+            )
+        )
+
+        previousSample = _cycle(
+            samples,
+            current,
+            -1,
+        )
+
+        if previousSample:
+            ui.update_select(
+                "sample",
+                choices=samples,
+                selected=previousSample,
+                session=session,
+            )
+
+            ui.update_select(
+                "thumbnail_sample_display",
+                choices=samples,
+                selected=previousSample,
+                session=session,
+            )
+
+    @reactive.Effect
+    @reactive.event(input.thumbnail_sample_display)
+    def _on_thumbnail_sample_display_change():
+        if (
+            loading.get()
+            or setting_selects.get()
+        ):
+            return
+
+        sampleName = (
+            input.thumbnail_sample_display()
+        )
+
+        if not sampleName:
+            return
+
+        if sampleName != input.sample():
+            ui.update_select(
+                "sample",
+                selected=sampleName,
+                session=session,
+            )
+
+
+
 
     def _get_mesmer_env_name() -> str:
         envName = (input.mesmer_env_name() or "").strip()
@@ -3778,52 +6641,208 @@ def server(input, output, session):
         df = clustering_data.get()
 
         if df is None or df.empty:
-            print("⚠️ No clustering dataset loaded. Load a table before importing a column map.")
-            return
+            msg = (
+                "No clustering dataset is loaded. "
+                "Load a table before importing a column map."
+            )
 
-        folder = last_loaded_folder.get() or (input.path() or "").strip()
-        initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
+            clustering_status.set(msg)
 
-        csvPath = pick_open_csv_dialog(initialdir=initdir)
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=8,
+            )
 
-        if not csvPath:
-            print("🛑 Import clustering column map canceled.")
-            return
-
-        try:
-            colMap = pd.read_csv(csvPath)
-        except Exception as e:
-            print(f"❌ Failed to read clustering column map: {e}")
-            return
-
-        requiredCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
-        missing = [c for c in requiredCols if c not in colMap.columns]
-
-        if missing:
             print(
-                "❌ Clustering column map is missing required column(s): "
-                + ", ".join(missing)
+                f"⚠️ {msg}",
+                flush=True,
             )
             return
 
-        colMap = colMap[requiredCols].copy()
-        clustering_column_map.set(colMap)
+        folder = (
+            last_loaded_folder.get()
+            or (input.path() or "").strip()
+        )
 
-        validMap = _get_valid_clustering_column_map()
+        initdir = (
+            folder
+            if folder and os.path.isdir(folder)
+            else os.getcwd()
+        )
+
+        tablePath = pick_open_table_dialog(
+            title="Select clustering column map",
+            initialdir=initdir,
+        )
+
+        if not tablePath:
+            print(
+                "🛑 Import clustering column map canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            colMap = _read_column_map_table(
+                tablePath
+            )
+
+            colMap = _normalize_imported_column_headers(
+                colMap
+            )
+
+        except Exception as e:
+            msg = (
+                "Failed to read clustering column map. "
+                f"{e}"
+            )
+
+            clustering_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+            return
+
+        requiredCols = [
+            "ChannelNamesForClustering",
+            "ChannelNameToDisplay",
+        ]
+
+        missing = [
+            col
+            for col in requiredCols
+            if col not in colMap.columns
+        ]
+
+        if missing:
+            detectedCols = [
+                str(col)
+                for col in colMap.columns
+            ]
+
+            msg = (
+                "Clustering column map is missing required column(s): "
+                + ", ".join(missing)
+                + ". Detected columns: "
+                + (
+                    ", ".join(detectedCols)
+                    if detectedCols
+                    else "none"
+                )
+            )
+
+            clustering_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+            return
+
+        colMap = colMap[
+            requiredCols
+        ].copy()
+
+        for col in requiredCols:
+            colMap[col] = (
+                colMap[col]
+                .fillna("")
+                .astype(str)
+                .str.replace(
+                    "\ufeff",
+                    "",
+                    regex=False,
+                )
+                .str.strip()
+            )
+
+        colMap = colMap.loc[
+            (
+                colMap["ChannelNamesForClustering"]
+                != ""
+            )
+            |
+            (
+                colMap["ChannelNameToDisplay"]
+                != ""
+            )
+        ].copy()
+
+        clustering_column_map.set(
+            colMap
+        )
+
+        validMap = (
+            _get_valid_clustering_column_map()
+        )
+
+        msg = (
+            f"Imported clustering column map from "
+            f"{os.path.basename(tablePath)}. "
+            f"{len(validMap):,} valid selected columns "
+            f"were found in the current dataset."
+        )
+
+        clustering_status.set(msg)
+
+        ui.notification_show(
+            msg,
+            type="message",
+            duration=6,
+        )
 
         print(
-            f"✅ Imported clustering column map → {csvPath}. "
-            f"{len(validMap):,} valid selected columns found in current dataset."
+            f"✅ {msg}",
+            flush=True,
         )
 
     @reactive.Effect
     @reactive.event(input.run_clustering_pca)
     def _run_clustering_pca():
+        ##Added this guard to rpevent PINT crashing out when forcing to go ahead with clsutering without unique ID
+        df = clustering_data.get()
+
+        idIsValid, idValidationMessage = _validate_pint_cell_id_column(df)
+
+        if not idIsValid:
+            msg = (
+                "PCA was not started because PINT_Cell_ID is not valid. "
+                f"{idValidationMessage} "
+                "Create or validate the cell ID in Data preparation first."
+            )
+
+            clustering_analysis_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=8,
+            )
+
+            print(f"⚠️ {msg}", flush=True)
+            return
+
         try:
+            # Validate and construct first. This may raise ClusteringInputError. I moved the clearance only if it passes
+            X, obs, sourceCols, displayCols = _prepare_clustering_feature_matrix()
+            #Only clear existing results after the new PCA input is valid.
             _drop_subclustering_columns_from_master()
             _clear_all_subclustering_state()
-
-            X, obs, sourceCols, displayCols = _prepare_clustering_feature_matrix()
 
             nCells, nFeatures = X.shape
             requestedPcs = int(input.clustering_n_pcs() or 20)
@@ -3894,6 +6913,37 @@ def server(input, output, session):
 
             clustering_analysis_status.set(msg)
             print(f"✅ {msg}", flush=True)
+
+        except ClusteringInputError as e:
+            msg = str(e)
+
+            clustering_analysis_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=10,
+            )
+
+            print(
+                f"⚠️ PCA was not started:\n{msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"PCA failed: {e}"
+            clustering_analysis_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(f"❌ {msg}", flush=True)
 
         except Exception as e:
             import traceback
@@ -4391,10 +7441,14 @@ def server(input, output, session):
 
             title = f"Leiden cluster marker heatmap | {aggregationMode} | {heatmapMode}"
 
+            zClip = float(input.clustering_heatmap_z_clip() or 2)
             fig = _make_cluster_marker_heatmap_figure(
                 plotMatrix,
                 palette=palette,
                 title=title,
+                heatmap_mode=heatmapMode,
+                z_clip=zClip,
+                cluster_axis_label="Leiden cluster",
             )
 
             fig.savefig(
@@ -4422,6 +7476,111 @@ def server(input, output, session):
             clustering_annotation_status.set(msg)
             print(f"❌ {msg}", flush=True)
 
+    @reactive.Effect
+    @reactive.event(input.export_subcluster_heatmap)
+    def _export_subcluster_heatmap():
+        try:
+            plotMatrix, summaryDf = _build_subcluster_marker_matrix()
+
+            palette = (
+                input.subclustering_heatmap_palette()
+                or "viridis"
+            )
+
+            heatmapMode = (
+                input.subclustering_heatmap_mode()
+                or "absolute"
+            )
+
+            aggregationMode = (
+                input.subclustering_heatmap_aggregation()
+                or "mean"
+            )
+
+            zClip = float(
+                input.subclustering_heatmap_z_clip()
+                or 2
+            )
+
+            outDir = pick_folder_dialog()
+
+            if not outDir:
+                print("🛑 Subcluster heatmap export canceled.")
+                return
+
+            outDir = Path(outDir)
+            outDir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            timestamp = datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            parentName = (
+                subclustering_parent_cluster.get()
+                or "parent_cluster"
+            )
+
+            safeParentName = _clean_column_name(parentName)
+
+            stem = (
+                f"PINT_subcluster_heatmap_"
+                f"{safeParentName}_"
+                f"{aggregationMode}_"
+                f"{heatmapMode}_"
+                f"{palette}_"
+                f"{timestamp}"
+            )
+
+            pngPath = outDir / f"{stem}.png"
+            csvPath = outDir / f"{stem}.csv"
+
+            title = (
+                f"Subcluster marker heatmap: {parentName} | "
+                f"{aggregationMode} | {heatmapMode}"
+            )
+
+            fig = _make_cluster_marker_heatmap_figure(
+                plotMatrix,
+                palette=palette,
+                title=title,
+                heatmap_mode=heatmapMode,
+                z_clip=zClip,
+                cluster_axis_label="Sub-Leiden cluster",
+            )
+
+            fig.savefig(
+                pngPath,
+                dpi=400,
+                bbox_inches="tight",
+            )
+
+            plt.close(fig)
+
+            summaryDf.to_csv(
+                csvPath,
+                index=False,
+            )
+
+            subclustering_marker_summary.set(summaryDf)
+
+            msg = (
+                f"Exported subcluster heatmap to: {pngPath}; "
+                f"matrix to: {csvPath}"
+            )
+
+            subclustering_annotation_status.set(msg)
+            print(f"✅ {msg}", flush=True)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Subcluster heatmap export failed: {e}"
+            subclustering_annotation_status.set(msg)
+            print(f"❌ {msg}", flush=True)
 
     @output
     @render.ui
@@ -4702,6 +7861,41 @@ def server(input, output, session):
             show[numCols] = show[numCols].round(3)
 
         return render.DataGrid(show, height="300px", filters=False)
+    
+    @output
+    @render.data_frame
+    def subclustering_marker_summary_preview():
+        df = subclustering_marker_summary.get()
+
+        if df is None or df.empty:
+            empty = pd.DataFrame(
+                {
+                    "Message": [
+                        "No subcluster heatmap matrix generated yet."
+                    ]
+                }
+            )
+
+            return render.DataGrid(
+                empty,
+                height="250px",
+                filters=False,
+            )
+
+        show = df.copy()
+
+        numCols = show.select_dtypes(
+            include=["number"]
+        ).columns
+
+        if len(numCols) > 0:
+            show[numCols] = show[numCols].round(3)
+
+        return render.DataGrid(
+            show,
+            height="300px",
+            filters=False,
+        )
 
     @reactive.Effect
     @reactive.event(input.export_cluster_name_template)
@@ -4865,7 +8059,7 @@ def server(input, output, session):
 
         paletteName = input.annotation_cluster_color_palette() or "viridis"
 
-        if paletteName == "custom":
+        if is_custom_palette(paletteName):
             colorMap = {}
 
             for i, clusterName in enumerate(clusterNames):
@@ -4897,7 +8091,7 @@ def server(input, output, session):
 
         paletteName = input.subcluster_color_palette() or "viridis"
 
-        if paletteName == "custom":
+        if is_custom_palette(paletteName):
             colorMap = {}
 
             for i, subclusterName in enumerate(subclusterNames):
@@ -4954,8 +8148,11 @@ def server(input, output, session):
         for i, subclusterName in enumerate(subclusterNames):
             inputId = f"subcluster_color_{i}"
 
+            # Preserve the current value without making this UI output
+            # reactive to every color-picker update. This should stop the endless reloading
             try:
-                currentValue = getattr(input, inputId)()
+                with reactive.isolate():
+                    currentValue = getattr(input, inputId)()
             except Exception:
                 currentValue = None
 
@@ -4977,22 +8174,15 @@ def server(input, output, session):
                             ),
                         ),
                     ),
-                    ui.column(
-                        5,
-                        ui.tags.input(
-                            id=inputId,
-                            type="color",
-                            value=currentValue,
-                            oninput=(
-                                f"Shiny.setInputValue('{inputId}', this.value, "
-                                "{priority: 'event'});"
-                            ),
-                            onchange=(
-                                f"Shiny.setInputValue('{inputId}', this.value, "
-                                "{priority: 'event'});"
-                            ),
-                            style="width: 100%; height: 32px;",
+                    ui.tags.input(
+                        id=inputId,
+                        type="color",
+                        value=currentValue,
+                        onchange=(
+                            f"Shiny.setInputValue('{inputId}', this.value, "
+                            "{priority: 'event'});"
                         ),
+                        style="width: 100%; height: 32px;",
                     ),
                     class_="gx-1 gy-1 align-items-center",
                 )
@@ -5108,6 +8298,30 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.run_subclustering_pca)
     def _run_subclustering_pca():
+        df = clustering_data.get()
+
+        idIsValid, idValidationMessage = (
+            _validate_pint_cell_id_column(df)
+        )
+
+        if not idIsValid:
+            msg = (
+                "Sub-PCA was not started because PINT_Cell_ID is not valid. "
+                f"{idValidationMessage} "
+                "Create or validate the cell ID in Data preparation first."
+            )
+
+            subclustering_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=8,
+            )
+
+            print(f"⚠️ {msg}", flush=True)
+            return
+
         try:
             activeIds = subclustering_active_cell_ids.get()
 
@@ -5196,6 +8410,36 @@ def server(input, output, session):
             )
 
             print(f"✅ {msg}", flush=True)
+        except ClusteringInputError as e:
+            msg = str(e)
+
+            subclustering_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=10,
+            )
+
+            print(
+                f"⚠️ Sub-PCA was not started:\n{msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = f"Sub-PCA failed: {e}"
+            subclustering_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(f"❌ {msg}", flush=True)
 
         except Exception as e:
             import traceback
@@ -5621,10 +8865,46 @@ def server(input, output, session):
     @output
     @render.ui
     def subclustering_annotation_summary():
-        return ui.tags.div(
-            subclustering_annotation_status.get(),
-            class_="compact-small-line",
-        )
+        embDf = subclustering_pacmap_embedding.get()
+        markerDf = subclustering_marker_summary.get()
+        status = subclustering_annotation_status.get()
+
+        parts = [
+            ui.tags.div(
+                status,
+                class_="compact-small-line",
+            )
+        ]
+
+        if embDf is not None and not embDf.empty:
+            parts.append(
+                ui.tags.div(
+                    f"Sub-PaCMAP cells: {len(embDf):,}",
+                    class_="compact-small-line",
+                )
+            )
+
+        if markerDf is not None and not markerDf.empty:
+            if "Subcluster" in markerDf.columns:
+                nSubclusters = markerDf["Subcluster"].nunique()
+            else:
+                nSubclusters = len(markerDf)
+
+            nMarkers = max(
+                0,
+                len(markerDf.columns) - 1,
+            )
+
+            parts.append(
+                ui.tags.div(
+                    f"Last heatmap matrix: "
+                    f"{nSubclusters:,} subclusters × "
+                    f"{nMarkers:,} markers",
+                    class_="compact-small-line",
+                )
+            )
+
+        return ui.tags.div(*parts)
 
 
     @output
@@ -6353,6 +9633,127 @@ def server(input, output, session):
 
         return df, original_name
 
+    def _read_column_map_table(path: str) -> pd.DataFrame:
+        """
+        Read a clustering column-map file from CSV, TSV/TXT, or Excel.
+
+        CSV-like files are read with delimiter auto-detection so files resaved by
+        Excel or LibreOffice using commas, semicolons, or tabs remain usable.
+        """
+        path = str(path or "").strip()
+
+        if not path:
+            raise ValueError(
+                "No clustering column-map file was selected."
+            )
+
+        if not os.path.isfile(path):
+            raise ValueError(
+                f"Column-map file does not exist: {path}"
+            )
+
+        suffix = Path(path).suffix.lower()
+
+        if suffix in {".xlsx", ".xls"}:
+            return pd.read_excel(
+                path,
+                sheet_name=0,
+            )
+
+        if suffix in {".csv", ".tsv", ".txt"}:
+            readAttempts = [
+                # Automatic delimiter detection handles comma, semicolon and tab.
+                {
+                    "sep": None,
+                    "engine": "python",
+                    "encoding": "utf-8-sig",
+                },
+                {
+                    "sep": "\t",
+                    "encoding": "utf-8-sig",
+                },
+                {
+                    "sep": ";",
+                    "encoding": "utf-8-sig",
+                },
+                {
+                    "sep": ",",
+                    "encoding": "utf-8-sig",
+                },
+            ]
+
+            errors = []
+
+            for kwargs in readAttempts:
+                try:
+                    candidate = pd.read_csv(
+                        path,
+                        dtype=str,
+                        keep_default_na=False,
+                        **kwargs,
+                    )
+
+                    # A wrong delimiter often produces a single combined column.
+                    # Continue trying when that happens.
+                    if len(candidate.columns) > 1:
+                        return candidate
+
+                    errors.append(
+                        f"{kwargs}: only one column detected"
+                    )
+
+                except Exception as e:
+                    errors.append(
+                        f"{kwargs}: {e}"
+                    )
+
+            raise ValueError(
+                "Could not determine the delimiter of the column-map file. "
+                "Tried automatic detection, tab, semicolon, and comma.\n"
+                + "\n".join(errors)
+            )
+
+        # Last-resort attempt for a file with an unusual or missing extension.
+        try:
+            return pd.read_csv(
+                path,
+                sep=None,
+                engine="python",
+                encoding="utf-8-sig",
+                dtype=str,
+                keep_default_na=False,
+            )
+        except Exception as textError:
+            try:
+                return pd.read_excel(
+                    path,
+                    sheet_name=0,
+                    dtype=str,
+                )
+            except Exception as excelError:
+                raise ValueError(
+                    "Unsupported or unreadable column-map file. "
+                    "Supported formats are CSV, TSV, TXT, XLSX, and XLS.\n"
+                    f"Text-reader error: {textError}\n"
+                    f"Excel-reader error: {excelError}"
+                ) from excelError
+
+    def _normalize_imported_column_headers(
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Clean imported table headers without changing their semantic names.
+        """
+        out = df.copy()
+
+        out.columns = [
+            str(col)
+            .replace("\ufeff", "")
+            .strip()
+            for col in out.columns
+        ]
+
+        return out
 
     def _get_valid_clustering_column_map() -> pd.DataFrame:
         """
@@ -6513,7 +9914,8 @@ def server(input, output, session):
             inputId = f"annotation_cluster_color_{i}"
 
             try:
-                currentValue = getattr(input, inputId)()
+                with reactive.isolate():
+                    currentValue = getattr(input, inputId)()
             except Exception:
                 currentValue = None
 
@@ -6541,10 +9943,6 @@ def server(input, output, session):
                             id=inputId,
                             type="color",
                             value=currentValue,
-                            oninput=(
-                                f"Shiny.setInputValue('{inputId}', this.value, "
-                                "{priority: 'event'});"
-                            ),
                             onchange=(
                                 f"Shiny.setInputValue('{inputId}', this.value, "
                                 "{priority: 'event'});"
@@ -7194,7 +10592,7 @@ def server(input, output, session):
         clusterNames = get_sorted_cluster_names(df[clusterCol])
         paletteName = input.mask_color_palette() or "viridis"
 
-        if paletteName == "custom":
+        if is_custom_palette(paletteName):
             return make_custom_color_map(
                 clusterNames,
                 input,
@@ -7246,10 +10644,10 @@ def server(input, output, session):
 
         for i, clusterName in enumerate(clusterNames):
             inputId = f"mask_cluster_color_{i}"
-
-            # Preserve existing color if the UI is rebuilt.
+            ##Fix to stop the endless reloading when dragging the color picker
             try:
-                currentValue = getattr(input, inputId)()
+                with reactive.isolate():
+                    currentValue = getattr(input, inputId)()
             except Exception:
                 currentValue = None
 
@@ -7277,10 +10675,6 @@ def server(input, output, session):
                             id=inputId,
                             type="color",
                             value=currentValue,
-                            oninput=(
-                                f"Shiny.setInputValue('{inputId}', this.value, "
-                                "{priority: 'event'});"
-                            ),
                             onchange=(
                                 f"Shiny.setInputValue('{inputId}', this.value, "
                                 "{priority: 'event'});"
@@ -9020,6 +12414,9 @@ def server(input, output, session):
 
         if isinstance(obj, (list, tuple, set)):
             return f"{type(obj).__name__}: {len(obj):,} entries"
+        
+        if isinstance(obj, (bytes, bytearray)):
+            return f"{type(obj).__name__}: {len(obj):,} bytes"
 
         return type(obj).__name__
 
@@ -9184,6 +12581,16 @@ def server(input, output, session):
             )
         )
 
+        rows.append(
+            _memory_row(
+                "Thumbnail cache",
+                thumbnail_cache.get(),
+                (
+                    "Cached PNG thumbnail bytes for all images, channels, "
+                    "rendering modes, and processing-parameter combinations."
+                ),
+            )
+        )
 
         rows.append(
             _memory_row(
@@ -9192,6 +12599,109 @@ def server(input, output, session):
                 "Shared clustering dataset used by Data preparation, Clustering, and Cluster names.",
             )
         )
+
+        rows.append(
+            _memory_row(
+                "Subclustering active cell IDs",
+                subclustering_active_cell_ids.get(),
+                "Cell IDs belonging to the selected parent cluster.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering feature matrix",
+                subclustering_feature_matrix.get(),
+                "Numeric cell × feature matrix prepared for sub-PCA.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering PCA scores",
+                subclustering_pca_scores.get(),
+                "Cell-level principal-component coordinates from sub-PCA.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering PCA loadings",
+                subclustering_pca_loadings.get(),
+                "Feature loadings for the sub-PCA components.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering PCA variance",
+                subclustering_pca_variance.get(),
+                "Explained-variance information for sub-PCA.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering Leiden labels",
+                subclustering_leiden_labels.get(),
+                "Cell-level sub-Leiden cluster assignments.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering marker summary",
+                subclustering_marker_summary.get(),
+                "Most recently generated subcluster heatmap matrix.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering PaCMAP embedding",
+                subclustering_pacmap_embedding.get(),
+                "Cell-level PaCMAP coordinates for subclusters.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering cluster-name map",
+                subclustering_cluster_name_map.get(),
+                "Mapping from sub-Leiden labels to imported subcluster names.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "Subclustering pushed columns",
+                subclustering_pushed_columns.get(),
+                "Names of subcluster annotation columns pushed into the master dataset.",
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "MCD acquisition metadata",
+                mcd_acquisition_metadata.get(),
+                (
+                    "Metadata-only table for acquisitions found "
+                    "in the currently selected MCD file."
+                ),
+            )
+        )
+
+        rows.append(
+            _memory_row(
+                "MCD panorama metadata",
+                mcd_panorama_metadata.get(),
+                (
+                    "Metadata-only table for real panorama images "
+                    "found in the currently selected MCD file."
+                ),
+            )
+        )
+
 
         out = pd.DataFrame(rows)
 

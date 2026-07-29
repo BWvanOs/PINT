@@ -71,6 +71,122 @@ def pick_open_csv_dialog(title: str = "Select parameter CSV", initialdir: str | 
     except Exception:
         print("[file dialog] tkinter fallback failed", file=sys.stderr)
         return ""
+    
+def pick_open_table_dialog(
+    title: str = "Select table",
+    initialdir: str | None = None,
+) -> str:
+    """
+    Open a file-selection dialog for common tabular formats.
+
+    Supported formats:
+    - CSV
+    - TSV / tab-separated TXT
+    - Excel XLSX / XLS
+    """
+    if _is_linux() and _zenity_available():
+        try:
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--title",
+                title,
+            ]
+
+            if initialdir:
+                cmd += [
+                    "--filename",
+                    os.path.join(initialdir, ""),
+                ]
+
+            cmd += [
+                "--file-filter=Supported tables | *.csv *.tsv *.txt *.xlsx *.xls",
+                "--file-filter=CSV files | *.csv",
+                "--file-filter=Tab-separated files | *.tsv *.txt",
+                "--file-filter=Excel files | *.xlsx *.xls",
+                "--file-filter=All files | *",
+            ]
+
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+            )
+
+            return (
+                res.stdout.strip()
+                if res.returncode == 0
+                else ""
+            )
+
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            dpi = root.winfo_fpixels("1i")
+            scale = max(
+                1.0,
+                float(dpi) / 96.0,
+            )
+            root.tk.call(
+                "tk",
+                "scaling",
+                scale,
+            )
+        except Exception:
+            pass
+
+        try:
+            root.wm_attributes(
+                "-topmost",
+                1,
+            )
+        except Exception:
+            pass
+
+        path = filedialog.askopenfilename(
+            title=title,
+            initialdir=initialdir or os.getcwd(),
+            filetypes=[
+                (
+                    "Supported tables",
+                    "*.csv *.tsv *.txt *.xlsx *.xls",
+                ),
+                (
+                    "CSV files",
+                    "*.csv",
+                ),
+                (
+                    "Tab-separated files",
+                    "*.tsv *.txt",
+                ),
+                (
+                    "Excel files",
+                    "*.xlsx *.xls",
+                ),
+                (
+                    "All files",
+                    "*.*",
+                ),
+            ],
+        )
+
+        root.destroy()
+        return path or ""
+
+    except Exception:
+        print(
+            "[file dialog] table picker fallback failed",
+            file=sys.stderr,
+        )
+        return ""
 
 
 def pick_save_csv_dialog(
@@ -301,3 +417,193 @@ def pick_save_png_dialog(
 
     root.destroy()
     return path or ""
+
+def pick_open_mcd_dialog(
+    title: str = "Select MCD file",
+    initialdir: str | None = None,
+) -> str:
+    """
+    Open a file-selection dialog for a Standard BioTools MCD file.
+    """
+    if _is_linux() and _zenity_available():
+        try:
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--title",
+                title,
+            ]
+
+            if initialdir:
+                cmd += [
+                    "--filename",
+                    os.path.join(initialdir, ""),
+                ]
+
+            cmd += [
+                "--file-filter=MCD files | *.mcd *.MCD",
+                "--file-filter=All files | *",
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+            )
+
+            return (
+                result.stdout.strip()
+                if result.returncode == 0
+                else ""
+            )
+
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            dpi = root.winfo_fpixels("1i")
+            scale = max(
+                1.0,
+                float(dpi) / 96.0,
+            )
+            root.tk.call(
+                "tk",
+                "scaling",
+                scale,
+            )
+        except Exception:
+            pass
+
+        try:
+            root.wm_attributes(
+                "-topmost",
+                1,
+            )
+        except Exception:
+            pass
+
+        path = filedialog.askopenfilename(
+            title=title,
+            initialdir=initialdir or os.getcwd(),
+            filetypes=[
+                ("MCD files", "*.mcd *.MCD"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        root.destroy()
+        return path or ""
+
+    except Exception:
+        print(
+            "[file dialog] MCD picker fallback failed",
+            file=sys.stderr,
+        )
+        return ""
+
+def pick_open_mcd_files_dialog(
+    title: str = "Select one or more MCD files",
+    initialdir: str | None = None,
+) -> list[str]:
+    """
+    Open a file-selection dialog for one or more MCD files.
+    """
+    if _is_linux() and _zenity_available():
+        try:
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--multiple",
+                "--separator=\n",
+                "--title",
+                title,
+            ]
+
+            if initialdir:
+                cmd += [
+                    "--filename",
+                    os.path.join(initialdir, ""),
+                ]
+
+            cmd += [
+                "--file-filter=MCD files | *.mcd *.MCD",
+                "--file-filter=All files | *",
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+            )
+
+            if result.returncode != 0:
+                return []
+
+            return [
+                path.strip()
+                for path in result.stdout.splitlines()
+                if path.strip()
+            ]
+
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            dpi = root.winfo_fpixels("1i")
+            scale = max(
+                1.0,
+                float(dpi) / 96.0,
+            )
+            root.tk.call(
+                "tk",
+                "scaling",
+                scale,
+            )
+        except Exception:
+            pass
+
+        try:
+            root.wm_attributes(
+                "-topmost",
+                1,
+            )
+        except Exception:
+            pass
+
+        paths = filedialog.askopenfilenames(
+            title=title,
+            initialdir=initialdir or os.getcwd(),
+            filetypes=[
+                ("MCD files", "*.mcd *.MCD"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        root.destroy()
+
+        return [
+            str(path)
+            for path in paths
+            if str(path).strip()
+        ]
+
+    except Exception:
+        print(
+            "[file dialog] multi-MCD picker fallback failed",
+            file=sys.stderr,
+        )
+        return []

@@ -13,22 +13,7 @@ def pint_panel():
                 # Loading / selection / export
                 # ----------------------------
                 ui.card(
-                    ui.card_header("Image selection"),
-
-                    ui.input_text(
-                        "path",
-                        "Folder path",
-                        value="",
-                        width="100%",
-                    ),
-
-                    ui.input_action_button(
-                        "load",
-                        "Load images",
-                        class_="btn btn-primary w-100 mb-2",
-                    ),
-
-                    ui.tags.hr(class_="pint-divider"),
+                    ui.card_header("Processing and export"),
 
                     ui.row(
                         ui.column(

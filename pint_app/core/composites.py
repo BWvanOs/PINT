@@ -53,3 +53,18 @@ def parse_composite_color(colorName: str) -> tuple[float, float, float]:
             return 1.0, 1.0, 1.0
 
     return 1.0, 1.0, 1.0
+
+def composite_color_to_hex(color_name: str) -> str:
+    """
+    Convert a named PINT composite preset to #RRGGBB.
+    """
+    rgb = COMPOSITE_PALETTE.get(str(color_name))
+
+    if rgb is None:
+        return "#ffffff"
+
+    return "#{:02x}{:02x}{:02x}".format(
+        round(float(rgb[0]) * 255),
+        round(float(rgb[1]) * 255),
+        round(float(rgb[2]) * 255),
+    )

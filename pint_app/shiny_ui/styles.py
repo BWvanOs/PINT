@@ -524,5 +524,72 @@ def app_styles():
                 text-align: left;
             }
                       
+            /* ============================================================
+                                Thumbnail overview
+            ============================================================ */
+
+            .thumbnail-scroll-area {
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow-y: auto;
+                overflow-x: auto;
+                padding: 0.25rem;
+            }
+                                
+            .thumbnail-grid {
+                display: grid;
+                grid-template-columns: repeat(
+                    auto-fill,
+                    minmax(250px, 250px)
+                );
+                gap: 0.75rem;
+                align-items: start;
+                justify-content: start;
+                width: 100%;
+            }
+
+            .thumbnail-card {
+                width: 250px;
+                border: 1px solid #8f8f8f;
+                border-radius: 0.35rem;
+                overflow: hidden;
+                background: var(--bs-body-bg);
+            }
+
+            .thumbnail-image-frame {
+                width: 250px;
+                height: 350px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #000000;
+                overflow: hidden;
+            }
+
+            .thumbnail-image {
+                display: block;
+                width: auto;
+                height: auto;
+                max-width: 250px;
+                max-height: 350px;
+                object-fit: contain;
+                image-rendering: auto;
+            }
+
+            .thumbnail-label {
+                padding: 0.35rem 0.5rem;
+                border-top: 1px solid #8f8f8f;
+                font-size: 0.85rem;
+                font-weight: 600;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .thumbnail-dimensions {
+                padding: 0 0.5rem 0.35rem 0.5rem;
+                font-size: 0.72rem;
+                color: var(--bs-secondary-color);
+            }                        
         """)
     )
