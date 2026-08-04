@@ -52,7 +52,9 @@ open issues/to do
     New functions!
         - You can now read MCD files and export the images as ome.tiffs, panoramas as PNG's and push images form the MCD into PINT
         - Made a Thumbnail tab and placed all the IMC images handlers into a seperate main tab
-
+0.6.8.1
+    -Added a way to vizualize 1 channel from all images in the thumbnail tab
+    -Added a single mask export function to the mask vizualization tab
 
 
 
