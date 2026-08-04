@@ -11,6 +11,22 @@ def thumbnail_panel():
             # ============================================================
             ui.tags.div(
                 ui.card(
+                    ui.card_header("Thumbnail overview"),
+
+                    ui.input_radio_buttons(
+                        "thumbnail_view_mode",
+                        "Display",
+                        choices={
+                            "sample": "All channels from one image",
+                            "channel": "One channel from all images",
+                        },
+                        selected="sample",
+                    ),
+
+                    class_="mb-2",
+                ),
+
+                ui.card(
                     ui.card_header("Thumbnail rendering"),
 
                     ui.input_radio_buttons(
@@ -34,15 +50,22 @@ def thumbnail_panel():
                         "Generate thumbnails",
                         class_="btn btn-primary w-100 mb-2",
                     ),
+
                     ui.tags.p(
-                    "Generates every channel for every loaded image using the selected rendering mode. Existing valid cache entries are reused and not rerendered. Rendering might take a while.",
-                    class_="text-muted small",
+                        "Generates thumbnails required for the selected overview. "
+                        "Existing valid cache entries are reused and not rerendered.",
+                        class_="text-muted small",
                     ),
-                    
+
                     ui.input_action_button(
                         "generate_all_thumbnails",
                         "Generate all thumbnails",
                         class_="btn btn-outline-primary w-100 mb-2",
+                    ),
+
+                    ui.tags.p(
+                        "Generates every channel for every loaded image.",
+                        class_="text-muted small",
                     ),
 
                     ui.input_action_button(
@@ -51,7 +74,7 @@ def thumbnail_panel():
                         class_="btn btn-secondary w-100",
                     ),
 
-                    class_="mb-2",
+                    class_="mb-2 thumbnail-render-controls",
                 ),
 
                 ui.card(
@@ -67,44 +90,70 @@ def thumbnail_panel():
             # RIGHT THUMBNAIL COLUMN
             # ============================================================
             ui.tags.div(
-                ui.tags.div(
-                    ui.row(
-                        ui.tags.div(
-                            ui.input_select(
-                                "thumbnail_sample_display",
-                                "Sample",
-                                choices=[],
-                                selected=None,
-                                width="100%",
-                            ),
-                            class_="navigator-select",
-                        ),
 
-                        ui.tags.div(
-                            ui.input_action_button(
-                                "thumbnail_prev_sample",
-                                "←",
-                                class_="btn-sm w-100",
-                            ),
-                            class_="navigator-button",
-                        ),
+                # --------------------------------------------------------
+                # SAMPLE MODE NAVIGATOR
+                # --------------------------------------------------------
+                ui.panel_conditional(
+                    "input.thumbnail_view_mode === 'sample'",
 
-                        ui.tags.div(
-                            ui.input_action_button(
-                                "thumbnail_next_sample",
-                                "→",
-                                class_="btn-sm w-100",
+                    ui.tags.div(
+                        ui.row(
+                            ui.tags.div(
+                                ui.input_select(
+                                    "thumbnail_sample_display",
+                                    "Image",
+                                    choices=[],
+                                    selected=None,
+                                    width="100%",
+                                ),
+                                class_="navigator-select",
                             ),
-                            class_="navigator-button",
-                        ),
 
-                        class_=(
-                            "align-items-end gy-0 gx-1 "
-                            "viewer-navigator-row "
-                            "pint-navigator-half-fixed"
+                            ui.tags.div(
+                                ui.input_action_button(
+                                    "thumbnail_prev_sample",
+                                    "←",
+                                    class_="btn-sm w-100",
+                                ),
+                                class_="navigator-button",
+                            ),
+
+                            ui.tags.div(
+                                ui.input_action_button(
+                                    "thumbnail_next_sample",
+                                    "→",
+                                    class_="btn-sm w-100",
+                                ),
+                                class_="navigator-button",
+                            ),
+
+                            class_=(
+                                "align-items-end gy-0 gx-1 "
+                                "viewer-navigator-row "
+                                "pint-navigator-half-fixed"
+                            ),
                         ),
+                        class_="viewer-navigator",
                     ),
-                    class_="viewer-navigator",
+                ),
+
+                # --------------------------------------------------------
+                # CHANNEL MODE NAVIGATOR
+                # --------------------------------------------------------
+                ui.panel_conditional(
+                    "input.thumbnail_view_mode === 'channel'",
+
+                    ui.tags.div(
+                        ui.input_select(
+                            "thumbnail_channel_display",
+                            "Channel",
+                            choices=[],
+                            selected=None,
+                            width="100%",
+                        ),
+                        class_="viewer-navigator",
+                    ),
                 ),
 
                 ui.tags.div(

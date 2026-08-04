@@ -191,6 +191,12 @@ def mask_visualization_panel():
                         ui.hr(class_="mask-divider"),
 
                         ui.input_action_button(
+                            "export_current_mask_visualization",
+                            "Export current mask visualization",
+                            class_="btn btn-secondary w-100 mt-2",
+                        ),
+
+                        ui.input_action_button(
                             "export_all_mask_visualizations",
                             "Export all matched mask visualizations",
                             class_="btn btn-secondary w-100 mt-2",

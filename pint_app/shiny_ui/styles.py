@@ -234,6 +234,29 @@ def app_styles():
                 padding-right: 0.35rem;
             }
 
+            .thumbnail-render-controls .shiny-input-container {
+                width: 100% !important;
+                max-width: none !important;
+            }
+
+            .thumbnail-render-controls .shiny-options-group {
+                width: 100% !important;
+                max-width: none !important;
+            }
+
+            .thumbnail-render-controls .form-check {
+                display: block !important;
+                width: 100% !important;
+                max-width: none !important;
+            }
+
+            .thumbnail-render-controls .form-check-label {
+                display: inline !important;
+                width: auto !important;
+                max-width: none !important;
+                white-space: nowrap !important;
+            }
+
             .param-table-wrap table {
                 font-size: 12px;
                 width: 100% !important;
@@ -471,59 +494,6 @@ def app_styles():
                 z-index: 3000 !important;
             }
                       
-            .advanced-settings-wide {
-                width: min(100%, 1850px);
-                max-width: 1850px;
-                margin-left: auto;
-                margin-right: auto;
-            }
-
-            .advanced-settings-card {
-                width: 100%;
-                border: 1px solid #dee2e6;
-                box-shadow: 0 0.15rem 0.45rem rgba(0, 0, 0, 0.08);
-            }
-
-            .advanced-settings-card .card-body {
-                width: 100%;
-                overflow: visible;
-            }
-
-            .advanced-memory-table-wrap {
-                width: 100%;
-                max-width: 100%;
-                overflow-x: auto;
-            }
-
-            .advanced-memory-table-wrap .shiny-html-output {
-                width: 100% !important;
-                display: block !important;
-                min-height: 50px;
-            }
-
-            .advanced-memory-table-wrap table {
-                display: table !important;
-                width: 100% !important;
-                table-layout: fixed;
-                border-collapse: collapse;
-                font-size: 0.86rem;
-            }
-
-            .advanced-memory-table-wrap th,
-            .advanced-memory-table-wrap td {
-                padding: 0.35rem 0.45rem;
-                vertical-align: top;
-                border-bottom: 1px solid #dee2e6;
-                white-space: normal;
-                overflow-wrap: anywhere;
-            }
-
-            .advanced-memory-table-wrap th {
-                font-weight: 750;
-                background-color: #f8f9fa;
-                text-align: left;
-            }
-                      
             /* ============================================================
                                 Thumbnail overview
             ============================================================ */
@@ -590,6 +560,60 @@ def app_styles():
                 padding: 0 0.5rem 0.35rem 0.5rem;
                 font-size: 0.72rem;
                 color: var(--bs-secondary-color);
-            }                        
+            }                 
+
+                        .advanced-settings-wide {
+                width: min(100%, 1850px);
+                max-width: 1850px;
+                margin-left: auto;
+                margin-right: auto;
+            }
+
+            .advanced-settings-card {
+                width: 100%;
+                border: 1px solid #dee2e6;
+                box-shadow: 0 0.15rem 0.45rem rgba(0, 0, 0, 0.08);
+            }
+
+            .advanced-settings-card .card-body {
+                width: 100%;
+                overflow: visible;
+            }
+
+            .advanced-memory-table-wrap {
+                width: 100%;
+                max-width: 100%;
+                overflow-x: auto;
+            }
+
+            .advanced-memory-table-wrap .shiny-html-output {
+                width: 100% !important;
+                display: block !important;
+                min-height: 50px;
+            }
+
+            .advanced-memory-table-wrap table {
+                display: table !important;
+                width: 100% !important;
+                table-layout: fixed;
+                border-collapse: collapse;
+                font-size: 0.86rem;
+            }
+
+            .advanced-memory-table-wrap th,
+            .advanced-memory-table-wrap td {
+                padding: 0.35rem 0.45rem;
+                vertical-align: top;
+                border-bottom: 1px solid #dee2e6;
+                white-space: normal;
+                overflow-wrap: anywhere;
+            }
+
+            .advanced-memory-table-wrap th {
+                font-weight: 750;
+                background-color: #f8f9fa;
+                text-align: left;
+            }
+                   
         """)
     )

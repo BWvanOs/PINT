@@ -428,6 +428,23 @@ def server(input, output, session):
             firstChannelList
         )
 
+        thumbnailChannels = _get_all_thumbnail_channels()
+
+        ui.update_select(
+            "thumbnail_channel_display",
+            choices=thumbnailChannels,
+            selected=(
+                firstChannel
+                if firstChannel in thumbnailChannels
+                else (
+                    thumbnailChannels[0]
+                    if thumbnailChannels
+                    else None
+                )
+            ),
+            session=session,
+        )
+
         setting_selects.set(True)
 
         try:
@@ -442,6 +459,13 @@ def server(input, output, session):
                 "creator_sample_display",
                 choices=samples,
                 selected=firstSample,
+                session=session,
+            )
+
+            ui.update_select(
+                "thumbnail_channel_display",
+                choices=firstChannelList,
+                selected=firstChannel,
                 session=session,
             )
 
@@ -484,6 +508,34 @@ def server(input, output, session):
             f"{len(firstChannelList):,} channels.",
             flush=True,
         )
+
+    def _get_all_thumbnail_channels() -> list[str]:
+        """
+        Return all channel names present anywhere in the loaded image library.
+
+        Canonical channel order is preserved first, followed by any additional
+        channels encountered in later images.
+        """
+        channelData = channels.get()
+        canonical = list(canonical_channels.get() or [])
+
+        allChannels = []
+        seen = set()
+
+        # Keep canonical ordering first.
+        for channelName in canonical:
+            if channelName not in seen:
+                allChannels.append(channelName)
+                seen.add(channelName)
+
+        # Add channels that occur only in later images.
+        for sampleChannels in channelData.values():
+            for channelName in sampleChannels:
+                if channelName not in seen:
+                    allChannels.append(channelName)
+                    seen.add(channelName)
+
+        return allChannels
 
     def _validate_loaded_image_channel_layouts(
         channelsBySample: dict[str, list[str]],
@@ -945,6 +997,93 @@ def server(input, output, session):
             nReused,
             failures,
             len(channelNames),
+        )
+
+    def _generate_channel_thumbnails(
+        channelName: str,
+        renderMode: str,
+        cache: dict,
+        *,
+        progress=None,
+    ) -> tuple[dict, int, int, list[str], int]:
+        """
+        Generate one channel across all images that contain that channel.
+
+        Returns:
+        - updated cache
+        - number generated
+        - number reused
+        - failure messages
+        - number of images processed
+        """
+        imageData = images.get()
+        channelData = channels.get()
+
+        sampleNames = [
+            sampleName
+            for sampleName in imageData.keys()
+            if channelName in channelData.get(sampleName, [])
+        ]
+
+        nGenerated = 0
+        nReused = 0
+        failures = []
+
+        totalWork = len(sampleNames)
+
+        for sampleIndex, sampleName in enumerate(
+            sampleNames,
+            start=1,
+        ):
+            if progress is not None:
+                progress.set(
+                    value=sampleIndex - 1,
+                    message=(
+                        f"Generating {channelName} thumbnails"
+                    ),
+                    detail=(
+                        f"{sampleName} "
+                        f"({sampleIndex}/{totalWork})"
+                    ),
+                )
+
+            cacheKey = _make_thumbnail_cache_key(
+                sampleName,
+                channelName,
+                renderMode,
+            )
+
+            if cacheKey in cache:
+                nReused += 1
+
+            else:
+                try:
+                    cache[cacheKey] = (
+                        _build_thumbnail_cache_entry(
+                            sampleName,
+                            channelName,
+                            renderMode,
+                        )
+                    )
+
+                    nGenerated += 1
+
+                except Exception as e:
+                    failures.append(
+                        f"{sampleName} / {channelName}: {e}"
+                    )
+
+            if progress is not None:
+                progress.set(
+                    value=sampleIndex
+                )
+
+        return (
+            cache,
+            nGenerated,
+            nReused,
+            failures,
+            totalWork,
         )
 
     def _processed_image_to_uint8(
@@ -5497,39 +5636,10 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.generate_thumbnails)
     def _generate_thumbnails():
-        sampleName = input.sample()
-
-        if not sampleName:
-            msg = "Select an image before generating thumbnails."
-
-            thumbnail_status.set(msg)
-
-            ui.notification_show(
-                msg,
-                type="warning",
-                duration=6,
-            )
-            return
-
-        channelNames = channels.get().get(
-            sampleName,
-            [],
+        viewMode = (
+            input.thumbnail_view_mode()
+            or "sample"
         )
-
-        if not channelNames:
-            msg = (
-                f"No channels are available for "
-                f"'{sampleName}'."
-            )
-
-            thumbnail_status.set(msg)
-
-            ui.notification_show(
-                msg,
-                type="warning",
-                duration=6,
-            )
-            return
 
         renderMode = (
             input.thumbnail_render_mode()
@@ -5540,27 +5650,157 @@ def server(input, output, session):
             thumbnail_cache.get()
         )
 
-        with ui.Progress(
-            min=0,
-            max=len(channelNames),
-            session=session,
-        ) as progress:
+        # ================================================================
+        # ONE IMAGE -> ALL CHANNELS
+        # ================================================================
+        if viewMode == "sample":
+            sampleName = input.sample()
 
-            (
-                currentCache,
-                nGenerated,
-                nReused,
-                failures,
-                _,
-            ) = _generate_sample_thumbnails(
+            if not sampleName:
+                msg = (
+                    "Select an image before generating thumbnails."
+                )
+
+                thumbnail_status.set(msg)
+
+                ui.notification_show(
+                    msg,
+                    type="warning",
+                    duration=6,
+                )
+                return
+
+            channelNames = channels.get().get(
                 sampleName,
-                renderMode,
-                currentCache,
-                progress=progress,
-                progressOffset=0,
-                totalWork=len(channelNames),
+                [],
             )
 
+            if not channelNames:
+                msg = (
+                    f"No channels are available for "
+                    f"'{sampleName}'."
+                )
+
+                thumbnail_status.set(msg)
+
+                ui.notification_show(
+                    msg,
+                    type="warning",
+                    duration=6,
+                )
+                return
+
+            with ui.Progress(
+                min=0,
+                max=len(channelNames),
+                session=session,
+            ) as progress:
+
+                (
+                    currentCache,
+                    nGenerated,
+                    nReused,
+                    failures,
+                    _,
+                ) = _generate_sample_thumbnails(
+                    sampleName,
+                    renderMode,
+                    currentCache,
+                    progress=progress,
+                    progressOffset=0,
+                    totalWork=len(channelNames),
+                )
+
+            overviewLabel = (
+                f"{len(channelNames):,} channels from "
+                f"{sampleName}"
+            )
+
+        # ================================================================
+        # ONE CHANNEL -> ALL IMAGES
+        # ================================================================
+        elif viewMode == "channel":
+            channelName = (
+                input.thumbnail_channel_display()
+            )
+
+            if not channelName:
+                msg = (
+                    "Select a channel before generating thumbnails."
+                )
+
+                thumbnail_status.set(msg)
+
+                ui.notification_show(
+                    msg,
+                    type="warning",
+                    duration=6,
+                )
+                return
+
+            sampleNames = [
+                sampleName
+                for sampleName in images.get().keys()
+                if channelName
+                in channels.get().get(sampleName, [])
+            ]
+
+            if not sampleNames:
+                msg = (
+                    f"Channel '{channelName}' is not available "
+                    f"in any loaded image."
+                )
+
+                thumbnail_status.set(msg)
+
+                ui.notification_show(
+                    msg,
+                    type="warning",
+                    duration=6,
+                )
+                return
+
+            with ui.Progress(
+                min=0,
+                max=len(sampleNames),
+                session=session,
+            ) as progress:
+
+                (
+                    currentCache,
+                    nGenerated,
+                    nReused,
+                    failures,
+                    _,
+                ) = _generate_channel_thumbnails(
+                    channelName,
+                    renderMode,
+                    currentCache,
+                    progress=progress,
+                )
+
+            overviewLabel = (
+                f"{channelName} across "
+                f"{len(sampleNames):,} images"
+            )
+
+        else:
+            msg = (
+                f"Unknown thumbnail view mode: {viewMode}"
+            )
+
+            thumbnail_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=6,
+            )
+            return
+
+        # ================================================================
+        # CACHE + STATUS
+        # ================================================================
         thumbnail_cache.set(
             currentCache
         )
@@ -5572,7 +5812,8 @@ def server(input, output, session):
         )
 
         msg = (
-            f"Thumbnail overview ready for {sampleName}: "
+            f"Thumbnail overview ready: "
+            f"{overviewLabel}; "
             f"{nGenerated:,} generated, "
             f"{nReused:,} loaded from cache using "
             f"{modeLabel} rendering."
@@ -5580,7 +5821,7 @@ def server(input, output, session):
 
         if failures:
             msg += (
-                f" {len(failures):,} channel(s) failed."
+                f" {len(failures):,} thumbnail(s) failed."
             )
 
             print(
@@ -5606,8 +5847,7 @@ def server(input, output, session):
             flush=True,
         )
 
-
-
+    
     @reactive.Effect
     @reactive.event(input.generate_all_thumbnails)
     def _generate_all_thumbnails():
@@ -5760,24 +6000,10 @@ def server(input, output, session):
     @output
     @render.ui
     def thumbnail_grid():
-        sampleName = input.sample()
-
-        if not sampleName:
-            return ui.tags.div(
-                "Load images and select a sample.",
-                class_="text-muted p-3",
-            )
-
-        channelNames = channels.get().get(
-            sampleName,
-            [],
+        viewMode = (
+            input.thumbnail_view_mode()
+            or "sample"
         )
-
-        if not channelNames:
-            return ui.tags.div(
-                "No channels are available for this sample.",
-                class_="text-muted p-3",
-            )
 
         renderMode = (
             input.thumbnail_render_mode()
@@ -5787,97 +6013,278 @@ def server(input, output, session):
         cache = thumbnail_cache.get()
 
         cards = []
-        missingChannels = []
 
-        for channelName in channelNames:
-            cacheKey = _make_thumbnail_cache_key(
+        # ================================================================
+        # ONE IMAGE -> ALL CHANNELS
+        # ================================================================
+        if viewMode == "sample":
+            sampleName = input.sample()
+
+            if not sampleName:
+                return ui.tags.div(
+                    "Load images and select an image.",
+                    class_="text-muted p-3",
+                )
+
+            channelNames = channels.get().get(
                 sampleName,
-                channelName,
-                renderMode,
+                [],
             )
 
-            entry = cache.get(cacheKey)
+            if not channelNames:
+                return ui.tags.div(
+                    "No channels are available for this image.",
+                    class_="text-muted p-3",
+                )
 
-            if entry is None:
-                missingChannels.append(channelName)
-                continue
+            missingChannels = []
 
-            dataUri = _png_bytes_to_data_uri(
-                entry["png_bytes"]
-            )
+            for channelName in channelNames:
+                cacheKey = _make_thumbnail_cache_key(
+                    sampleName,
+                    channelName,
+                    renderMode,
+                )
 
-            cards.append(
-                ui.tags.div(
+                entry = cache.get(cacheKey)
+
+                if entry is None:
+                    missingChannels.append(
+                        channelName
+                    )
+                    continue
+
+                dataUri = _png_bytes_to_data_uri(
+                    entry["png_bytes"]
+                )
+
+                cards.append(
                     ui.tags.div(
-                        ui.tags.img(
-                            src=dataUri,
-                            alt=(
-                                f"{channelName} thumbnail "
-                                f"for {sampleName}"
+                        ui.tags.div(
+                            ui.tags.img(
+                                src=dataUri,
+                                alt=(
+                                    f"{channelName} thumbnail "
+                                    f"for {sampleName}"
+                                ),
+                                class_="thumbnail-image",
+                                loading="lazy",
                             ),
-                            class_="thumbnail-image",
-                            loading="lazy",
+                            class_="thumbnail-image-frame",
                         ),
-                        class_="thumbnail-image-frame",
-                    ),
 
-                    ui.tags.div(
-                        channelName,
-                        title=channelName,
-                        class_="thumbnail-label",
-                    ),
+                        ui.tags.div(
+                            channelName,
+                            title=channelName,
+                            class_="thumbnail-label",
+                        ),
 
+                        ui.tags.div(
+                            (
+                                f"{entry['source_width']} × "
+                                f"{entry['source_height']} → "
+                                f"{entry['width']} × "
+                                f"{entry['height']}"
+                            ),
+                            class_="thumbnail-dimensions",
+                        ),
+
+                        class_="thumbnail-card",
+                    )
+                )
+
+            if not cards:
+                return ui.tags.div(
+                    ui.tags.p(
+                        (
+                            f"No cached {renderMode} thumbnails exist "
+                            f"for {sampleName}."
+                        )
+                    ),
+                    ui.tags.p(
+                        "Press “Generate thumbnails” to create them.",
+                        class_="text-muted",
+                    ),
+                    class_="p-3",
+                )
+
+            content = [
+                ui.tags.div(
+                    *cards,
+                    class_="thumbnail-grid",
+                )
+            ]
+
+            if missingChannels:
+                content.insert(
+                    0,
                     ui.tags.div(
                         (
-                            f"{entry['source_width']} × "
-                            f"{entry['source_height']} → "
-                            f"{entry['width']} × "
-                            f"{entry['height']}"
+                            f"{len(missingChannels):,} channel(s) do not "
+                            f"have a current cached thumbnail. "
+                            f"Press “Generate thumbnails” to update them."
                         ),
-                        class_="thumbnail-dimensions",
+                        class_="alert alert-warning py-2",
                     ),
+                )
 
-                    class_="thumbnail-card",
+            return ui.tags.div(
+                *content
+            )
+
+        # ================================================================
+        # ONE CHANNEL -> ALL IMAGES
+        # ================================================================
+        elif viewMode == "channel":
+            channelName = (
+                input.thumbnail_channel_display()
+            )
+
+            if not channelName:
+                return ui.tags.div(
+                    "Select a channel to compare across images.",
+                    class_="text-muted p-3",
+                )
+
+            imageData = images.get()
+            channelData = channels.get()
+
+            if not imageData:
+                return ui.tags.div(
+                    "No images are loaded.",
+                    class_="text-muted p-3",
+                )
+
+            missingCache = []
+            unavailableSamples = []
+
+            for sampleName in imageData.keys():
+
+                # Some datasets may not contain the selected
+                # channel in every image.
+                if channelName not in channelData.get(
+                    sampleName,
+                    [],
+                ):
+                    unavailableSamples.append(
+                        sampleName
+                    )
+                    continue
+
+                cacheKey = _make_thumbnail_cache_key(
+                    sampleName,
+                    channelName,
+                    renderMode,
+                )
+
+                entry = cache.get(cacheKey)
+
+                if entry is None:
+                    missingCache.append(
+                        sampleName
+                    )
+                    continue
+
+                dataUri = _png_bytes_to_data_uri(
+                    entry["png_bytes"]
+                )
+
+                cards.append(
+                    ui.tags.div(
+                        ui.tags.div(
+                            ui.tags.img(
+                                src=dataUri,
+                                alt=(
+                                    f"{channelName} thumbnail "
+                                    f"for {sampleName}"
+                                ),
+                                class_="thumbnail-image",
+                                loading="lazy",
+                            ),
+                            class_="thumbnail-image-frame",
+                        ),
+
+                        # In this mode the useful label is the IMAGE,
+                        # not the channel, because every card is the
+                        # same channel.
+                        ui.tags.div(
+                            sampleName,
+                            title=sampleName,
+                            class_="thumbnail-label",
+                        ),
+
+                        ui.tags.div(
+                            (
+                                f"{entry['source_width']} × "
+                                f"{entry['source_height']} → "
+                                f"{entry['width']} × "
+                                f"{entry['height']}"
+                            ),
+                            class_="thumbnail-dimensions",
+                        ),
+
+                        class_="thumbnail-card",
+                    )
+                )
+
+            if not cards:
+                return ui.tags.div(
+                    ui.tags.p(
+                        (
+                            f"No cached {renderMode} thumbnails exist "
+                            f"for channel '{channelName}'."
+                        )
+                    ),
+                    ui.tags.p(
+                        "Press “Generate thumbnails” to create them.",
+                        class_="text-muted",
+                    ),
+                    class_="p-3",
+                )
+
+            content = []
+
+            if missingCache:
+                content.append(
+                    ui.tags.div(
+                        (
+                            f"{len(missingCache):,} image(s) containing "
+                            f"'{channelName}' do not have a current "
+                            f"cached thumbnail. Press “Generate thumbnails” "
+                            f"to update them."
+                        ),
+                        class_="alert alert-warning py-2",
+                    )
+                )
+
+            if unavailableSamples:
+                content.append(
+                    ui.tags.div(
+                        (
+                            f"{len(unavailableSamples):,} image(s) do not "
+                            f"contain channel '{channelName}' and are "
+                            f"not shown."
+                        ),
+                        class_="alert alert-secondary py-2",
+                    )
+                )
+
+            content.append(
+                ui.tags.div(
+                    *cards,
+                    class_="thumbnail-grid",
                 )
             )
 
-        if not cards:
             return ui.tags.div(
-                ui.tags.p(
-                    (
-                        f"No cached {renderMode} thumbnails exist "
-                        f"for {sampleName}."
-                    )
-                ),
-                ui.tags.p(
-                    "Press “Generate thumbnails” to create them.",
-                    class_="text-muted",
-                ),
-                class_="p-3",
+                *content
             )
 
-        content = [
-            ui.tags.div(
-                *cards,
-                class_="thumbnail-grid",
-            )
-        ]
+        return ui.tags.div(
+            f"Unknown thumbnail view mode: {viewMode}",
+            class_="text-muted p-3",
+        )
 
-        if missingChannels:
-            content.insert(
-                0,
-                ui.tags.div(
-                    (
-                        f"{len(missingChannels):,} channel(s) do not "
-                        f"have a current cached thumbnail. "
-                        f"Press “Generate thumbnails” to update them."
-                    ),
-                    class_="alert alert-warning py-2",
-                ),
-            )
-
-        return ui.tags.div(*content)
-    
     @output
     @render.ui
     def thumbnail_status_ui():
@@ -11738,6 +12145,173 @@ def server(input, output, session):
         )
 
         print(f"✅ Mask matching complete: {len(matched_df)} matched, {len(missing_df)} missing.")
+
+    @reactive.Effect
+    @reactive.event(input.export_current_mask_visualization)
+    def _export_current_mask_visualization():
+        sel = selected_mask_match.get()
+        inputDf = mask_input_df.get()
+
+        if sel is None or sel.empty:
+            msg = "No matched mask is currently selected."
+            print(f"⚠️ {msg}", flush=True)
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        if inputDf is None or inputDf.empty:
+            msg = "No cell table loaded."
+            print(f"⚠️ {msg}", flush=True)
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        maskNameCol = input.mask_name_col() or "CellMaskName"
+        xCol = input.mask_x_col()
+        yCol = input.mask_y_col()
+        clusterCol = input.mask_cluster_col()
+        scaleFactor = int(input.mask_scale_factor() or 2)
+
+        if not xCol or not yCol or not clusterCol:
+            msg = "X, Y, and cluster columns must be selected."
+            print(f"⚠️ {msg}", flush=True)
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        row = sel.iloc[0]
+
+        if maskNameCol not in row.index:
+            msg = f"Mask name column '{maskNameCol}' was not found."
+            print(f"⚠️ {msg}", flush=True)
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        maskName = str(row[maskNameCol])
+        maskPath = row.get("MaskPath", None)
+
+        if not maskPath or pd.isna(maskPath):
+            msg = f"No valid mask path found for '{maskName}'."
+            print(f"⚠️ {msg}", flush=True)
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        matchingData = get_cells_for_mask_name(
+            inputDf,
+            mask_name=maskName,
+            mask_name_col=maskNameCol,
+        )
+
+        if matchingData.empty:
+            msg = f"No cell-table rows found for '{maskName}'."
+            print(f"⚠️ {msg}", flush=True)
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+            return
+
+        maskDir = (input.mask_path() or "").strip()
+
+        if not maskDir:
+            maskDir = str(Path(maskPath).parent)
+
+        outDir = Path(maskDir) / "Exported mask visualizations"
+        outDir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        clusterColorMap = active_mask_cluster_color_map()
+
+        try:
+            fig, matchedData = _build_mask_visualization_figure(
+                maskPath=str(maskPath),
+                maskName=maskName,
+                matchingData=matchingData,
+                clusterCol=clusterCol,
+                xCol=xCol,
+                yCol=yCol,
+                scaleFactor=scaleFactor,
+                clusterColorMap=clusterColorMap,
+            )
+
+            safeName = "".join(
+                ch
+                if ch.isalnum() or ch in ("_", "-", ".")
+                else "_"
+                for ch in maskName
+            )
+
+            outPath = outDir / f"{safeName}.tiff"
+
+            fig.savefig(
+                outPath,
+                format="tiff",
+                dpi=200,
+                bbox_inches="tight",
+                pil_kwargs={
+                    "compression": "tiff_lzw"
+                },
+            )
+
+            plt.close(fig)
+
+            msg = (
+                f"Exported {maskName} "
+                f"({matchedData.shape[0]:,} cells) "
+                f"to {outPath}"
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+        except Exception as e:
+            try:
+                plt.close("all")
+            except Exception:
+                pass
+
+            msg = (
+                f"Failed to export '{maskName}': {e}"
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=8,
+            )
 
     @reactive.Effect
     @reactive.event(input.confirm_export_all_mask_visualizations)
