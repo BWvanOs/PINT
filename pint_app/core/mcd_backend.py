@@ -18,6 +18,10 @@ try:
 except ImportError:
     MCDFile = None
 
+from pint_app.core.channel_names import (
+    _make_unique_channel_names,
+)
+
 warnings.filterwarnings(
     "ignore",
     category=Image.DecompressionBombWarning,
@@ -372,90 +376,6 @@ def inspect_mcd_file(
         summary,
     )
 
-def _normalize_channel_name(value: object) -> str:
-    if value is None:
-        return ""
-
-    return " ".join(
-        str(value)
-        .strip()
-        .split()
-    )
-
-
-def _make_unique_channel_names(
-    channel_names: list[object],
-    channel_labels: list[object],
-) -> list[str]:
-    """
-    Build readable, unique PINT channel names.
-
-    Target labels are preferred. The metal/tag is used as fallback and
-    appended when duplicate target labels occur.
-    """
-    nChannels = max(
-        len(channel_names),
-        len(channel_labels),
-    )
-
-    metals = [
-        _normalize_channel_name(
-            channel_names[i]
-            if i < len(channel_names)
-            else ""
-        )
-        for i in range(nChannels)
-    ]
-
-    labels = [
-        _normalize_channel_name(
-            channel_labels[i]
-            if i < len(channel_labels)
-            else ""
-        )
-        for i in range(nChannels)
-    ]
-
-    baseNames = []
-
-    for i in range(nChannels):
-        if labels[i]:
-            baseName = labels[i]
-        elif metals[i]:
-            baseName = metals[i]
-        else:
-            baseName = f"Channel{i + 1}"
-
-        baseNames.append(baseName)
-
-    counts = {}
-
-    for name in baseNames:
-        counts[name] = counts.get(name, 0) + 1
-
-    output = []
-    used = set()
-
-    for i, baseName in enumerate(baseNames):
-        if counts[baseName] > 1 and metals[i]:
-            candidate = f"{baseName} [{metals[i]}]"
-        else:
-            candidate = baseName
-
-        uniqueCandidate = candidate
-        suffix = 2
-
-        while uniqueCandidate in used:
-            uniqueCandidate = (
-                f"{candidate}_{suffix}"
-            )
-            suffix += 1
-
-        output.append(uniqueCandidate)
-        used.add(uniqueCandidate)
-
-    return output
-
 def _safe_image_name(
     value: object,
     fallback: str,
@@ -483,6 +403,8 @@ def _safe_image_name(
 def load_mcd_acquisitions(
     path: str | Path,
     selected_acquisitions: pd.DataFrame,
+    *,
+    standardize_channel_names: bool = True,
 ) -> tuple[
     dict[str, Any],
     dict[str, list[str]],
@@ -576,18 +498,55 @@ def load_mcd_acquisitions(
                 acquisitionIndex
             ]
 
-            channelNames = (
-                _make_unique_channel_names(
-                    list(
-                        acquisition.channel_names
-                        or []
-                    ),
-                    list(
-                        acquisition.channel_labels
-                        or []
-                    ),
-                )
+            rawChannelNames = list(
+                acquisition.channel_names
+                or []
             )
+
+            channelLabels = list(
+                acquisition.channel_labels
+                or []
+            )
+
+            if standardize_channel_names:
+                channelNames = _make_unique_channel_names(
+                    rawChannelNames,
+                    channelLabels,
+                )
+
+            else:
+                channelNames = []
+
+                nChannels = max(
+                    len(rawChannelNames),
+                    len(channelLabels),
+                )
+
+                for i in range(nChannels):
+                    metal = (
+                        str(rawChannelNames[i]).strip()
+                        if i < len(rawChannelNames)
+                        and rawChannelNames[i] is not None
+                        else ""
+                    )
+
+                    label = (
+                        str(channelLabels[i]).strip()
+                        if i < len(channelLabels)
+                        and channelLabels[i] is not None
+                        else ""
+                    )
+
+                    if label and metal:
+                        name = f"{label}({metal})"
+                    elif label:
+                        name = label
+                    elif metal:
+                        name = metal
+                    else:
+                        name = f"Channel{i + 1}"
+
+                    channelNames.append(name)
 
             acquisitionId = getattr(
                 acquisition,

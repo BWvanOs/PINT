@@ -8,6 +8,15 @@ def image_loading_panel():
         ui.tags.div(
             ui.tags.div(
                 ui.card(
+                    ui.card_header("Normalize ChannelNames"),
+
+                    ui.input_checkbox(
+                        "standardize_channel_names",
+                        "Standardize MCD channel names",
+                        True,
+                    ),
+                ),
+                ui.card(
                     ui.card_header("OME-TIFF folder"),
 
                     ui.input_text(
@@ -31,7 +40,7 @@ def image_loading_panel():
 
                     ui.input_action_button(
                         "open_mcd_file",
-                        "Open MCD file",
+                        "Open MCD file(s)",
                         class_="btn btn-primary w-100 mb-2",
                     ),
 

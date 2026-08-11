@@ -19,20 +19,10 @@ from scipy import sparse
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
-try:
-    import igraph as ig
-    import leidenalg
-    LEIDEN_AVAILABLE = True
-except Exception:
-    ig = None
-    leidenalg = None
-    LEIDEN_AVAILABLE = False
-try:
-    import pacmap
-    PACMAP_AVAILABLE = True
-except Exception:
-    pacmap = None
-    PACMAP_AVAILABLE = False
+
+import igraph as ig
+import leidenalg
+import pacmap
 
 import os, sys, subprocess
 import shutil
@@ -61,6 +51,11 @@ from pint_app.core.processing import (
     global_winsor_range_for_channel as compute_global_winsor_range_for_channel,
     image_winsor_range as compute_image_winsor_range,
     process_image_pipeline,
+)
+
+from pint_app.core.channel_names import (
+    _normalize_channel_name,
+    _make_unique_channel_names,
 )
 
 from pint_app.core.selection import cycle_list, order_by_canonical
@@ -5083,6 +5078,7 @@ def server(input, output, session):
                             load_mcd_acquisitions(
                                 mcdPath,
                                 fileSelectionDf,
+                                standardize_channel_names=input.standardize_channel_names(),
                             )
                         )
 
@@ -5265,7 +5261,10 @@ def server(input, output, session):
             ##Loads the OME.tiff, also checks if channels are consistent and throws an error if one of the images if different from the first one
             ##Error from load_tiffs_raw is passed on to the interface
             try:
-                imgs, chs = load_tiffs_raw(folder)  # ideally load_tiffs_raw(folder, validate_consistent=True)
+                imgs, chs = load_tiffs_raw(
+                    folder,
+                    standardize_channel_names=input.standardize_channel_names(),
+                )  # ideally load_tiffs_raw(folder, validate_consistent=True)
             except ValueError as e:
                 ui.modal_show(
                     ui.modal(
@@ -5279,13 +5278,8 @@ def server(input, output, session):
                 return
             ##If the folder didn't contain any images:
             if not imgs:
-                print("⚠️ No images found in selected folder.")
-                return
-
-            if not imgs:
                 print(
                     "⚠️ No images found in selected folder.",
-                    flush=True,
                 )
                 return
 
