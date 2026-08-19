@@ -7469,12 +7469,6 @@ def server(input, output, session):
             _drop_subclustering_columns_from_master()
             _clear_all_subclustering_state()
 
-            if not LEIDEN_AVAILABLE:
-                raise ImportError(
-                    "Leiden clustering requires python-igraph and leidenalg. "
-                    "Install with: pip install python-igraph leidenalg"
-                )
-
             pcaDf = clustering_pca_scores.get()
 
             if pcaDf is None or pcaDf.empty:
@@ -7730,11 +7724,6 @@ def server(input, output, session):
     @reactive.event(input.run_clustering_pacmap)
     def _run_clustering_pacmap():
         try:
-            if not PACMAP_AVAILABLE:
-                raise ImportError(
-                    "PaCMAP requires the pacmap package. Install with: pip install pacmap"
-                )
-
             pcaDf = clustering_pca_scores.get()
 
             if pcaDf is None or pcaDf.empty:

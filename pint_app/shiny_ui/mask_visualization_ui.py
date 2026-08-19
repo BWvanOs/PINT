@@ -221,36 +221,36 @@ def mask_visualization_panel():
 
             ui.tags.div(
                 ui.tags.div(
-                    ui.row(
-                        ui.column(
-                            6,
-                            ui.input_select(
-                                "selected_mask_name_display",
-                                "Mask",
-                                choices=[],
-                                selected=None,
-                                width="100%",
-                            ),
+                    ui.tags.div(
+                        ui.input_select(
+                            "selected_mask_name_display",
+                            "Mask",
+                            choices=[],
+                            selected=None,
+                            width="100%",
                         ),
-                        ui.column(
-                            3,
-                            ui.input_action_button(
-                                "mask_prev",
-                                "←",
-                                class_="btn-sm w-100",
-                            ),
-                        ),
-                        ui.column(
-                            3,
-                            ui.input_action_button(
-                                "mask_next",
-                                "→",
-                                class_="btn-sm w-100",
-                            ),
-                        ),
-                        class_="align-items-end gy-0 gx-1 viewer-navigator-row",
+                        class_="navigator-select",
                     ),
-                    class_="viewer-navigator",
+
+                    ui.tags.div(
+                        ui.input_action_button(
+                            "mask_prev",
+                            "←",
+                            class_="btn-sm",
+                        ),
+                        class_="navigator-button",
+                    ),
+
+                    ui.tags.div(
+                        ui.input_action_button(
+                            "mask_next",
+                            "→",
+                            class_="btn-sm",
+                        ),
+                        class_="navigator-button",
+                    ),
+
+                    class_="pint-navigator-half-fixed viewer-navigator",
                 ),
 
                 ui.tags.div(
