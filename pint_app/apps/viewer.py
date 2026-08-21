@@ -5,19 +5,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import pandas as pd
-import base64
-import io
-
-from PIL import Image
 
 from shiny import App, ui, render, reactive
 from shiny.types import SilentException
 
-from scipy.ndimage import grey_opening, uniform_filter, median_filter
 from scipy import sparse
 
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
 
 import igraph as ig
@@ -25,15 +19,28 @@ import leidenalg
 import pacmap
 
 import os, sys, subprocess
-import shutil
 import warnings
 from datetime import datetime
 
 from tifffile import imwrite, imread
 
+
+##Internal import from /core
 from pint_app.core.load_tiffs import load_tiffs_raw
-from pint_app.core.formatting import fmt1
-from pint_app.core.mask_neighbors import build_touching_edges_for_pushed_dataset
+
+from pint_app.core.clustering_helpers import (
+    prepare_clustering_feature_matrix,
+    run_pca,
+    run_leiden,
+    run_pacmap
+)
+
+from pint_app.core.composites import (
+    MAX_COMPOSITE_CHANNELS,
+    COMPOSITE_EMPTY_CHOICE,
+    screen_blend_layer,
+)
+
 from pint_app.core.dialogs import (
     pick_folder_dialog,
     pick_open_csv_dialog,
@@ -41,22 +48,9 @@ from pint_app.core.dialogs import (
     pick_save_png_dialog,
     pick_save_tiff_dialog,
     pick_open_table_dialog,
-    pick_open_mcd_dialog,
     pick_open_mcd_files_dialog
 )
-from pint_app.core.processing import (
-    clamp01,
-    strength_to_percentile,
-    global_minmax_for_channel as compute_global_minmax_for_channel,
-    global_winsor_range_for_channel as compute_global_winsor_range_for_channel,
-    image_winsor_range as compute_image_winsor_range,
-    process_image_pipeline,
-)
-
-from pint_app.core.channel_names import (
-    _normalize_channel_name,
-    _make_unique_channel_names,
-)
+from pint_app.core.formatting import fmt1
 
 from pint_app.core.selection import cycle_list, order_by_canonical
 
@@ -79,10 +73,11 @@ from pint_app.core.load_masks import (
 from pint_app.core.mcd_backend import (
     export_mcd_acquisitions_as_ome_tiff,
     export_mcd_panoramas,
-    inspect_mcd_file,
     inspect_mcd_files,
     load_mcd_acquisitions,
 )
+
+from pint_app.core.mask_neighbors import build_touching_edges_for_pushed_dataset
 
 from pint_app.core.mask_render_cache import (
     MaskRenderCache,
@@ -109,12 +104,6 @@ from pint_app.core.mask_neighbors_stats import (
     aggregate_interaction_matrix,
 )
 
-from pint_app.core.composites import (
-    MAX_COMPOSITE_CHANNELS,
-    COMPOSITE_EMPTY_CHOICE,
-    screen_blend_layer,
-)
-
 from pint_app.core.mesmer_backend import (
     DEFAULT_MESMER_ENV_NAME,
     check_mesmer_backend,
@@ -122,6 +111,22 @@ from pint_app.core.mesmer_backend import (
     install_mesmer_backend,
     check_mesmer_gpu,
     run_mesmer_backend,
+)
+
+from pint_app.core.processing import (
+    clamp01,
+    strength_to_percentile,
+    global_minmax_for_channel as compute_global_minmax_for_channel,
+    global_winsor_range_for_channel as compute_global_winsor_range_for_channel,
+    image_winsor_range as compute_image_winsor_range,
+    process_image_pipeline,
+)
+
+from pint_app.core.thumbnail_helpers import (
+    png_bytes_to_data_uri,
+    make_thumbnail_cache_key,
+    generate_sample_thumbnails,
+    generate_channel_thumbnails,
 )
 
 from pint_app.core.segmentation_quantification import quantify_mesmer_masks_for_dataset
@@ -749,9 +754,6 @@ def server(input, output, session):
 
     WINSOR_MIN_UPPER_BOUND = 5.0
 
-    def _strength_to_percentile(s: float, eps: float = 0.005) -> float:
-        return strength_to_percentile(s, eps=eps)
-
     ##Cache for global min/max per channel (invalidated on load)
     ##Also stored previous values so moving back and forth is cached
     _global_minmax_cache = reactive.Value({})   ##looks like {channel_name: (gmin, gmax)}
@@ -862,574 +864,6 @@ def server(input, output, session):
             winsor_min_upper_bound=WINSOR_MIN_UPPER_BOUND,
         )
     
-    THUMBNAIL_MAX_WIDTH = 250
-    THUMBNAIL_MAX_HEIGHT = 350
-
-
-    def _thumbnail_target_shape(
-        source_height: int,
-        source_width: int,
-        *,
-        max_width: int = THUMBNAIL_MAX_WIDTH,
-        max_height: int = THUMBNAIL_MAX_HEIGHT,
-    ) -> tuple[int, int]:
-        """
-        Calculate thumbnail dimensions while preserving aspect ratio.
-
-        Images are never enlarged beyond their original dimensions.
-        """
-        source_height = int(source_height)
-        source_width = int(source_width)
-
-        if source_height < 1 or source_width < 1:
-            raise ValueError(
-                "Thumbnail source image has invalid dimensions."
-            )
-
-        scale = min(
-            float(max_width) / float(source_width),
-            float(max_height) / float(source_height),
-            1.0,
-        )
-
-        target_width = max(
-            1,
-            int(round(source_width * scale)),
-        )
-
-        target_height = max(
-            1,
-            int(round(source_height * scale)),
-        )
-
-        return target_height, target_width
-
-    def _generate_sample_thumbnails(
-        sampleName: str,
-        renderMode: str,
-        cache: dict,
-        *,
-        progress=None,
-        progressOffset: int = 0,
-        totalWork: int | None = None,
-    ) -> tuple[dict, int, int, list[str], int]:
-        """
-        Generate all channel thumbnails for one sample.
-
-        Returns:
-        - updated cache
-        - number generated
-        - number reused
-        - failure messages
-        - number of channels processed
-        """
-        channelNames = channels.get().get(
-            sampleName,
-            [],
-        )
-
-        nGenerated = 0
-        nReused = 0
-        failures = []
-
-        for channelIndex, channelName in enumerate(
-            channelNames,
-            start=1,
-        ):
-            completedWork = (
-                progressOffset
-                + channelIndex
-                - 1
-            )
-
-            if progress is not None:
-                progress.set(
-                    value=completedWork,
-                    message=(
-                        f"Generating thumbnails for "
-                        f"{sampleName}"
-                    ),
-                    detail=(
-                        f"{channelName} "
-                        f"({completedWork + 1}/{totalWork})"
-                    ),
-                )
-
-            cacheKey = _make_thumbnail_cache_key(
-                sampleName,
-                channelName,
-                renderMode,
-            )
-
-            if cacheKey in cache:
-                nReused += 1
-
-            else:
-                try:
-                    cache[cacheKey] = (
-                        _build_thumbnail_cache_entry(
-                            sampleName,
-                            channelName,
-                            renderMode,
-                        )
-                    )
-
-                    nGenerated += 1
-
-                except Exception as e:
-                    failures.append(
-                        f"{sampleName} / {channelName}: {e}"
-                    )
-
-            if progress is not None:
-                progress.set(
-                    value=progressOffset + channelIndex
-                )
-
-        return (
-            cache,
-            nGenerated,
-            nReused,
-            failures,
-            len(channelNames),
-        )
-
-    def _generate_channel_thumbnails(
-        channelName: str,
-        renderMode: str,
-        cache: dict,
-        *,
-        progress=None,
-    ) -> tuple[dict, int, int, list[str], int]:
-        """
-        Generate one channel across all images that contain that channel.
-
-        Returns:
-        - updated cache
-        - number generated
-        - number reused
-        - failure messages
-        - number of images processed
-        """
-        imageData = images.get()
-        channelData = channels.get()
-
-        sampleNames = [
-            sampleName
-            for sampleName in imageData.keys()
-            if channelName in channelData.get(sampleName, [])
-        ]
-
-        nGenerated = 0
-        nReused = 0
-        failures = []
-
-        totalWork = len(sampleNames)
-
-        for sampleIndex, sampleName in enumerate(
-            sampleNames,
-            start=1,
-        ):
-            if progress is not None:
-                progress.set(
-                    value=sampleIndex - 1,
-                    message=(
-                        f"Generating {channelName} thumbnails"
-                    ),
-                    detail=(
-                        f"{sampleName} "
-                        f"({sampleIndex}/{totalWork})"
-                    ),
-                )
-
-            cacheKey = _make_thumbnail_cache_key(
-                sampleName,
-                channelName,
-                renderMode,
-            )
-
-            if cacheKey in cache:
-                nReused += 1
-
-            else:
-                try:
-                    cache[cacheKey] = (
-                        _build_thumbnail_cache_entry(
-                            sampleName,
-                            channelName,
-                            renderMode,
-                        )
-                    )
-
-                    nGenerated += 1
-
-                except Exception as e:
-                    failures.append(
-                        f"{sampleName} / {channelName}: {e}"
-                    )
-
-            if progress is not None:
-                progress.set(
-                    value=sampleIndex
-                )
-
-        return (
-            cache,
-            nGenerated,
-            nReused,
-            failures,
-            totalWork,
-        )
-
-    def _processed_image_to_uint8(
-        image: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Convert a processed two-dimensional image to display-ready uint8.
-
-        PINT-normalized arrays are already in [0, 1]. If normalization was
-        disabled, this reproduces Matplotlib's automatic min/max display scaling.
-        """
-        image = np.asarray(
-            image,
-            dtype=np.float32,
-        )
-
-        ##Catch if input is incorrect
-        if image.ndim != 2:
-            raise ValueError(
-                "Thumbnail input must be a two-dimensional channel image."
-            )
-
-        finiteMask = np.isfinite(image)
-
-        if not finiteMask.any():
-            return np.zeros(
-                image.shape,
-                dtype=np.uint8,
-            )
-
-        finiteValues = image[finiteMask]
-
-        imageMin = float(np.min(finiteValues))
-        imageMax = float(np.max(finiteValues))
-
-        if imageMax <= imageMin:
-            return np.zeros(
-                image.shape,
-                dtype=np.uint8,
-            )
-
-        # Normalized PINT images can be converted directly. Non-normalized
-        # images are scaled as Matplotlib would scale them for display.
-        if imageMin >= 0.0 and imageMax <= 1.0:
-            scaled = image
-        else:
-            scaled = (
-                image - imageMin
-            ) / (
-                imageMax - imageMin
-            )
-
-        scaled = np.nan_to_num(
-            scaled,
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
-
-        scaled = np.clip(
-            scaled,
-            0.0,
-            1.0,
-        )
-
-        return np.round(
-            scaled * 255.0
-        ).astype(np.uint8)
-
-    def _max_pool_uint8_to_shape(
-        image: np.ndarray,
-        target_height: int,
-        target_width: int,
-    ) -> np.ndarray:
-        """
-        Downscale a uint8 image using variable-size maximum-pooling regions.
-
-        Every source pixel belongs to one output region. Small bright structures
-        are therefore retained rather than averaged away.
-        """
-        image = np.asarray(
-            image,
-            dtype=np.uint8,
-        )
-
-        source_height, source_width = image.shape
-
-        target_height = min(
-            int(target_height),
-            source_height,
-        )
-
-        target_width = min(
-            int(target_width),
-            source_width,
-        )
-
-        if (
-            target_height == source_height
-            and target_width == source_width
-        ):
-            return image.copy()
-
-        rowStarts = np.floor(
-            np.arange(target_height)
-            * source_height
-            / target_height
-        ).astype(np.int64)
-
-        colStarts = np.floor(
-            np.arange(target_width)
-            * source_width
-            / target_width
-        ).astype(np.int64)
-
-        # np.maximum.reduceat reduces each interval from one start index
-        # up to the next. The final interval continues to the image boundary.
-        # This handles images without integer scaling (eg 1100x700 into 250x~)
-        pooledRows = np.maximum.reduceat(
-            image,
-            rowStarts,
-            axis=0,
-        )
-
-        pooled = np.maximum.reduceat(
-            pooledRows,
-            colStarts,
-            axis=1,
-        )
-
-        return pooled[
-            :target_height,
-            :target_width,
-        ].astype(
-            np.uint8,
-            copy=False,
-        )
-
-    ##Downscale to unint8 to prevent the cache from exploding in size
-    def _area_downscale_uint8(
-        image: np.ndarray,
-        target_height: int,
-        target_width: int,
-    ) -> np.ndarray:
-        """
-        Downscale uint8 image using area averaging.
-
-        This produces a smooth, anti-aliased overview but can dilute isolated
-        bright structures.
-        """
-        image = np.asarray(
-            image,
-            dtype=np.uint8,
-        )
-
-        source_height, source_width = image.shape
-
-        target_height = min(
-            int(target_height),
-            source_height,
-        )
-
-        target_width = min(
-            int(target_width),
-            source_width,
-        )
-
-        if (
-            target_height == source_height
-            and target_width == source_width
-        ):
-            return image.copy()
-
-        pilImage = Image.fromarray(
-            image,
-            mode="L",
-        )
-
-        resized = pilImage.resize(
-            (
-                target_width,
-                target_height,
-            ),
-            resample=Image.Resampling.BOX,
-        )
-
-        return np.asarray(
-            resized,
-            dtype=np.uint8,
-        )
-
-    def _uint8_thumbnail_to_png_bytes(
-        image: np.ndarray,
-    ) -> bytes:
-        """
-        Encode a grayscale uint8 thumbnail as compressed PNG bytes.
-        """
-        buffer = io.BytesIO()
-
-        Image.fromarray(
-            np.asarray(image, dtype=np.uint8),
-            mode="L",
-        ).save(
-            buffer,
-            format="PNG",
-            optimize=True,
-        )
-
-        return buffer.getvalue()
-
-    def _png_bytes_to_data_uri(
-        pngBytes: bytes,
-    ) -> str:
-        encoded = base64.b64encode(
-            pngBytes
-        ).decode("ascii")
-
-        return (
-            "data:image/png;base64,"
-            + encoded
-        )
-    
-    THUMBNAIL_PARAM_COLUMNS = (
-        "DoWinsor",
-        "Low",
-        "High",
-        "DoThr",
-        "ThrVal",
-        "DoAbsThr",
-        "AbsThrVal",
-        "Noise",
-        "NStr",
-        "WinSz",
-        "DoNorm",
-        "NormScope",
-        "DoAsinh",
-        "Cofac",
-    )
-
-
-    def _thumbnail_parameter_signature(
-        channelName: str,
-    ) -> tuple:
-        """
-        Return a stable signature for the channel's current processing settings.
-        """
-        row = _get_channel_param_row(
-            channelName
-        )
-
-        if row is None:
-            return ("missing-parameters",)
-
-        return tuple(
-            str(row.get(columnName, ""))
-            for columnName in THUMBNAIL_PARAM_COLUMNS
-        )
-    
-    ##If you change a channel it will only invalidate part of the cache. 
-    def _build_thumbnail_cache_entry(
-        sampleName: str,
-        channelName: str,
-        renderMode: str,
-    ) -> dict:
-        """
-        Process, downscale, and encode one channel thumbnail.
-        """
-        processed = _process_channel_from_table(
-            sampleName,
-            channelName,
-        )
-
-        if processed is None:
-            raise ValueError(
-                f"Could not process channel '{channelName}'."
-            )
-
-        sourceHeight, sourceWidth = processed.shape
-
-        targetHeight, targetWidth = (
-            _thumbnail_target_shape(
-                sourceHeight,
-                sourceWidth,
-            )
-        )
-
-        displayUint8 = (
-            _processed_image_to_uint8(
-                processed
-            )
-        )
-
-        # The full-resolution float array is no longer needed after this point.
-        del processed
-
-        if renderMode == "signal":
-            thumbnailUint8 = (
-                _max_pool_uint8_to_shape(
-                    displayUint8,
-                    targetHeight,
-                    targetWidth,
-                )
-            )
-
-        elif renderMode == "smooth":
-            thumbnailUint8 = (
-                _area_downscale_uint8(
-                    displayUint8,
-                    targetHeight,
-                    targetWidth,
-                )
-            )
-
-        else:
-            raise ValueError(
-                f"Unknown thumbnail rendering mode: {renderMode}"
-            )
-
-        del displayUint8
-
-        pngBytes = (
-            _uint8_thumbnail_to_png_bytes(
-                thumbnailUint8
-            )
-        )
-
-        return {
-            "png_bytes": pngBytes,
-            "width": int(targetWidth),
-            "height": int(targetHeight),
-            "source_width": int(sourceWidth),
-            "source_height": int(sourceHeight),
-        }
-    
-    def _make_thumbnail_cache_key(
-        sampleName: str,
-        channelName: str,
-        renderMode: str,
-    ) -> tuple:
-        return (
-            str(sampleName),
-            str(channelName),
-            str(renderMode),
-            THUMBNAIL_MAX_WIDTH,
-            THUMBNAIL_MAX_HEIGHT,
-            _thumbnail_parameter_signature(
-                channelName
-            ),
-        )
-
-
     def _build_composite_rgb(sampleName: str | None = None):
         if sampleName is None:
             sampleName = input.sample()
@@ -2224,130 +1658,6 @@ def server(input, output, session):
         )
 
         return selectedMap.reset_index(drop=True)
-
-    def _prepare_clustering_feature_matrix(
-        active_cell_ids=None,
-        feature_map: pd.DataFrame | None = None,
-        transform: str | None = None,
-        cofactor: float | None = None,
-        scale_data: bool | None = None,
-    ) -> tuple[np.ndarray, pd.DataFrame, list[str], list[str]]:
-        """
-        Build the numeric feature matrix for PCA/clustering.
-
-        Returns:
-        - X: numeric matrix, cells × selected features
-        - obs: dataframe with PINT_Cell_ID
-        - sourceCols: original dataframe column names
-        - displayCols: display names used in plots
-        """
-        df = clustering_data.get()
-
-        if df is None or df.empty:
-            raise ValueError("No clustering dataset loaded.")
-
-        idIsValid, idValidationMessage = (
-            _validate_pint_cell_id_column(df)
-        )
-
-        if not idIsValid:
-            raise ValueError(
-                "PINT_Cell_ID validation failed: "
-                + idValidationMessage
-            )
-
-        if feature_map is None:
-            featureMap = _get_pca_feature_map()
-        else:
-            featureMap = feature_map.copy()
-
-        if featureMap is None or featureMap.empty:
-            raise ValueError("No valid feature columns selected for PCA/clustering.")
-
-        sourceCols = featureMap["ChannelNamesForClustering"].tolist()
-        displayCols = featureMap["ChannelNameToDisplay"].tolist()
-
-        missingCols = [c for c in sourceCols if c not in df.columns]
-        if missingCols:
-            raise ValueError(
-                "Selected feature columns are missing from clustering_data: "
-                + ", ".join(missingCols)
-            )
-
-        # Optional subclustering.
-        # Main clustering calls this with active_cell_ids=None.
-        # Subclustering calls this with active_cell_ids=subclustering_active_cell_ids.get().
-        if active_cell_ids is None:
-            active_cell_ids = clustering_active_cell_ids.get()
-
-        if active_cell_ids is not None:
-            active_cell_ids = set(map(str, active_cell_ids))
-            useDf = df.loc[
-                df[PINT_CELL_ID_COL].astype(str).isin(active_cell_ids)
-            ].copy()
-        else:
-            useDf = df.copy()
-
-        if useDf.empty:
-            raise ValueError("No cells available for the current clustering run.")
-
-        obs = useDf[[PINT_CELL_ID_COL]].copy()
-
-        Xdf = useDf.loc[:, sourceCols].copy()
-        Xdf = Xdf.apply(pd.to_numeric, errors="coerce")
-        Xdf = Xdf.replace([np.inf, -np.inf], np.nan)
-
-        # Drop features that are entirely missing.
-        allMissing = Xdf.columns[Xdf.isna().all()].tolist()
-        if allMissing:
-            keepMask = ~Xdf.columns.isin(allMissing)
-            Xdf = Xdf.loc[:, keepMask].copy()
-
-            featureMap = featureMap.loc[keepMask].copy()
-            sourceCols = featureMap["ChannelNamesForClustering"].tolist()
-            displayCols = featureMap["ChannelNameToDisplay"].tolist()
-
-        if Xdf.shape[1] == 0:
-            raise ValueError("No numeric feature columns remain after filtering.")
-
-        # Fill missing values by marker median.
-        medians = Xdf.median(axis=0, numeric_only=True)
-        Xdf = Xdf.fillna(medians).fillna(0)
-
-        if transform is None:
-            transform = input.clustering_transform() or "asinh"
-
-        if cofactor is None:
-            cofactor = float(input.clustering_asinh_cofactor() or 5)
-        else:
-            cofactor = float(cofactor)
-
-        X = Xdf.to_numpy(dtype=np.float32, copy=True)
-
-        if transform == "asinh":
-            if cofactor <= 0:
-                raise ValueError("asinh cofactor must be > 0.")
-            X = np.arcsinh(X / cofactor).astype(np.float32, copy=False)
-
-        elif transform == "log1p":
-            X = np.clip(X, a_min=0, a_max=None)
-            X = np.log1p(X).astype(np.float32, copy=False)
-
-        elif transform == "none":
-            pass
-
-        else:
-            raise ValueError(f"Unknown transform: {transform}")
-
-        if scale_data is None:
-            scale_data = bool(input.clustering_scale_data())
-
-        if bool(scale_data):
-            scaler = StandardScaler(copy=True)
-            X = scaler.fit_transform(X).astype(np.float32, copy=False)
-
-        return X, obs, sourceCols, displayCols
-
 
     def _make_pca_loadings_grid_figure(
         loadingsDf: pd.DataFrame,
@@ -5684,27 +4994,26 @@ def server(input, output, session):
                 )
                 return
 
-            with ui.Progress(
-                min=0,
-                max=len(channelNames),
-                session=session,
-            ) as progress:
+            print(
+                f"▶️ Generating thumbnails for '{sampleName}' "
+                f"({len(channelNames):,} channels)...",
+                flush=True,
+            )
 
-                (
-                    currentCache,
-                    nGenerated,
-                    nReused,
-                    failures,
-                    _,
-                ) = _generate_sample_thumbnails(
+            (
+                currentCache,
+                nGenerated,
+                nReused,
+                failures,
+                _,
+            ) = generate_sample_thumbnails(
                     sampleName,
+                    channelNames,
                     renderMode,
                     currentCache,
-                    progress=progress,
-                    progressOffset=0,
-                    totalWork=len(channelNames),
+                    get_parameter_row=_get_channel_param_row,
+                    process_channel=_process_channel_from_table,
                 )
-
             overviewLabel = (
                 f"{len(channelNames):,} channels from "
                 f"{sampleName}"
@@ -5754,24 +5063,26 @@ def server(input, output, session):
                 )
                 return
 
-            with ui.Progress(
-                min=0,
-                max=len(sampleNames),
-                session=session,
-            ) as progress:
+            print(
+                f"▶️ Generating '{channelName}' thumbnails across "
+                f"{len(sampleNames):,} images...",
+                flush=True,
+            )
 
-                (
-                    currentCache,
-                    nGenerated,
-                    nReused,
-                    failures,
-                    _,
-                ) = _generate_channel_thumbnails(
-                    channelName,
-                    renderMode,
-                    currentCache,
-                    progress=progress,
-                )
+            (
+                currentCache,
+                nGenerated,
+                nReused,
+                failures,
+                _,
+            ) = generate_channel_thumbnails(
+                channelName,
+                sampleNames,
+                renderMode,
+                currentCache,
+                get_parameter_row=_get_channel_param_row,
+                process_channel=_process_channel_from_table,
+            )
 
             overviewLabel = (
                 f"{channelName} across "
@@ -5872,6 +5183,14 @@ def server(input, output, session):
             for sampleName in sampleNames
         )
 
+        uniqueChannels = len(
+            {
+                channelName
+                for sampleName in sampleNames
+                for channelName in channelData.get(sampleName, [])
+            }
+        )
+
         if totalChannels == 0:
             msg = (
                 "The loaded images do not contain any "
@@ -5899,48 +5218,37 @@ def server(input, output, session):
         totalGenerated = 0
         totalReused = 0
         allFailures = []
-        progressOffset = 0
+ 
+        print(
+            f"▶️ Generating thumbnails for all loaded images: "
+            f"{len(sampleNames):,} images, "
+            f"{totalChannels:,} channels...",
+            flush=True,
+        )
 
-        with ui.Progress(
-            min=0,
-            max=totalChannels,
-            session=session,
-        ) as progress:
+        for sampleName in sampleNames:
+            channelNames = channelData.get(
+                sampleName,
+                [],
+            )
+            (
+                currentCache,
+                nGenerated,
+                nReused,
+                failures,
+                _,
+            ) = generate_sample_thumbnails(
+                sampleName,
+                channelNames,
+                renderMode,
+                currentCache,
+                get_parameter_row=_get_channel_param_row,
+                process_channel=_process_channel_from_table,
+            )
 
-            for sampleIndex, sampleName in enumerate(
-                sampleNames,
-                start=1,
-            ):
-                progress.set(
-                    value=progressOffset,
-                    message=(
-                        "Generating thumbnails for all images"
-                    ),
-                    detail=(
-                        f"{sampleName} "
-                        f"({sampleIndex}/{len(sampleNames)})"
-                    ),
-                )
-
-                (
-                    currentCache,
-                    nGenerated,
-                    nReused,
-                    failures,
-                    nProcessed,
-                ) = _generate_sample_thumbnails(
-                    sampleName,
-                    renderMode,
-                    currentCache,
-                    progress=progress,
-                    progressOffset=progressOffset,
-                    totalWork=totalChannels,
-                )
-
-                totalGenerated += nGenerated
-                totalReused += nReused
-                allFailures.extend(failures)
-                progressOffset += nProcessed
+            totalGenerated += nGenerated
+            totalReused += nReused
+            allFailures.extend(failures)
 
         # Update the reactive cache only once, after the full batch.
         thumbnail_cache.set(
@@ -5956,7 +5264,8 @@ def server(input, output, session):
         msg = (
             f"All-image thumbnail generation complete: "
             f"{len(sampleNames):,} images, "
-            f"{totalChannels:,} channels; "
+            f"{uniqueChannels:,} unique channels, "
+            f"{totalChannels:,} thumbnails; "
             f"{totalGenerated:,} generated and "
             f"{totalReused:,} loaded from cache using "
             f"{modeLabel} rendering."
@@ -6034,10 +5343,15 @@ def server(input, output, session):
             missingChannels = []
 
             for channelName in channelNames:
-                cacheKey = _make_thumbnail_cache_key(
+                parameterRow = _get_channel_param_row(
+                    channelName
+                )
+
+                cacheKey = make_thumbnail_cache_key(
                     sampleName,
                     channelName,
                     renderMode,
+                    parameterRow,
                 )
 
                 entry = cache.get(cacheKey)
@@ -6048,7 +5362,7 @@ def server(input, output, session):
                     )
                     continue
 
-                dataUri = _png_bytes_to_data_uri(
+                dataUri = png_bytes_to_data_uri(
                     entry["png_bytes"]
                 )
 
@@ -6165,10 +5479,15 @@ def server(input, output, session):
                     )
                     continue
 
-                cacheKey = _make_thumbnail_cache_key(
+                parameterRow = _get_channel_param_row(
+                    channelName
+                )
+
+                cacheKey = make_thumbnail_cache_key(
                     sampleName,
                     channelName,
                     renderMode,
+                    parameterRow,
                 )
 
                 entry = cache.get(cacheKey)
@@ -6179,7 +5498,7 @@ def server(input, output, session):
                     )
                     continue
 
-                dataUri = _png_bytes_to_data_uri(
+                dataUri = png_bytes_to_data_uri(
                     entry["png_bytes"]
                 )
 
@@ -7240,76 +6559,79 @@ def server(input, output, session):
 
         try:
             # Validate and construct first. This may raise ClusteringInputError. I moved the clearance only if it passes
-            X, obs, sourceCols, displayCols = _prepare_clustering_feature_matrix()
+            featureMap = _get_pca_feature_map()
+
+            X, obs, sourceCols, displayCols = (
+                prepare_clustering_feature_matrix(
+                    clustering_data.get(),
+                    featureMap,
+                    cell_id_col=PINT_CELL_ID_COL,
+                    active_cell_ids=(clustering_active_cell_ids.get()),
+                    transform=(input.clustering_transform() or "asinh"),
+                    cofactor=float(input.clustering_asinh_cofactor() or 5),
+                    scale_data=bool(input.clustering_scale_data()),
+                )
+            )
+
             #Only clear existing results after the new PCA input is valid.
             _drop_subclustering_columns_from_master()
             _clear_all_subclustering_state()
 
-            nCells, nFeatures = X.shape
-            requestedPcs = int(input.clustering_n_pcs() or 20)
-            nPcs = max(2, min(requestedPcs, nFeatures, nCells - 1))
+            requestedPcs = int(
+                input.clustering_n_pcs()
+                or 20
+            )
 
-            if nPcs < 2:
-                raise ValueError("Need at least 2 PCs. Check number of cells/features.")
+            randomSeed = int(
+                input.clustering_random_seed()
+                or 1
+            )
+
+            nCells, nFeatures = X.shape
 
             clustering_analysis_status.set(
-                f"Running PCA on {nCells:,} cells × {nFeatures:,} features..."
+                f"Running PCA on "
+                f"{nCells:,} cells × "
+                f"{nFeatures:,} features..."
             )
 
             print(
-                f"▶️ Running PCA: {nCells:,} cells × {nFeatures:,} features, "
-                f"{nPcs} PCs.",
+                f"▶️ Running PCA: "
+                f"{nCells:,} cells × "
+                f"{nFeatures:,} features, "
+                f"requested {requestedPcs} PCs.",
                 flush=True,
             )
 
-            pca = PCA(n_components=nPcs, random_state=int(input.clustering_random_seed() or 1))
-            scores = pca.fit_transform(X)
-
-            scoreCols = [f"PC_{i}" for i in range(1, nPcs + 1)]
-
-            scoresDf = obs.copy()
-            for i, col in enumerate(scoreCols):
-                scoresDf[col] = scores[:, i].astype(np.float32)
-
-            loadingsDf = pd.DataFrame(
-                pca.components_.T,
-                columns=scoreCols,
-            )
-            loadingsDf.insert(0, "Feature", displayCols)
-            loadingsDf.insert(0, "SourceColumn", sourceCols)
-
-            varianceDf = pd.DataFrame(
-                {
-                    "PC": scoreCols,
-                    "ExplainedVarianceRatio": pca.explained_variance_ratio_,
-                    "ExplainedVariancePercent": pca.explained_variance_ratio_ * 100,
-                    "CumulativeVariancePercent": np.cumsum(pca.explained_variance_ratio_) * 100,
-                }
+            result = run_pca(
+                X,
+                obs,
+                sourceCols,
+                displayCols,
+                n_pcs=requestedPcs,
+                random_seed=randomSeed,
             )
 
-            clustering_feature_matrix.set(X)
-            clustering_feature_source_columns.set(sourceCols)
-            clustering_feature_display_columns.set(displayCols)
+            clustering_feature_matrix.set(result["feature_matrix"])
+            clustering_feature_source_columns.set(result["source_columns"])
+            clustering_feature_display_columns.set(result["display_columns"])
 
-            clustering_pca_scores.set(scoresDf)
-            clustering_pca_loadings.set(loadingsDf)
-            clustering_pca_variance.set(varianceDf)
+            clustering_pca_scores.set(result["scores"])
+            clustering_pca_loadings.set(result["loadings"])
+            clustering_pca_variance.set(result["variance"])
 
             clustering_leiden_labels.set(pd.DataFrame())
             clustering_marker_summary.set(pd.DataFrame())
             clustering_pacmap_embedding.set(pd.DataFrame())
 
-            clustering_cluster_name_map.set(
-                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
-            )
-
-            clustering_annotation_status.set(
-                "Main PCA was rerun. Leiden clusters, annotations, PaCMAP, heatmaps, and subclusters were cleared."
-            )
+            clustering_cluster_name_map.set(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
+            clustering_annotation_status.set("Main PCA was rerun. Leiden clusters, annotations, PaCMAP, heatmaps, and subclusters were cleared.")
 
             msg = (
-                f"PCA complete: {nCells:,} cells × {nFeatures:,} features, "
-                f"{nPcs:,} PCs."
+                f"PCA complete: "
+                f"{result['n_cells']:,} cells × "
+                f"{result['n_features']:,} features, "
+                f"{result['n_pcs']:,} PCs."
             )
 
             clustering_analysis_status.set(msg)
@@ -7336,7 +6658,10 @@ def server(input, output, session):
             traceback.print_exc()
 
             msg = f"PCA failed: {e}"
-            clustering_analysis_status.set(msg)
+
+            clustering_analysis_status.set(
+                msg
+            )
 
             ui.notification_show(
                 msg,
@@ -7344,15 +6669,10 @@ def server(input, output, session):
                 duration=10,
             )
 
-            print(f"❌ {msg}", flush=True)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-
-            msg = f"PCA failed: {e}"
-            clustering_analysis_status.set(msg)
-            print(f"❌ {msg}", flush=True)
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
 
     @output
     @render.ui
@@ -7477,106 +6797,39 @@ def server(input, output, session):
             nDims = int(input.clustering_leiden_n_dims() or 10)
             nNeighbors = int(input.clustering_leiden_n_neighbors() or 15)
             resolution = float(input.clustering_leiden_resolution() or 1.0)
-            seed = int(input.clustering_random_seed() or 1)
-
-            pcCols = [c for c in pcaDf.columns if c.startswith("PC_")]
-
-            if len(pcCols) < 2:
-                raise ValueError("PCA scores do not contain enough PC columns.")
-
-            usePcCols = pcCols[: min(nDims, len(pcCols))]
-            Xpca = pcaDf.loc[:, usePcCols].to_numpy(dtype=np.float32, copy=True)
-
-            nCells = Xpca.shape[0]
-
-            if nCells < 3:
-                raise ValueError("Need at least 3 cells for graph clustering.")
-
-            nNeighbors = max(2, min(nNeighbors, nCells - 1))
-
-            clustering_analysis_status.set(
-                f"Building kNN graph using {len(usePcCols)} PCs and {nNeighbors} neighbors..."
-            )
-
+            seed = int(input.clustering_random_seed() or 42)
+         
             print(
-                f"▶️ Leiden clustering: {nCells:,} cells, "
-                f"{len(usePcCols)} PCs, k={nNeighbors}, resolution={resolution}",
+                f"▶️ Leiden clustering: "
+                f"{len(pcaDf):,} cells, "
+                f"{nDims} requested PCs, "
+                f"k={nNeighbors}, "
+                f"resolution={resolution}",
                 flush=True,
             )
 
-            nn = NearestNeighbors(
-                n_neighbors=nNeighbors + 1,
-                metric="euclidean",
-                algorithm="auto",
-            )
-            nn.fit(Xpca)
-
-            distances, indices = nn.kneighbors(Xpca)
-
-            edges = []
-            weights = []
-
-            for i in range(nCells):
-                for j, dist in zip(indices[i, 1:], distances[i, 1:]):
-                    if i == j:
-                        continue
-
-                    a = int(i)
-                    b = int(j)
-
-                    if a < b:
-                        edges.append((a, b))
-                    else:
-                        edges.append((b, a))
-
-                    weights.append(float(1.0 / (1.0 + dist)))
-
-            if not edges:
-                raise ValueError("No graph edges were created.")
-
-            edgeDf = pd.DataFrame(edges, columns=["source", "target"])
-            edgeDf["weight"] = weights
-
-            edgeDf = (
-                edgeDf
-                .groupby(["source", "target"], as_index=False)["weight"]
-                .max()
-            )
-
-            graph = ig.Graph(
-                n=nCells,
-                edges=list(map(tuple, edgeDf[["source", "target"]].to_numpy())),
-            )
-            graph.es["weight"] = edgeDf["weight"].tolist()
-
-            partition = leidenalg.find_partition(
-                graph,
-                leidenalg.RBConfigurationVertexPartition,
-                weights=graph.es["weight"],
-                resolution_parameter=resolution,
+            result = run_leiden(
+                pcaDf,
+                cell_id_col=PINT_CELL_ID_COL,
+                n_dims=nDims,
+                n_neighbors=nNeighbors,
+                resolution=resolution,
                 seed=seed,
             )
 
-            labels = np.array(partition.membership, dtype=int)
-
-            labelsDf = pcaDf[[PINT_CELL_ID_COL]].copy()
-            labelsDf["PINT_Leiden_cluster"] = [
-                f"Cluster_{x}" for x in labels
-            ]
-
+            labelsDf = result["labels"]
             clustering_leiden_labels.set(labelsDf)
-
             master = clustering_data.get().copy()
 
-            # Drop downstream main clustering/annotation columns before writing new labels.
             dropCols = [
-                c for c in [
+                columnName
+                for columnName in [
                     "PINT_Leiden_cluster",
                     "PINT_ClusterName",
                     "PaCMAP_1",
                     "PaCMAP_2",
                 ]
-                if c in master.columns
+                if columnName in master.columns
             ]
 
             if dropCols:
@@ -7590,28 +6843,39 @@ def server(input, output, session):
 
             clustering_data.set(master)
 
-            # Clear main annotation state that depended on old Leiden labels.
             clustering_cluster_name_map.set(
-                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+                pd.DataFrame(
+                    columns=[
+                        "OldClusterName",
+                        "NewClusterName",
+                    ]
+                )
             )
 
             clustering_pacmap_embedding.set(pd.DataFrame())
             clustering_marker_summary.set(pd.DataFrame())
 
-            nClusters = labelsDf["PINT_Leiden_cluster"].nunique()
-
             msg = (
-                f"Leiden clustering complete: {nCells:,} cells, "
-                f"{nClusters:,} clusters. Previous annotations, PaCMAP, heatmaps, and subclusters were cleared."
+                f"Leiden clustering complete: "
+                f"{result['n_cells']:,} cells, "
+                f"{result['n_clusters']:,} clusters. "
+                f"Previous annotations, PaCMAP, heatmaps, "
+                f"and subclusters were cleared."
             )
 
             clustering_analysis_status.set(msg)
+
             clustering_annotation_status.set(
-                "Main Leiden clustering was rerun. Cluster annotations, PaCMAP, heatmaps, and subclusters were cleared."
+                "Main Leiden clustering was rerun. "
+                "Cluster annotations, PaCMAP, heatmaps, "
+                "and subclusters were cleared."
             )
 
-            print(f"✅ {msg}", flush=True)
-
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+            
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -7729,79 +6993,88 @@ def server(input, output, session):
             if pcaDf is None or pcaDf.empty:
                 raise ValueError("Run PCA before PaCMAP.")
 
-            pcCols = [c for c in pcaDf.columns if c.startswith("PC_")]
-
-            if len(pcCols) < 2:
-                raise ValueError("PCA scores do not contain enough PC columns.")
-
             nDims = int(input.clustering_pacmap_n_dims() or 10)
-            usePcCols = pcCols[: min(nDims, len(pcCols))]
-
-            Xpca = pcaDf.loc[:, usePcCols].to_numpy(dtype=np.float32, copy=True)
-
-            nNeighbors = int(input.clustering_pacmap_n_neighbors() or 10)
+            nNeighbors = int(input.clustering_pacmap_n_neighbors() or 15)
             mnRatio = float(input.clustering_pacmap_mn_ratio() or 0.5)
             fpRatio = float(input.clustering_pacmap_fp_ratio() or 2.0)
-            seed = int(input.clustering_random_seed() or 1)
-
-            nCells = Xpca.shape[0]
-
-            if nCells < 3:
-                raise ValueError("Need at least 3 cells for PaCMAP.")
+            seed = int(input.clustering_random_seed() or 42)
 
             clustering_annotation_status.set(
-                f"Running PaCMAP on {nCells:,} cells using {len(usePcCols)} PCs..."
+                f"Running PaCMAP on "
+                f"{len(pcaDf):,} cells using "
+                f"{nDims} requested PCs..."
             )
 
             print(
-                f"▶️ Running PaCMAP: {nCells:,} cells, "
-                f"{len(usePcCols)} PCs, n_neighbors={nNeighbors}, "
-                f"MN_ratio={mnRatio}, FP_ratio={fpRatio}",
+                f"▶️ Running PaCMAP: "
+                f"{len(pcaDf):,} cells, "
+                f"{nDims} requested PCs, "
+                f"n_neighbors={nNeighbors}, "
+                f"MN_ratio={mnRatio}, "
+                f"FP_ratio={fpRatio}",
                 flush=True,
             )
 
-            reducer = pacmap.PaCMAP(
-                n_components=2,
+            result = run_pacmap(
+                pcaDf,
+                cell_id_col=PINT_CELL_ID_COL,
+                n_dims=nDims,
                 n_neighbors=nNeighbors,
-                MN_ratio=mnRatio,
-                FP_ratio=fpRatio,
-                random_state=seed,
+                mn_ratio=mnRatio,
+                fp_ratio=fpRatio,
+                seed=seed,
             )
 
-            embedding = reducer.fit_transform(Xpca, init="pca")
-
-            embDf = pcaDf[[PINT_CELL_ID_COL]].copy()
-            embDf["PaCMAP_1"] = embedding[:, 0].astype(np.float32)
-            embDf["PaCMAP_2"] = embedding[:, 1].astype(np.float32)
-
+            embDf = result["embedding"]
             clustering_pacmap_embedding.set(embDf)
-
-            # Add PaCMAP columns back to master clustering_data.
             master = clustering_data.get().copy()
 
-            dropCols = [c for c in ["PaCMAP_1", "PaCMAP_2"] if c in master.columns]
+            dropCols = [
+                columnName
+                for columnName in [
+                    "PaCMAP_1",
+                    "PaCMAP_2",
+                ]
+                if columnName in master.columns
+            ]
+
             if dropCols:
                 master = master.drop(columns=dropCols)
 
-            master = master.merge(
-                embDf,
+            master = master.merge(embDf,
                 on=PINT_CELL_ID_COL,
                 how="left",
             )
 
             clustering_data.set(master)
 
-            msg = f"PaCMAP complete: {nCells:,} cells using {len(usePcCols)} PCs."
+            msg = (
+                f"PaCMAP complete: "
+                f"{result['n_cells']:,} cells using "
+                f"{result['n_dims']:,} PCs."
+            )
+
             clustering_annotation_status.set(msg)
-            print(f"✅ {msg}", flush=True)
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
 
         except Exception as e:
             import traceback
             traceback.print_exc()
 
             msg = f"PaCMAP failed: {e}"
-            clustering_annotation_status.set(msg)
-            print(f"❌ {msg}", flush=True)
+
+            clustering_annotation_status.set(
+                msg
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
 
     @reactive.Effect
     @reactive.event(input.export_cluster_heatmap)
@@ -8723,83 +7996,82 @@ def server(input, output, session):
             if featureMap is None or featureMap.empty:
                 raise ValueError("No valid features selected for subclustering PCA.")
 
-            X, obs, sourceCols, displayCols = _prepare_clustering_feature_matrix(
-                active_cell_ids=activeIds,
-                feature_map=featureMap,
+            X, obs, sourceCols, displayCols = (
+                prepare_clustering_feature_matrix(
+                    df,
+                    featureMap,
+                    cell_id_col=PINT_CELL_ID_COL,
+                    active_cell_ids=activeIds,
+
+                    # Preserve the existing behavior:
+                    # subclustering currently uses the main
+                    # clustering preprocessing controls.
+                    transform=(input.clustering_transform() or "asinh"),
+                    cofactor=float(input.clustering_asinh_cofactor() or 5),
+                    scale_data=bool(input.clustering_scale_data()),
+                )
             )
 
-            nCells, nFeatures = X.shape
             requestedPcs = int(input.subclustering_n_pcs() or 20)
-            nPcs = max(2, min(requestedPcs, nFeatures, nCells - 1))
+            seed = int(input.subclustering_random_seed() or 42)
 
-            if nPcs < 2:
-                raise ValueError("Need at least 2 PCs. Check number of cells/features.")
-
-            seed = int(input.subclustering_random_seed() or 1)
+            nCells, nFeatures = X.shape
 
             subclustering_status.set(
-                f"Running sub-PCA on {nCells:,} cells × {nFeatures:,} features..."
+                f"Running sub-PCA on "
+                f"{nCells:,} cells × "
+                f"{nFeatures:,} features..."
             )
 
             print(
-                f"▶️ Running sub-PCA: {nCells:,} cells × {nFeatures:,} features, "
-                f"{nPcs} PCs.",
+                f"▶️ Running sub-PCA: "
+                f"{nCells:,} cells × "
+                f"{nFeatures:,} features, "
+                f"requested {requestedPcs} PCs.",
                 flush=True,
             )
 
-            pca = PCA(n_components=nPcs, random_state=seed)
-            scores = pca.fit_transform(X)
-
-            scoreCols = [f"PC_{i}" for i in range(1, nPcs + 1)]
-
-            scoresDf = obs.copy()
-            for i, col in enumerate(scoreCols):
-                scoresDf[col] = scores[:, i].astype(np.float32)
-
-            loadingsDf = pd.DataFrame(
-                pca.components_.T,
-                columns=scoreCols,
-            )
-            loadingsDf.insert(0, "Feature", displayCols)
-            loadingsDf.insert(0, "SourceColumn", sourceCols)
-
-            varianceDf = pd.DataFrame(
-                {
-                    "PC": scoreCols,
-                    "ExplainedVarianceRatio": pca.explained_variance_ratio_,
-                    "ExplainedVariancePercent": pca.explained_variance_ratio_ * 100,
-                    "CumulativeVariancePercent": np.cumsum(
-                        pca.explained_variance_ratio_
-                    ) * 100,
-                }
+            result = run_pca(
+                X,
+                obs,
+                sourceCols,
+                displayCols,
+                n_pcs=requestedPcs,
+                random_seed=seed,
             )
 
-            subclustering_feature_matrix.set(X)
-            subclustering_feature_source_columns.set(sourceCols)
-            subclustering_feature_display_columns.set(displayCols)
+            subclustering_feature_matrix.set(result["feature_matrix"])
+            subclustering_feature_source_columns.set(result["source_columns"])
+            subclustering_feature_display_columns.set(result["display_columns"])
 
-            subclustering_pca_scores.set(scoresDf)
-            subclustering_pca_loadings.set(loadingsDf)
-            subclustering_pca_variance.set(varianceDf)
+            subclustering_pca_scores.set(result["scores"])
+            subclustering_pca_loadings.set(result["loadings"])
+            subclustering_pca_variance.set(result["variance"])
 
             # Clear downstream subclustering state.
             subclustering_leiden_labels.set(pd.DataFrame())
             subclustering_pacmap_embedding.set(pd.DataFrame())
-            subclustering_cluster_name_map.set(
-                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
-            )
+            subclustering_cluster_name_map.set(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
 
             msg = (
-                f"Sub-PCA complete: {nCells:,} cells × {nFeatures:,} features, "
-                f"{nPcs:,} PCs."
+                f"Sub-PCA complete: "
+                f"{result['n_cells']:,} cells × "
+                f"{result['n_features']:,} features, "
+                f"{result['n_pcs']:,} PCs."
             )
 
             subclustering_status.set(msg)
+
             subclustering_annotation_status.set(
-                "Sub-PCA was rerun. Run sub-Leiden and sub-PaCMAP again."
+                "Sub-PCA was rerun. "
+                "Run sub-Leiden and sub-PaCMAP again."
             )
 
-            print(f"✅ {msg}", flush=True)
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
         except ClusteringInputError as e:
             msg = str(e)
 
@@ -8831,24 +8103,10 @@ def server(input, output, session):
 
             print(f"❌ {msg}", flush=True)
 
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-
-            msg = f"Sub-PCA failed: {e}"
-            subclustering_status.set(msg)
-            print(f"❌ {msg}", flush=True)
-
     @reactive.Effect
     @reactive.event(input.run_subleiden_clustering)
     def _run_subleiden_clustering():
         try:
-            if not LEIDEN_AVAILABLE:
-                raise ImportError(
-                    "Leiden clustering requires python-igraph and leidenalg. "
-                    "Install with: pip install python-igraph leidenalg"
-                )
-
             pcaDf = subclustering_pca_scores.get()
 
             if pcaDf is None or pcaDf.empty:
@@ -8978,11 +8236,6 @@ def server(input, output, session):
     @reactive.event(input.run_subclustering_pacmap)
     def _run_subclustering_pacmap():
         try:
-            if not PACMAP_AVAILABLE:
-                raise ImportError(
-                    "PaCMAP requires the pacmap package. Install with: pip install pacmap"
-                )
-
             pcaDf = subclustering_pca_scores.get()
 
             if pcaDf is None or pcaDf.empty:
