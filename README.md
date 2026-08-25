@@ -314,31 +314,15 @@ Two display modes are available:
 - "All channels from one image", useful for reviewing an ROI and spotting bad channels, contamination or staining patterns.
 - "One channel from all images" useful for checking how one marker behaves across the whole dataset and identifying sample-to-sample variation
 
-12.1 Downscaling methods
-------------------------
-SIGNAL PRESERVING — MAXIMUM POOLING
-    Small bright structures are more likely to remain visible. Good for sparse
-    punctate signal or thin structures.
+To reduce RAM usage, thumbnails are downscaled to ~1 Mpixel INT8 arrays. 
 
-SMOOTH OVERVIEW — AREA AVERAGING
-    Averages source pixels into the thumbnail. Produces a smoother, less noisy
-    overview but can dilute tiny bright features.
+Two downscaling methods are available:
+- Signal preserving — maximum pooling: small bright structures are more likely to remain visible. Good for sparse punctate signal or thin structures.
+- Smooth overview — area averaging: averages source pixels into the thumbnail. Produces a smoother, less noisy overview but can dilute tiny bright features.
 
-12.2 Generate thumbnails
-------------------------
-Generates only the thumbnails needed for the selected overview. Valid cached
-entries are reused.
+Thumbnails are not generated upon loading the images and are only generated on demand. You can either generate them per image/channel with "Generate thumbails" or generate them for all channels/images using "Generate all thumbnails" 
 
-12.3 Generate all thumbnails
-----------------------------
-Generates every channel for every loaded image. This takes more processing and
-cache space but makes subsequent navigation immediate.
+Thumbnails are cached and will be retrieved from cache if possible.
 
-12.4 Clear thumbnail cache
---------------------------
-Removes cached thumbnail renderings. Use this if you deliberately want to free
-memory/cache state or force regeneration.
-
-The cache keys include relevant image/parameter information so stale
-thumbnails should not simply be reused across changed processing recipes.
+To delete all thumbnails in the cache, use "Clear thumbnails"
 
