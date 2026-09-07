@@ -97,11 +97,15 @@ def app_styles():
                 padding-left: 0;
                 padding-right: 0;
             }
+            
+            .viewer-zoom-controls {
+                width: 100%;
+            }
                       
             /* PINT tab: fixed pixel navigator, independent of screen width */
             .pint-navigator-grid {
                 display: grid !important;
-                grid-template-columns: 375px 50px 50px 50px 375px 50px 50px;
+                grid-template-columns: 350px 50px 50px 50px 350px 50px 50px 50px 250px;
                 column-gap: 0.25rem;
                 align-items: end;
                 width: max-content;
@@ -412,86 +416,99 @@ def app_styles():
             }
                       
 
+            /* ============================================================
+            Clustering workspace
+            ============================================================ */
+
+            /*
+            Each clustering sub-tab owns its own sidebar.
+
+            Controls are kept at a fixed width on the left while the output
+            area uses all remaining horizontal space.
+            */
+
+            .clustering-current-dataset-preview tbody tr:first-child {
+                font-size: 0.85rem;
+                font-weight: 600;
+                background-color: #e9ecef;
+            }
+            
+            .clustering-tab-layout {
+                display: flex;
+                gap: 0.75rem;
+                width: 100%;
+                min-width: 0;
+
+                /*
+                Leave room for:
+                - top-level PINT navigation
+                - clustering card header
+                - clustering sub-tab navigation
+                */
+                height: calc(100vh - 235px);
+                min-height: 0;
+            }
+
+
             /* ------------------------------------------------------------
-            Clustering workspace scroll behavior, should fix the problem with the right card not scrolling to visibility...
+            Left clustering control column
             ------------------------------------------------------------ */
 
-            .clustering-main-column {
-                min-width: 0;
-                max-height: calc(100vh - 255px);
-                overflow-y: auto;
-                overflow-x: auto;
-                padding-right: 0.75rem;
-                padding-bottom: 5rem;
-            }
+            .clustering-tab-controls {
+                flex: 0 0 500px;
+                width: 500px;
+                max-width: 500px;
 
-            .clustering-control-column {
-                max-width: 430px;
-                max-height: calc(100vh - 255px);
+                min-height: 0;
                 overflow-y: auto;
                 overflow-x: hidden;
+
                 padding-right: 0.5rem;
-                padding-bottom: 5rem;
-                margin-left: auto;
+                padding-bottom: 3rem;
             }
 
-            /* Prevent the last card/button from being hidden behind viewport bottom. */
-            .clustering-control-column::after,
-            .clustering-main-column::after {
+
+            /*
+            Match the appearance of the Image Handler control cards without
+            forcing clustering to use the global .controls-left dimensions.
+            */
+            .clustering-tab-controls .card {
+                border: 1px solid #8f8f8f;
+                box-shadow: 0 0.15rem 0.45rem rgba(0, 0, 0, 0.18);
+            }
+
+
+            .clustering-tab-controls .card-header {
+                border-bottom: 1px solid #8f8f8f;
+                background-color: #e9ecef;
+            }
+
+            /* ------------------------------------------------------------
+            Right clustering result column
+            ------------------------------------------------------------ */
+
+            .clustering-tab-main {
+                flex: 1 1 auto;
+                min-width: 0;
+
+                min-height: 0;
+                overflow-y: auto;
+                overflow-x: auto;
+
+                padding-right: 0.75rem;
+                padding-bottom: 3rem;
+            }
+
+
+            /*
+            Give the scrollable columns a little breathing room at the bottom
+            so the final controls/results do not sit against the viewport edge.
+            */
+            .clustering-tab-controls::after,
+            .clustering-tab-main::after {
                 content: "";
                 display: block;
-                height: 3rem;
-            }
-
-            /* Compact action buttons that do not stretch across the whole card. */
-            .compact-action-button {
-                width: 230px;
-                max-width: 100%;
-            }
-
-
-            .mask-section-title {
-                font-weight: 700;
-                margin-top: 0.25rem;
-                margin-bottom: 0.35rem;
-            }
-
-            .mask-divider {
-                margin-top: 0.6rem;
-                margin-bottom: 0.6rem;
-            }
-
-            .compact-stack p {
-                margin-bottom: 0.2rem;
-            }
-
-            .compact-stack .shiny-input-container {
-                margin-bottom: 0.4rem !important;
-            }
-
-            .compact-small-line {
-                margin-bottom: 0.15rem;
-                line-height: 1.2;
-            }
-
-            .beta-warning-card {
-                border: 1px solid #6ea8fe;
-                background-color: #e7f1ff;
-                color: #084298;
-                border-radius: 0.35rem;
-            }
-
-            .beta-warning-title {
-                font-weight: 750;
-                margin-bottom: 0.35rem;
-            }
-                      
-            /* Keep Shiny progress/notification UI above PINT sidebars */
-            #shiny-notification-panel,
-            .shiny-notification,
-            .shiny-progress-container,
-            .shiny-progress {
-                z-index: 3000 !important;
+                height: 2rem;
             }
                       
             /* ============================================================

@@ -47,15 +47,44 @@ def summarize_cluster_frequency(
     cluster_col: str,
 ) -> pd.DataFrame:
     if matchedDf is None or matchedDf.empty:
-        return pd.DataFrame(columns=[sample_col, "cell_cluster", "n_cells"])
+        return pd.DataFrame(
+            columns=[sample_col, "cell_cluster", "n_cells"]
+        )
+
+    temp = matchedDf[[sample_col, cluster_col]].copy()
+
+    clusterClean = (
+        temp[cluster_col]
+        .astype("string")
+        .str.strip()
+    )
+
+    badCluster = (
+        clusterClean.isna()
+        | (clusterClean == "")
+        | clusterClean.str.lower().isin(
+            ["nan", "none", "na"]
+        )
+    )
+
+    temp = temp.loc[~badCluster].copy()
+    temp[cluster_col] = clusterClean.loc[~badCluster].astype(str)
 
     out = (
-        matchedDf
-        .groupby([sample_col, cluster_col], sort=False)
+        temp
+        .groupby(
+            [sample_col, cluster_col],
+            sort=False,
+        )
         .size()
         .reset_index(name="n_cells")
-        .rename(columns={cluster_col: "cell_cluster"})
+        .rename(
+            columns={
+                cluster_col: "cell_cluster"
+            }
+        )
     )
+
     return out
 
 def expected_touching_stats_permutation(
@@ -362,6 +391,29 @@ def chance_correct_touching_interactions(
     out["n_cells"] = pd.to_numeric(out["n_cells"], errors="coerce")
 
     badNCells = out["n_cells"].isna() | (out["n_cells"] <= 0)
+
+    ##Found various inconsistencies in some dataframe. This piece of code will run of badNcells is != zero and tell you which cell types
+    ##Mostly it's nothing serieous (celltypes missing from one condition) but sometimes ther might be naming inconsistencies and 20+% of comparisons are dropt for a reason
+    ##Originally used as diagnosistool but since it doesn't run if nothing is wrong I left it in.
+    if badNCells.any():
+        badDf = out.loc[
+            badNCells,
+            [sample_col, "cell_cluster", "neighbor_cluster", "n_cells"]
+        ].copy()
+
+        print("\nMissing source-cell counts by source cluster:")
+        print(
+            badDf["cell_cluster"]
+            .value_counts(dropna=False)
+            .to_string()
+        )
+
+        print("\nExamples:")
+        print(
+            badDf.head(30).to_string(index=False)
+        )
+
+    badNCells = out["n_cells"].isna() | (out["n_cells"] <= 0)
     if badNCells.any():
         nBad = int(badNCells.sum())
         _emit(
@@ -469,27 +521,77 @@ def aggregate_interaction_matrix(
     if metadataDf is None or metadataDf.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    meta = metadataDf[[sample_col, aggregate_col, group_col]].drop_duplicates().copy()
+    # Preserve column order while avoiding duplicate metadata columns
+    # when aggregate_col and group_col are the same.
+    metaCols = list(
+        dict.fromkeys(
+            [
+                sample_col,
+                aggregate_col,
+                group_col,
+            ]
+        )
+    )
 
-    df = matrixDf.merge(meta, on=sample_col, how="inner")
+    meta = (
+        metadataDf[metaCols]
+        .drop_duplicates()
+        .copy()
+    )
+
+    df = matrixDf.merge(
+        meta,
+        on=sample_col,
+        how="inner",
+    )
+
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    featureCols = [c for c in df.columns if c not in [sample_col, aggregate_col, group_col]]
+    featureCols = [
+        c
+        for c in df.columns
+        if c not in {
+            sample_col,
+            aggregate_col,
+            group_col,
+        }
+    ]
 
     aggregatedMatrixDf = (
-        df.groupby(aggregate_col, sort=False)[featureCols]
+        df.groupby(
+            aggregate_col,
+            sort=False,
+        )[featureCols]
         .mean()
         .reset_index()
     )
 
-    aggregatedMetaDf = (
-        df[[aggregate_col, group_col]]
-        .drop_duplicates()
-        .groupby(aggregate_col, sort=False)
-        .first()
-        .reset_index()
-    )
+    # If the aggregation unit is itself the grouping variable,
+    # there is no separate group metadata to recover.
+    if aggregate_col == group_col:
+        aggregatedMetaDf = (
+            df[[aggregate_col]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+
+    else:
+        aggregatedMetaDf = (
+            df[
+                [
+                    aggregate_col,
+                    group_col,
+                ]
+            ]
+            .drop_duplicates()
+            .groupby(
+                aggregate_col,
+                sort=False,
+            )
+            .first()
+            .reset_index()
+        )
 
     return aggregatedMatrixDf, aggregatedMetaDf
 

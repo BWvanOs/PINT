@@ -24,7 +24,19 @@ def neighborhood_panel():
 
                     ui.input_select(
                         "analysis_unit_col",
-                        "Final comparison unit",
+                        ui.tags.span(
+                            "Aggregate ROIs by ",
+                            ui.tags.span(
+                                "ⓘ",
+                                title=(
+                                    "Sometimes you have multiple ROI's from the sample patient. If you have a "
+                                    "column that has a samplenumber that identifies different ROI's from one patient, select this column here. "
+                                    "The ROI's will be averaged before statistical comparison. Usually this column identifies "
+                                    "biological replicates and is called something like SampleNumber or PatientID."
+                                ),
+                                style="cursor: help;",
+                            ),
+                        ),
                         choices=[],
                         selected=None,
                         width="100%",

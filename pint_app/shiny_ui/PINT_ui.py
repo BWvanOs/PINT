@@ -349,14 +349,43 @@ def pint_panel():
                             ),
                         ),
 
+                        ui.tags.div(),
+
+                        ui.tags.div(
+                            ui.input_action_button(
+                                "viewer_reset_zoom",
+                                "Reset zoom",
+                                class_="btn btn-secondary w-100",
+                            ),
+                            class_="viewer-zoom-controls",
+                        ),
                         class_="pint-navigator-grid",
                     ),
                     class_="viewer-navigator",
                 ),
 
                 ui.tags.div(
-                    ui.output_plot("pint_viewer", fill=True, height="100%"),
+                    ui.output_plot(
+                        "pint_viewer",
+                        fill=True,
+                        height="100%",
+                        brush=ui.brush_opts(
+                            delay=200,
+                            delay_type="debounce",
+                            reset_on_new=True,
+                        ),
+                    ),
                     class_="viewer-plot-fill",
+                ),
+                ui.tags.script(
+                    """
+                    Shiny.addCustomMessageHandler(
+                        "reset-pint-brush",
+                        function(message) {
+                            Shiny.resetBrush(message.brush_id);
+                        }
+                    );
+                    """
                 ),
 
                 class_="viewer-main",

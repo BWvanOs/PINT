@@ -32,7 +32,8 @@ from pint_app.core.clustering_helpers import (
     prepare_clustering_feature_matrix,
     run_pca,
     run_leiden,
-    run_pacmap
+    run_pacmap,
+    set_clustering_columns_by_suffix,
 )
 
 from pint_app.core.composites import (
@@ -218,6 +219,8 @@ def server(input, output, session):
     mcd_file_summary = reactive.Value({})
     mcd_loading_status = reactive.Value("No MCD file selected.")
 
+    viewer_zoom_bounds = reactive.Value(None)
+
     segmentation_mesmer_mask = reactive.Value(None)
     segmentation_mesmer_result = reactive.Value(None)
     segmentation_mesmer_mask_path = reactive.Value("")
@@ -244,6 +247,9 @@ def server(input, output, session):
     #       "obsm": PCA/UMAP/PaCMAP embeddings,
     #       "source": input source,
     #   }
+
+    # Path awaiting confirmation because loading it would replace the currently active master clustering dataset. Overwriting an existing dataset would suck...
+    pending_clustering_table_path = reactive.Value("")
     clustering_data = reactive.Value(pd.DataFrame())
     clustering_source = reactive.Value("")
     clustering_status = reactive.Value("No clustering dataset loaded yet.")
@@ -251,7 +257,9 @@ def server(input, output, session):
     clustering_metadata_columns = reactive.Value([])
     clustering_excluded_columns = reactive.Value([])
     ##User defined column to input cluster parameters and names to plot
-    clustering_column_map = reactive.Value(pd.DataFrame(columns=["ChannelNamesForClustering", "ChannelNameToDisplay"]))
+    clustering_column_map = reactive.Value(pd.DataFrame(columns=["ChannelNamesForClustering", "ChannelNameToDisplay","IncludeForClustering",]))
+    clustering_column_map_editor_data = reactive.Value(pd.DataFrame())
+    clustering_column_regex_preview = reactive.Value(None)
     # PCA / clustering analysis state.
     clustering_analysis_status = reactive.Value("No PCA or clustering run yet.")
     clustering_feature_matrix = reactive.Value(None)
@@ -615,6 +623,45 @@ def server(input, output, session):
                 + "\n".join(mismatches)
             )
 
+    @reactive.Effect
+    @reactive.event(input.viewer_reset_zoom)
+    async def _viewer_reset_zoom():
+        viewer_zoom_bounds.set(None)
+
+        await session.send_custom_message(
+            "reset-pint-brush",
+            {"brush_id": "pint_viewer_brush"},
+        )
+
+    @reactive.Effect
+    @reactive.event(input.pint_viewer_brush)
+    async def _apply_viewer_zoom_from_brush():
+        brush = input.pint_viewer_brush()
+
+        if not brush:
+            return
+
+        x_min = float(brush["xmin"])
+        x_max = float(brush["xmax"])
+        y_min = float(brush["ymin"])
+        y_max = float(brush["ymax"])
+
+        if (x_max - x_min) < 5 or (y_max - y_min) < 5:
+            return
+
+        viewer_zoom_bounds.set(
+            {
+                "x_min": x_min,
+                "x_max": x_max,
+                "y_min": y_min,
+                "y_max": y_max,
+            }
+        )
+
+        await session.send_custom_message(
+            "reset-pint-brush",
+            {"brush_id": "pint_viewer_brush"},
+        )
 
     def _get_winsor_settings():
         """
@@ -1436,10 +1483,15 @@ def server(input, output, session):
         Build a default clustering column map from the currently loaded table.
 
         Reserved columns such as PINT_Cell_ID are not exported as clustering features.
+        All ordinary columns are included for clustering by default.
         """
         if df is None or df.empty:
             return pd.DataFrame(
-                columns=["ChannelNamesForClustering", "ChannelNameToDisplay"]
+                columns=[
+                    "ChannelNamesForClustering",
+                    "ChannelNameToDisplay",
+                    "IncludeForClustering",
+                ]
             )
 
         exportCols = [
@@ -1451,7 +1503,36 @@ def server(input, output, session):
             {
                 "ChannelNamesForClustering": exportCols,
                 "ChannelNameToDisplay": exportCols,
+                "IncludeForClustering": True,
             }
+        )
+
+    def _set_bulk_suffix_selection(
+        suffix: str,
+        include: bool,
+    ):
+        col_map = clustering_column_map.get()
+
+        if col_map is None or col_map.empty:
+            return
+
+        updated, n_matched = set_clustering_columns_by_suffix(
+            col_map,
+            suffix,
+            include,
+        )
+
+        clustering_column_map.set(updated)
+        clustering_column_map_editor_data.set(
+            updated.copy()
+        )
+
+        action = "included" if include else "excluded"
+
+        ui.notification_show(
+            f"{n_matched:,} '{suffix}' columns {action}.",
+            type="message",
+            duration=4,
         )
 
     def _parse_feature_list_text(text: str) -> list[str]:
@@ -5729,7 +5810,7 @@ def server(input, output, session):
                 session=session,
             )
 
-
+    
 
 
     def _get_mesmer_env_name() -> str:
@@ -6255,68 +6336,411 @@ def server(input, output, session):
 
         return ui.div(*parts)
 
+    def _load_clustering_table_from_path(
+        table_path: str,
+    ) -> None:
+        """
+        Replace the current master clustering dataset with a table from disk.
+
+        This helper performs the actual destructive load. Confirmation that
+        replacement is acceptable should happen before calling this function.
+        """
+        if not table_path or not os.path.isfile(table_path):
+            raise ValueError(
+                f"Invalid clustering table path: {table_path!r}"
+            )
+
+        file_size_mb = (
+            os.path.getsize(table_path)
+            / 1024
+            / 1024
+        )
+
+        with ui.Progress(
+            min=0,
+            max=3,
+            session=session,
+        ) as p:
+
+            p.set(
+                value=0,
+                message=(
+                    f"Reading clustering table "
+                    f"({file_size_mb:.1f} MB)..."
+                ),
+            )
+
+            t0 = datetime.now()
+
+            df, original_name = (
+                _read_clustering_table_path(
+                    table_path
+                )
+            )
+
+            t1 = datetime.now()
+
+            print(
+                f"✅ pandas read complete in "
+                f"{(t1 - t0).total_seconds():.1f} sec. "
+                f"Shape: {df.shape[0]:,} rows × "
+                f"{df.shape[1]:,} columns.",
+                flush=True,
+            )
+
+            if df is None or df.empty:
+                raise ValueError(
+                    "Loaded file is empty."
+                )
+
+            p.set(
+                value=1,
+                message="Storing clustering table...",
+            )
+
+            clustering_data.set(df)
+            clustering_source.set("file_path")
+
+            # Build a complete mapping from the newly loaded dataset.
+            # Original source names remain immutable.
+            newMap = _make_default_clustering_column_map(
+                df
+            )
+
+            clustering_column_map.set(
+                newMap
+            )
+
+            clustering_column_map_editor_data.set(
+                newMap.copy()
+            )
+
+            clustering_feature_columns.set([])
+            clustering_metadata_columns.set([])
+            clustering_excluded_columns.set([])
+
+            p.set(
+                value=2,
+                message="Updating Current dataset tab...",
+            )
+
+            msg = (
+                f"Loaded clustering table "
+                f"'{original_name}': "
+                f"{len(df):,} rows, "
+                f"{len(df.columns):,} columns."
+            )
+
+            clustering_status.set(msg)
+
+            p.set(
+                value=3,
+                message="Done.",
+            )
+
+        ui.update_navs(
+            "viewer_mode",
+            selected="clustering",
+            session=session,
+        )
+
+        ui.update_navs(
+            "clustering_workspace_mode",
+            selected="Current dataset",
+            session=session,
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+
     @reactive.Effect
     @reactive.event(input.load_clustering_table)
     def _load_clustering_table():
-        table_path = (input.clustering_table_path() or "").strip()
+        tablePath = (
+            input.clustering_table_path()
+            or ""
+        ).strip()
 
-        print(f"▶️ Clustering table load requested: {table_path}", flush=True)
+        currentDf = clustering_data.get()
+
+        if (
+            currentDf is not None
+            and not currentDf.empty
+        ):
+            pending_clustering_table_path.set(
+                tablePath
+            )
+
+            ui.modal_show(
+                ui.modal(
+                    ui.tags.p(
+                        "A dataset is already loaded into PINT."
+                    ),
+
+                    ui.tags.p(
+                        f"The current dataset contains "
+                        f"{len(currentDf):,} rows × "
+                        f"{len(currentDf.columns):,} columns."
+                    ),
+
+                    ui.tags.p(
+                        "Loading another table will replace the current "
+                        "master dataset and all clustering results associated "
+                        "with it.",
+                        class_="text-danger",
+                    ),
+
+                    footer=ui.tags.div(
+                        ui.input_action_button(
+                            "cancel_replace_clustering_dataset",
+                            "Cancel",
+                            class_="btn btn-secondary",
+                        ),
+
+                        ui.input_action_button(
+                            "confirm_replace_clustering_dataset",
+                            "Replace dataset",
+                            class_="btn btn-danger ms-2",
+                        ),
+                    ),
+
+                    title="Replace current dataset?",
+                    easy_close=False,
+                )
+            )
+
+            return
 
         try:
-            if not table_path or not os.path.isfile(table_path):
-                raise ValueError(f"Invalid clustering table path: {table_path!r}")
-
-            file_size_mb = os.path.getsize(table_path) / 1024 / 1024
-
-            with ui.Progress(min=0, max=3, session=session) as p:
-                p.set(value=0, message=f"Reading clustering table ({file_size_mb:.1f} MB)...")
-
-                t0 = datetime.now()
-                df, original_name = _read_clustering_table_path(table_path)
-                t1 = datetime.now()
-
-                print(
-                    f"✅ pandas read complete in {(t1 - t0).total_seconds():.1f} sec. "
-                    f"Shape: {df.shape[0]:,} rows × {df.shape[1]:,} columns.",
-                    flush=True,
-                )
-
-                if df is None or df.empty:
-                    raise ValueError("Loaded file is empty.")
-
-                p.set(value=1, message="Storing clustering table...")
-
-                clustering_data.set(df)
-                clustering_source.set("file_path")
-                clustering_column_map.set(_make_default_clustering_column_map(df))
-
-                clustering_feature_columns.set([])
-                clustering_metadata_columns.set([])
-                clustering_excluded_columns.set([])
-
-                p.set(value=2, message="Updating Data preparation tab...")
-
-                msg = (
-                    f"Loaded clustering table '{original_name}' into Data preparation: "
-                    f"{len(df):,} rows, {len(df.columns):,} columns."
-                )
-
-                clustering_status.set(msg)
-
-                p.set(value=3, message="Done.")
-
-            ui.update_navs("viewer_mode", selected="clustering", session=session)
-            ui.update_navs("clustering_workspace_mode", selected="Data preparation", session=session)
-
-            print(f"✅ {msg}", flush=True)
+            _load_clustering_table_from_path(
+                tablePath
+            )
 
         except Exception as e:
             import traceback
             traceback.print_exc()
 
-            msg = f"Could not load clustering table: {e}"
+            msg = (
+                f"Could not load clustering table: {e}"
+            )
+
             clustering_status.set(msg)
-            print(f"⚠️ {msg}", flush=True)
+
+            print(
+                f"⚠️ {msg}",
+                flush=True,
+            )
+
+    @reactive.Effect
+    @reactive.event(input.cancel_replace_clustering_dataset)
+    def _cancel_replace_clustering_dataset():
+        pending_clustering_table_path.set("")
+        ui.modal_remove()
+
+
+    @reactive.Effect
+    @reactive.event(
+        input.confirm_replace_clustering_dataset
+    )
+    def _confirm_replace_clustering_dataset():
+        tablePath = (
+            pending_clustering_table_path.get()
+            or ""
+        ).strip()
+
+        pending_clustering_table_path.set("")
+        ui.modal_remove()
+
+        try:
+            _load_clustering_table_from_path(
+                tablePath
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Could not load clustering table: {e}"
+            )
+
+            clustering_status.set(msg)
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+    @output
+    @render.data_frame
+    def clustering_column_map_editor():
+        colMap = clustering_column_map_editor_data.get()
+
+        if (
+            colMap is None
+            or colMap.empty
+        ):
+            emptyDf = pd.DataFrame(
+                columns=[
+                    "Source column",
+                    "Display name",
+                    "Include for clustering",
+                ]
+            )
+
+            return render.DataGrid(
+                emptyDf,
+                editable=True,
+                filters=True,
+                height="750px",
+                width="fit-content",
+            )
+
+        displayDf = colMap[
+            [
+                "ChannelNamesForClustering",
+                "ChannelNameToDisplay",
+                "IncludeForClustering",
+            ]
+        ].copy()
+
+        displayDf.columns = [
+            "Source column",
+            "Display name",
+            "Include for clustering",
+        ]
+
+        return render.DataGrid(
+            displayDf,
+            editable=True,
+            filters=True,
+            height="750px",
+            width="fit-content",
+        )
+
+    @clustering_column_map_editor.set_patch_fn
+    def _edit_clustering_column_map(
+        *,
+        patch: render.CellPatch,
+    ):
+        rowIndex = int(
+            patch["row_index"]
+        )
+
+        colIndex = int(
+            patch["column_index"]
+        )
+
+        newValue = str(
+            patch["value"]
+            or ""
+        ).strip()
+
+        # Get the current authoritative mapping first.
+        colMap = (
+            clustering_column_map.get()
+            .copy()
+        )
+
+        # Column 0 = immutable source column name. Editing not exposed to the user to preserve 
+        # backwards compatbility between dataframes when going back to R studio or something
+        if colIndex == 0:
+            return str(
+                colMap.iloc[rowIndex][
+                    "ChannelNamesForClustering"
+                ]
+            )
+
+        # Column 1 = editable display name.
+        if colIndex == 1:
+
+            oldValue = str(
+                colMap.iloc[rowIndex][
+                    "ChannelNameToDisplay"
+                ]
+            )
+
+            # Do not allow blank display names.
+            if not newValue:
+                ui.notification_show(
+                    "Display names cannot be empty.",
+                    type="warning",
+                    duration=4,
+                )
+
+                return oldValue
+
+            # Do not allow duplicate display names.
+            otherNames = (
+                colMap[
+                    "ChannelNameToDisplay"
+                ]
+                .drop(
+                    index=rowIndex
+                )
+                .astype(str)
+                .str.strip()
+            )
+
+            if newValue in set(otherNames):
+                ui.notification_show(
+                    f"Display name '{newValue}' is already in use.",
+                    type="warning",
+                    duration=5,
+                )
+
+                return oldValue
+
+            # Valid edit -> update mapping.
+            colMap.iat[
+                rowIndex,
+                colMap.columns.get_loc(
+                    "ChannelNameToDisplay"
+                ),
+            ] = newValue
+
+            clustering_column_map.set(
+                colMap
+            )
+
+            return newValue
+
+        if colIndex == 2:
+            rawValue = patch["value"]
+
+            if isinstance(rawValue, bool):
+                includeValue = rawValue
+            else:
+                includeValue = (
+                    str(rawValue)
+                    .strip()
+                    .lower()
+                    in {
+                        "true",
+                        "1",
+                        "yes",
+                        "y",
+                    }
+                )
+
+            colMap.iat[
+                rowIndex,
+                colMap.columns.get_loc(
+                    "IncludeForClustering"
+                ),
+            ] = includeValue
+
+            clustering_column_map.set(
+                colMap
+            )
+
+            return includeValue
+
+        return patch["value"]
+
 
     @reactive.Effect
     @reactive.event(input.export_clustering_column_map)
@@ -6437,6 +6861,9 @@ def server(input, output, session):
             "ChannelNameToDisplay",
         ]
 
+        if "IncludeForClustering" not in colMap.columns:
+            colMap["IncludeForClustering"] = True
+
         missing = [
             col
             for col in requiredCols
@@ -6474,10 +6901,17 @@ def server(input, output, session):
             )
             return
 
+        mapCols = [
+            "ChannelNamesForClustering",
+            "ChannelNameToDisplay",
+            "IncludeForClustering",
+        ]
+
         colMap = colMap[
-            requiredCols
+            mapCols
         ].copy()
 
+        # Clean text columns.
         for col in requiredCols:
             colMap[col] = (
                 colMap[col]
@@ -6491,6 +6925,13 @@ def server(input, output, session):
                 .str.strip()
             )
 
+        # Normalize include/exclude values.
+        colMap["IncludeForClustering"] = (
+            colMap["IncludeForClustering"]
+            .apply(_normalize_include_for_clustering)
+        )
+
+        # Drop completely empty mapping rows.
         colMap = colMap.loc[
             (
                 colMap["ChannelNamesForClustering"]
@@ -6505,6 +6946,10 @@ def server(input, output, session):
 
         clustering_column_map.set(
             colMap
+        )
+
+        clustering_column_map_editor_data.set(
+            colMap.copy()
         )
 
         validMap = (
@@ -6530,6 +6975,355 @@ def server(input, output, session):
             f"✅ {msg}",
             flush=True,
         )
+
+    @reactive.Effect
+    @reactive.event(input.clustering_deselect_mean)
+    def _clustering_deselect_mean():
+
+        col_map = clustering_column_map.get()
+
+        if col_map is None or col_map.empty:
+            return
+
+        updated, n_matched = set_clustering_columns_by_suffix(
+            col_map,
+            "_mean",
+            False,
+        )
+
+        clustering_column_map.set(updated)
+        clustering_column_map_editor_data.set(
+            updated.copy()
+        )
+
+        ui.notification_show(
+            f"{n_matched:,} '_mean' columns excluded.",
+            type="message",
+            duration=4,
+        )
+
+    @reactive.Effect
+    @reactive.event(input.clustering_select_mean)
+    def _clustering_select_mean():
+        _set_bulk_suffix_selection("_mean", True)
+
+
+    @reactive.Effect
+    @reactive.event(input.clustering_deselect_mean)
+    def _clustering_deselect_mean():
+        _set_bulk_suffix_selection("_mean", False)
+
+
+    @reactive.Effect
+    @reactive.event(input.clustering_select_median)
+    def _clustering_select_median():
+        _set_bulk_suffix_selection("_median", True)
+
+
+    @reactive.Effect
+    @reactive.event(input.clustering_deselect_median)
+    def _clustering_deselect_median():
+        _set_bulk_suffix_selection("_median", False)
+    
+
+    @reactive.Effect
+    @reactive.event(input.preview_clustering_column_regex)
+    def _preview_clustering_column_regex():
+        pattern = (
+            input.clustering_column_regex_pattern()
+            or ""
+        ).strip()
+
+        replacement = (
+            input.clustering_column_regex_replacement()
+            or ""
+        )
+
+        col_map = clustering_column_map.get()
+
+        if col_map is None or col_map.empty:
+            clustering_column_regex_preview.set({
+                "type": "warning",
+                "message": "No column map is available.",
+                "examples": [],
+            })
+            return
+
+        if not pattern:
+            clustering_column_regex_preview.set({
+                "type": "warning",
+                "message": "Enter a regular expression first.",
+                "examples": [],
+            })
+            return
+
+        try:
+            old_names = (
+                col_map["ChannelNameToDisplay"]
+                .fillna("")
+                .astype(str)
+            )
+
+            new_names = old_names.str.replace(
+                pattern,
+                replacement,
+                regex=True,
+            )
+
+        except Exception as e:
+            clustering_column_regex_preview.set({
+                "type": "error",
+                "message": f"Invalid regular expression: {e}",
+                "examples": [],
+            })
+            return
+
+        changed = old_names != new_names
+        n_changed = int(changed.sum())
+
+        examples = list(
+            zip(
+                old_names.loc[changed].head(5),
+                new_names.loc[changed].head(5),
+            )
+        )
+
+        clustering_column_regex_preview.set({
+            "type": "success",
+            "message": (
+                f"{n_changed:,} display name(s) would change."
+                if n_changed
+                else "No display names match this expression."
+            ),
+            "examples": examples,
+        })
+
+    @output
+    @render.ui
+    def clustering_column_regex_summary():
+        preview = clustering_column_regex_preview.get()
+
+        if not preview:
+            return None
+
+        message_type = preview.get(
+            "type",
+            "success",
+        )
+
+        message = preview.get(
+            "message",
+            "",
+        )
+
+        examples = preview.get(
+            "examples",
+            [],
+        )
+
+        if message_type == "error":
+            text_class = "text-danger"
+        elif message_type == "warning":
+            text_class = "text-warning"
+        else:
+            text_class = "text-muted"
+
+        parts = [
+            ui.tags.div(
+                message,
+                class_=f"compact-small-line {text_class}",
+            )
+        ]
+
+        if examples:
+            parts.append(
+                ui.tags.ul(
+                    *[
+                        ui.tags.li(
+                            f"{old} → {new}"
+                        )
+                        for old, new in examples
+                    ],
+                    class_="mb-2",
+                )
+            )
+
+        return ui.tags.div(
+            *parts,
+            class_="mt-1 mb-2",
+        )
+
+    @reactive.Effect
+    @reactive.event(input.apply_clustering_column_regex)
+    def _apply_clustering_column_regex():
+        pattern = (
+            input.clustering_column_regex_pattern()
+            or ""
+        ).strip()
+
+        replacement = (
+            input.clustering_column_regex_replacement()
+            or ""
+        )
+
+        col_map = clustering_column_map.get()
+
+        if col_map is None or col_map.empty:
+            return
+
+        if not pattern:
+            ui.notification_show(
+                "Enter a regular expression first.",
+                type="warning",
+                duration=4,
+            )
+            return
+
+        try:
+            updated = col_map.copy()
+
+            old_names = (
+                updated["ChannelNameToDisplay"]
+                .fillna("")
+                .astype(str)
+            )
+
+            new_names = old_names.str.replace(
+                pattern,
+                replacement,
+                regex=True,
+            )
+
+        except Exception as e:
+            ui.notification_show(
+                f"Invalid regular expression: {e}",
+                type="error",
+                duration=6,
+            )
+            return
+
+        n_changed = int(
+            (old_names != new_names).sum()
+        )
+
+        if n_changed == 0:
+            ui.notification_show(
+                "No display names matched the expression.",
+                type="warning",
+                duration=4,
+            )
+            return
+
+        # Keep the same rules as manual editing:
+        # no blank or duplicate display names.
+        if (new_names.str.strip() == "").any():
+            ui.notification_show(
+                "Regex replacement would create an empty display name.",
+                type="error",
+                duration=6,
+            )
+            return
+
+        duplicates = new_names[
+            new_names.duplicated(keep=False)
+        ].unique()
+
+        if len(duplicates) > 0:
+            ui.notification_show(
+                "Regex replacement would create duplicate display names: "
+                + ", ".join(map(str, duplicates[:5])),
+                type="error",
+                duration=8,
+            )
+            return
+
+        updated["ChannelNameToDisplay"] = new_names
+
+        clustering_column_map.set(updated)
+
+        clustering_column_map_editor_data.set(
+            updated.copy()
+        )
+
+        clustering_column_regex_preview.set({
+            "type": "success",
+            "message": (
+                f"Applied regex replacement to "
+                f"{n_changed:,} display name(s)."
+            ),
+            "examples": [],
+        })
+
+        ui.notification_show(
+            f"{n_changed:,} display name(s) changed.",
+            type="message",
+            duration=4,
+        )
+
+    @reactive.Effect
+    @reactive.event(input.reset_clustering_display_names)
+    def _reset_clustering_display_names():
+        col_map = clustering_column_map.get()
+
+        if col_map is None or col_map.empty:
+            return
+
+        updated = col_map.copy()
+
+        updated["ChannelNameToDisplay"] = (
+            updated["ChannelNamesForClustering"]
+            .astype(str)
+        )
+
+        clustering_column_map.set(updated)
+
+        clustering_column_map_editor_data.set(
+            updated.copy()
+        )
+
+        clustering_column_regex_preview.set({
+            "type": "success",
+            "message": "Display names reset to source column names.",
+            "examples": [],
+        })
+
+    def _normalize_include_for_clustering(value) -> bool:
+        """
+        Convert common CSV/Excel representations to a real boolean.
+
+        Missing values default to True for backward compatibility with
+        older two-column mapping files.
+        """
+        if pd.isna(value):
+            return True
+
+        if isinstance(value, bool):
+            return value
+
+        text = str(value).strip().lower()
+
+        if text in {
+            "true",
+            "1",
+            "yes",
+            "y",
+            "include",
+            "included",
+        }:
+            return True
+
+        if text in {
+            "false",
+            "0",
+            "no",
+            "n",
+            "exclude",
+            "excluded",
+        }:
+            return False
+
+        return True
+    
 
     @reactive.Effect
     @reactive.event(input.run_clustering_pca)
@@ -9220,11 +10014,16 @@ def server(input, output, session):
             print(f"⚠️ {msg}")
             return
 
-        # Do not copy here.
+        # Do not copy the main dataframe here.
         # This avoids duplicating a potentially large segmentation quantification table.
         clustering_data.set(cellDf)
         clustering_source.set("segmentation_quantification")
-        clustering_column_map.set(_make_default_clustering_column_map(cellDf))
+        #push into newMap
+        newMap = _make_default_clustering_column_map(cellDf)
+        ##Push NewMap into both the reactive object that are loaded into curernt Dataset and Columns tabs
+        # This changed after splitting the datahandling tab of the clustering into 2 seperate tabs
+        clustering_column_map.set(newMap)
+        clustering_column_map_editor_data.set(newMap.copy())
 
         # Clear column-role guesses for now.
         clustering_feature_columns.set([])
@@ -9405,7 +10204,11 @@ def server(input, output, session):
         df = clustering_data.get()
         colMap = clustering_column_map.get()
 
-        expectedCols = ["ChannelNamesForClustering", "ChannelNameToDisplay"]
+        expectedCols = [
+            "ChannelNamesForClustering",
+            "ChannelNameToDisplay",
+            "IncludeForClustering",
+        ]
 
         if df is None or df.empty:
             return pd.DataFrame(columns=expectedCols)
@@ -9431,28 +10234,41 @@ def server(input, output, session):
             .str.strip()
         )
 
-        # Remove empty rows.
-        out = out.loc[out["ChannelNamesForClustering"] != ""].copy()
+        out["IncludeForClustering"] = (
+            out["IncludeForClustering"]
+            .apply(_normalize_include_for_clustering)
+        )
 
-        # Keep only columns actually present in the loaded table.
-        # Keep only columns actually present in the loaded table.
-        availableCols = set(df.columns)
-        out = out.loc[out["ChannelNamesForClustering"].isin(availableCols)].copy()
-
-        # Never allow protected structural columns to become clustering features.
+        # Never allow protected structural columns.
         out = out.loc[
-            ~out["ChannelNamesForClustering"].isin(RESERVED_CLUSTERING_COLUMNS)
+            ~out["ChannelNamesForClustering"].isin(
+                RESERVED_CLUSTERING_COLUMNS
+            )
         ].copy()
 
-        # If display name is empty, fall back to the source column name.
-        emptyDisplay = out["ChannelNameToDisplay"] == ""
-        out.loc[emptyDisplay, "ChannelNameToDisplay"] = out.loc[
+        # Empty display names fall back to source names.
+        emptyDisplay = (
+            out["ChannelNameToDisplay"] == ""
+        )
+
+        out.loc[
             emptyDisplay,
-            "ChannelNamesForClustering"
+            "ChannelNameToDisplay",
+        ] = out.loc[
+            emptyDisplay,
+            "ChannelNamesForClustering",
         ]
 
         # Avoid duplicate source columns.
-        out = out.drop_duplicates(subset=["ChannelNamesForClustering"], keep="first")
+        out = out.drop_duplicates(
+            subset=["ChannelNamesForClustering"],
+            keep="first",
+        )
+
+        # Respect the user's include/exclude selection.
+        out = out.loc[
+            out["IncludeForClustering"]
+        ].copy()
 
         return out.reset_index(drop=True)
 
@@ -10143,7 +10959,22 @@ def server(input, output, session):
             )
 
             ax.imshow(img, cmap="gray")
+
+            zoom_bounds = viewer_zoom_bounds.get()
+
+            if zoom_bounds is not None:
+                ax.set_xlim(
+                    zoom_bounds["x_min"],
+                    zoom_bounds["x_max"],
+                )
+
+                ax.set_ylim(
+                    zoom_bounds["y_max"],
+                    zoom_bounds["y_min"],
+                )
+
             ax.set_axis_off()
+
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
             return fig
 
@@ -10599,7 +11430,7 @@ def server(input, output, session):
         )
 
         return ui.div(*parts)
-
+    
     @output
     @render.data_frame
     def clustering_data_preview():
@@ -10613,24 +11444,71 @@ def server(input, output, session):
                     ]
                 }
             )
-            return render.DataGrid(empty, height="400px")
+            return render.DataGrid(
+                empty,
+                height="400px",
+            )
 
         # Show only a small preview. This avoids rendering a huge table in the browser.
+        # This is already a copy, so changing its display headers is safe.
         show = df.head(100).copy()
 
-        # Round numeric values in the preview only.
-        # This does NOT modify clustering_data.
-        numCols = show.select_dtypes(include=["number"]).columns
+        # Round numeric preview values first.
+        numCols = show.select_dtypes(
+            include=["number"]
+        ).columns
 
         if len(numCols) > 0:
             show[numCols] = show[numCols].round(4)
+
+        # Build display-name row.
+        colMap = clustering_column_map.get()
+
+        displayNameRow = {
+            col: ""
+            for col in show.columns
+        }
+
+        if (
+            colMap is not None
+            and not colMap.empty
+        ):
+            for _, row in colMap.iterrows():
+                sourceName = str(
+                    row["ChannelNamesForClustering"]
+                )
+
+                displayName = str(
+                    row["ChannelNameToDisplay"]
+                ).strip()
+
+                if (
+                    sourceName in displayNameRow
+                    and displayName
+                    and displayName != sourceName
+                ):
+                    displayNameRow[sourceName] = (
+                        displayName
+                    )
+
+        displayNameDf = pd.DataFrame(
+            [displayNameRow]
+        )
+
+        show = pd.concat(
+            [
+                displayNameDf,
+                show,
+            ],
+            ignore_index=True,
+        )
 
         return render.DataGrid(
             show,
             height="500px",
             filters=False,
         )
-    
+
     @output
     @render.ui
     def clustering_cell_id_controls():
@@ -10812,10 +11690,6 @@ def server(input, output, session):
             # All original columns are retained.
             clustering_data.set(df_new)
 
-            # Refresh the default map after creating PINT_Cell_ID.
-            # The map helper should exclude PINT_Cell_ID.
-            clustering_column_map.set(_make_default_clustering_column_map(df_new))
-
             clustering_status.set(msg)
 
             print(f"✅ {msg}", flush=True)
@@ -10979,6 +11853,81 @@ def server(input, output, session):
             filters=False,
         )
 
+    @output
+    @render.ui
+    def clustering_pca_feature_summary():
+        try:
+            featureMap = _get_pca_feature_map()
+
+            if featureMap is None or featureMap.empty:
+                return ui.tags.div(
+                    "No features selected for PCA.",
+                    class_="text-warning",
+                )
+
+            return ui.tags.div(
+                ui.tags.strong(
+                    f"{len(featureMap):,} features will be used for PCA"
+                ),
+                ui.tags.div(
+                    "Review the list below before running PCA.",
+                    class_="text-muted small",
+                ),
+            )
+
+        except ClusteringInputError as e:
+            return ui.tags.div(
+                str(e),
+                class_="text-danger",
+            )
+
+    @output
+    @render.data_frame
+    def clustering_pca_feature_preview():
+        try:
+            featureMap = _get_pca_feature_map()
+
+        except ClusteringInputError as e:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Message": [
+                            str(e)
+                        ]
+                    }
+                ),
+                height="150px",
+            )
+
+        if featureMap is None or featureMap.empty:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Message": [
+                            "No PCA features selected."
+                        ]
+                    }
+                ),
+                height="150px",
+            )
+
+        preview = featureMap[
+            [
+                "ChannelNamesForClustering",
+                "ChannelNameToDisplay",
+            ]
+        ].copy()
+
+        preview.columns = [
+            "Source column",
+            "PINT name",
+        ]
+
+        return render.DataGrid(
+            preview,
+            height="250px",
+            filters=False,
+        )
 
     
     @output

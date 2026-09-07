@@ -90,41 +90,178 @@ def cell_identity_card():
         class_="mb-2",
     )
 
-
 def column_selection_card():
     return ui.card(
-        ui.card_header("Column selection for clustering"),
+        ui.card_header(
+            "Column-name mapping"
+        ),
 
         ui.tags.p(
-            "Define which columns are actual marker/channel data for clustering. "
-            "Export a template, edit it, then import it back into PINT.",
+            "Export the current column-name mapping, edit it "
+            "externally, or import a mapping from another dataset.",
             class_="text-muted",
         ),
 
         ui.tags.p(
-            "Expected columns: ChannelNamesForClustering and ChannelNameToDisplay."
-            "Export a template, edit it, then import it back into PINT. "
-            "CSV, tab-separated TXT/TSV, and Excel files are supported.",
+            "Source column names remain unchanged. "
+            "Only PINT display names are editable.",
             class_="text-muted",
         ),
 
         ui.input_action_button(
             "export_clustering_column_map",
-            "Export column-names as template",
-            class_="btn btn-secondary compact-action-button mb-2",
+            "Export column map",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
         ),
 
         ui.input_action_button(
             "import_clustering_column_map",
-            "Import edited column-name table",
-            class_="btn btn-primary compact-action-button mb-2",
+            "Import column map",
+            class_=(
+                "btn btn-primary "
+                "compact-action-button mb-2"
+            ),
         ),
-
-        ui.output_ui("clustering_column_map_summary"),
 
         class_="mb-2",
     )
 
+def column_bulk_selection_card():
+    return ui.card(
+        ui.card_header(
+            "Bulk select channels"
+        ),
+
+        ui.tags.p(
+            "Quickly include or exclude groups of channels "
+            "from clustering.",
+            class_="text-muted",
+        ),
+
+        ui.tags.p(
+            "Mesmer quantification",
+            class_="mask-section-title",
+        ),
+
+        ui.row(
+            ui.column(
+                6,
+                ui.input_action_button(
+                    "clustering_select_mean",
+                    "Select all _mean",
+                    class_=(
+                        "btn btn-secondary "
+                        "compact-action-button w-100 mb-2"
+                    ),
+                ),
+            ),
+
+            ui.column(
+                6,
+                ui.input_action_button(
+                    "clustering_deselect_mean",
+                    "Deselect all _mean",
+                    class_=(
+                        "btn btn-secondary "
+                        "compact-action-button w-100 mb-2"
+                    ),
+                ),
+            ),
+        ),
+
+        ui.row(
+            ui.column(
+                6,
+                ui.input_action_button(
+                    "clustering_select_median",
+                    "Select all _median",
+                    class_=(
+                        "btn btn-secondary "
+                        "compact-action-button w-100 mb-2"
+                    ),
+                ),
+            ),
+
+            ui.column(
+                6,
+                ui.input_action_button(
+                    "clustering_deselect_median",
+                    "Deselect all _median",
+                    class_=(
+                        "btn btn-secondary "
+                        "compact-action-button w-100 mb-2"
+                    ),
+                ),
+            ),
+        ),
+
+        class_="mb-2",
+    )
+
+def column_regex_card():
+    return ui.card(
+        ui.card_header(
+            "Bulk rename display names"
+        ),
+
+        ui.tags.p(
+            "Apply a regular-expression replacement to all "
+            "display names. Source column names are never changed.",
+            class_="text-muted",
+        ),
+
+        ui.input_text(
+            "clustering_column_regex_pattern",
+            "Regular expression",
+            value="",
+            placeholder=r"_ROI\d+$",
+        ),
+
+        ui.input_text(
+            "clustering_column_regex_replacement",
+            "Replace with",
+            value="",
+            placeholder="Leave empty to remove matches",
+        ),
+
+        ui.input_action_button(
+            "preview_clustering_column_regex",
+            "Preview changes",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.output_ui(
+            "clustering_column_regex_summary"
+        ),
+
+        ui.input_action_button(
+            "apply_clustering_column_regex",
+            "Apply regex",
+            class_=(
+                "btn btn-primary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.hr(),
+
+        ui.input_action_button(
+            "reset_clustering_display_names",
+            "Reset display names",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        class_="mb-2",
+    )
 
 def pca_controls_card():
     return ui.card(
@@ -155,8 +292,16 @@ def pca_controls_card():
         ),
 
         ui.row(
+            ui.input_checkbox(
+                "clustering_scale_data",
+                "Scale data before PCA",
+                value=True,
+            ),
+        ),
+
+        ui.row(
             ui.column(
-                4,
+                6,
                 ui.input_select(
                     "clustering_transform",
                     "Transformation",
@@ -169,21 +314,13 @@ def pca_controls_card():
                 ),
             ),
             ui.column(
-                4,
+                6,
                 ui.input_numeric(
                     "clustering_asinh_cofactor",
                     "arcsinh cofactor",
                     value=5,
                     min=0.1,
                     step=0.5,
-                ),
-            ),
-            ui.column(
-                4,
-                ui.input_checkbox(
-                    "clustering_scale_data",
-                    "Scale data before PCA",
-                    value=True,
                 ),
             ),
         ),
@@ -209,6 +346,14 @@ def pca_controls_card():
                     step=1,
                 ),
             ),
+        ),
+
+        ui.output_ui(
+            "clustering_pca_feature_summary"
+        ),
+
+        ui.output_data_frame(
+            "clustering_pca_feature_preview"
         ),
 
         ui.input_action_button(
@@ -278,7 +423,7 @@ def leiden_controls_card():
                 4,
                 ui.input_numeric(
                     "clustering_leiden_n_dims",
-                    "PC dimensions",
+                    "Number of PC's (dimensions) to use",
                     value=10,
                     min=2,
                     step=1,
@@ -298,7 +443,7 @@ def leiden_controls_card():
                 4,
                 ui.input_numeric(
                     "clustering_leiden_resolution",
-                    "Resolution",
+                    "Clustering resolution",
                     value=1.0,
                     min=0.01,
                     step=0.1,
@@ -327,7 +472,7 @@ def embedding_display_controls_card():
 
         ui.row(
             ui.column(
-                4,
+                6,
                 ui.input_select(
                     "clustering_scatter_palette",
                     "PCA palette",
@@ -336,7 +481,7 @@ def embedding_display_controls_card():
                 ),
             ),
             ui.column(
-                4,
+                6,
                 ui.input_numeric(
                     "clustering_embedding_plot_width",
                     "Plot width",
@@ -346,8 +491,11 @@ def embedding_display_controls_card():
                     step=100,
                 ),
             ),
+        ),
+
+        ui.row(
             ui.column(
-                2,
+                6,
                 ui.input_numeric(
                     "clustering_plot_point_size",
                     "PCA point size",
@@ -357,10 +505,10 @@ def embedding_display_controls_card():
                 ),
             ),
             ui.column(
-                2,
+                6,
                 ui.input_numeric(
                     "clustering_plot_alpha",
-                    "PCA alpha",
+                    "PCA dot opacity",
                     value=0.7,
                     min=0.05,
                     max=1,
@@ -385,43 +533,66 @@ def pacmap_controls_card():
 
         ui.row(
             ui.column(
-                3,
+                6,
                 ui.input_numeric(
                     "clustering_pacmap_n_dims",
-                    "PC dimensions",
+                    "Principle components (dimensions) to use",
                     value=10,
                     min=2,
                     step=1,
                 ),
             ),
             ui.column(
-                3,
+                6,
                 ui.input_numeric(
                     "clustering_pacmap_n_neighbors",
-                    "n_neighbors",
+                    "Number of neighbors (close neigbors)",
                     value=10,
                     min=2,
                     step=1,
                 ),
             ),
+        ),
+
+        ui.row(
             ui.column(
-                3,
+                6,
                 ui.input_numeric(
                     "clustering_pacmap_mn_ratio",
-                    "MN_ratio",
+                    "MN_ratio (mid-near pairs)",
                     value=0.5,
                     min=0.0,
                     step=0.1,
                 ),
+                ui.tags.small(
+                    ui.tags.span("ℹ️ ", class_="me-1"),
+                    "Mid-near pair ratio",
+                    title=(
+                        "Controls how many mid-near point pairs PaCMAP uses "
+                        "relative to nearest-neighbor pairs. Higher values place "
+                        "more emphasis on medium-range structure."
+                    ),
+                    class_="text-muted",
+                ),
             ),
             ui.column(
-                3,
+                6,
                 ui.input_numeric(
                     "clustering_pacmap_fp_ratio",
-                    "FP_ratio",
+                    "FP_ratio (far away pairs)",
                     value=2.0,
                     min=0.1,
                     step=0.1,
+                ),
+                ui.tags.small(
+                    ui.tags.span("ℹ️ ", class_="me-1"),
+                    "Far-pair ratio",
+                    title=(
+                        "Controls how many far-away point pairs PaCMAP uses "
+                        "relative to nearest-neighbor pairs. Higher values increase "
+                        "global separation between distant regions."
+                    ),
+                    class_="text-muted",
                 ),
             ),
         ),
@@ -570,17 +741,23 @@ def cluster_annotation_controls_card():
             "OldClusterName should match the PINT Leiden cluster names, for example Cluster_0.",
             class_="text-muted",
         ),
-
-        ui.input_action_button(
-            "export_cluster_name_template",
-            "Export cluster-name template",
-            class_="btn btn-secondary compact-action-button mb-2",
-        ),
-
-        ui.input_action_button(
-            "import_cluster_name_map",
-            "Import cluster names",
-            class_="btn btn-primary compact-action-button mb-2",
+        ui.row(
+            ui.column(
+                6,
+                ui.input_action_button(
+                    "export_cluster_name_template",
+                    "Export a cluster-name template",
+                    class_="btn btn-secondary compact-action-button mb-2",
+                ),
+            ),
+            ui.column(
+                6,
+                ui.input_action_button(
+                    "import_cluster_name_map",
+                    "Import you custom cluster names",
+                    class_="btn btn-primary compact-action-button mb-2",
+                ),
+            ),
         ),
 
         ui.hr(),
@@ -1067,351 +1244,384 @@ def subcluster_pushback_card():
         class_="mb-2",
     )
 
+def clustering_tab_layout(
+    *controls,
+    content,
+):
+    """
+    Build the standard two-column layout used by clustering sub-tabs.
 
+    Each clustering sub-tab owns its own controls. This prevents controls
+    belonging to Data preparation, PCA, annotation, etc. from remaining
+    visible while the user is working in another part of the workflow.
+
+    Controls are deliberately placed on the LEFT and results on the RIGHT,
+    matching the layout used elsewhere in PINT.
+    """
+    return ui.tags.div(
+
+        # LEFT: controls relevant only to this sub-tab.
+        ui.tags.div(
+            *controls,
+            class_="clustering-tab-controls",
+        ),
+
+        # RIGHT: plots, previews, tables, etc.
+        ui.tags.div(
+            content,
+            class_="clustering-tab-main",
+        ),
+
+        class_="clustering-tab-layout",
+    )
 
 def clustering_panel():
     return ui.nav_panel(
         "Clustering",
-        ui.tags.div(
-            # ============================================================
-            # LEFT CONTROL COLUMN: only global / setup controls
-            # ============================================================
-            ui.tags.div(
-                input_data_card(),
-                cell_identity_card(),
-                column_selection_card(),
-                class_="controls-left",
-            ),
 
-            # ============================================================
-            # RIGHT MAIN COLUMN
-            # ============================================================
-            ui.tags.div(
-                ui.card(
-                    ui.card_header("Clustering workspace"),
+        ui.navset_tab(
+            ui.nav_panel(
+                "Current dataset",
 
-                    ui.navset_tab(
-                        ui.nav_panel(
-                            "Data preparation",
-                            ui.tags.div(
-                                ui.output_ui("clustering_data_summary"),
+                clustering_tab_layout(
 
-                                ui.hr(),
+                    # --------------------------------------------------------
+                    # LEFT: controls specific to preparing the master dataset
+                    # --------------------------------------------------------
+                    input_data_card(),
+                    cell_identity_card(),
 
-                                ui.tags.div(
-                                    "Loaded master dataset preview",
-                                    class_="mask-section-title",
-                                ),
+                    # --------------------------------------------------------
+                    # RIGHT: resulting dataset previews
+                    # --------------------------------------------------------
+                    content=ui.tags.div(
+                        ui.output_ui("clustering_data_summary"),
 
-                                ui.tags.p(
-                                    "This is the full loaded master dataset. PINT will only add columns to this table; "
-                                    "it should not delete or destructively subset columns.",
-                                    class_="text-muted",
-                                ),
+                        ui.hr(),
 
-                                ui.output_data_frame("clustering_data_preview"),
-
-                                ui.hr(),
-
-                                ui.tags.div(
-                                    "Selected dataset for clustering",
-                                    class_="mask-section-title",
-                                ),
-
-                                ui.tags.p(
-                                    "This preview shows PINT_Cell_ID plus the marker/channel columns selected by the "
-                                    "clustering column map. The protected PINT_Cell_ID is used to map PCA, PaCMAP, "
-                                    "and cluster labels back to the full master dataset. It is not used as a clustering feature.",
-                                    class_="text-muted",
-                                ),
-
-                                ui.output_data_frame("selected_clustering_data_preview"),
-
-                                class_="compact-stack",
-                            ),
+                        ui.tags.div(
+                            "Loaded master dataset preview",
+                            class_="mask-section-title",
                         ),
 
-                        ui.nav_panel(
-                            "Clustering",
-                            ui.tags.div(
-                                ui.output_ui("clustering_analysis_summary"),
-
-                                ui.hr(),
-
-                                ui.row(
-                                    # Main output column
-                                    ui.column(
-                                        8,
-                                        ui.tags.div(
-                                            "PCA plot",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.output_ui("clustering_pca_plot_ui"),
-
-                                        ui.hr(),
-
-                                        ui.row(
-                                            ui.column(
-                                                8,
-                                                ui.tags.div(
-                                                    "PCA variance",
-                                                    class_="mask-section-title",
-                                                ),
-                                                ui.output_data_frame("clustering_pca_variance_preview"),
-                                            ),
-                                            ui.column(
-                                                4,
-                                                ui.tags.div(
-                                                    "Leiden cluster counts",
-                                                    class_="mask-section-title",
-                                                ),
-                                                ui.output_data_frame("clustering_leiden_counts_preview"),
-                                            ),
-                                        ),
-
-                                        class_="clustering-main-column",
-                                    ),
-
-                                    # Right control column
-                                    ui.column(
-                                        4,
-                                        ui.tags.div(
-                                            pca_controls_card(),
-                                            leiden_controls_card(),
-                                            embedding_display_controls_card(),
-                                            pca_loading_export_card(),
-                                            class_="clustering-control-column ms-auto",
-                                        ),
-                                    ),
-                                ),
-
-                                class_="compact-stack",
-                            ),
+                        ui.tags.p(
+                            "This is the full loaded master dataset. PINT will only "
+                            "add columns to this table; it should not delete or "
+                            "destructively subset columns.",
+                            class_="text-muted",
                         ),
 
-                        ui.nav_panel(
-                            "Annotation",
-                            ui.tags.div(
-                                ui.output_ui("clustering_annotation_summary"),
-
-                                ui.hr(),
-
-                                ui.row(
-                                    # Main output column
-                                    ui.column(
-                                        8,
-                                        ui.tags.div(
-                                            "Cluster annotations",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.output_data_frame("clustering_cluster_name_map_preview"),
-
-                                        ui.hr(),
-
-                                        ui.tags.div(
-                                            "PaCMAP embedding",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.tags.p(
-                                            "PaCMAP is calculated from PCA scores and colored by the current Leiden clusters.",
-                                            class_="text-muted",
-                                        ),
-
-                                        ui.output_ui("clustering_pacmap_plot_ui"),
-
-                                        ui.hr(),
-
-                                        ui.tags.div(
-                                            "Last exported heatmap matrix",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.tags.p(
-                                            "This table shows the most recently exported cluster × marker heatmap matrix.",
-                                            class_="text-muted",
-                                        ),
-
-                                        ui.output_data_frame("clustering_marker_summary_preview"),
-
-                                        class_="clustering-main-column",
-                                    ),
-
-                                    # Right control column
-                                    ui.column(
-                                        4,
-                                        ui.tags.div(
-                                            cluster_annotation_controls_card(),
-                                            pacmap_controls_card(),
-                                            pacmap_display_controls_card(),
-                                            heatmap_controls_card(),
-                                            annotation_export_controls_card(),
-                                            class_="clustering-control-column ms-auto",
-                                        ),
-                                    ),
-                                ),
-
-                                class_="compact-stack",
+                        ui.tags.div(
+                            ui.output_data_frame(
+                                "clustering_data_preview"
                             ),
+                            class_="clustering-current-dataset-preview",
                         ),
 
-                        ui.nav_panel(
-                            "Subclustering",
-                            ui.tags.div(
-                                ui.output_ui("subclustering_status_summary"),
-
-                                ui.hr(),
-
-                                ui.row(
-                                    # Main output column
-                                    ui.column(
-                                        8,
-                                        ui.tags.div(
-                                            "Sub-PCA plot",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.output_ui("subclustering_pca_plot_ui"),
-
-                                        ui.hr(),
-
-                                        ui.row(
-                                            ui.column(
-                                                8,
-                                                ui.tags.div(
-                                                    "Sub-PCA variance",
-                                                    class_="mask-section-title",
-                                                ),
-                                                ui.output_data_frame("subclustering_pca_variance_preview"),
-                                            ),
-                                            ui.column(
-                                                4,
-                                                ui.tags.div(
-                                                    "Sub-Leiden counts",
-                                                    class_="mask-section-title",
-                                                ),
-                                                ui.output_data_frame("subclustering_leiden_counts_preview"),
-                                            ),
-                                        ),
-
-                                        class_="clustering-main-column",
-                                    ),
-
-                                    # Right control column
-                                    ui.column(
-                                        4,
-                                        ui.tags.div(
-                                            subclustering_setup_card(),
-                                            subclustering_pca_controls_card(),
-                                            subclustering_leiden_controls_card(),
-                                            subclustering_embedding_display_controls_card(),
-                                            class_="clustering-control-column ms-auto",
-                                        ),
-                                    ),
-                                ),
-
-                                class_="compact-stack",
-                            ),
-                        ),
-
-                        ui.nav_panel(
-                            "Subcl. Annotation",
-                            ui.tags.div(
-                                ui.output_ui("subclustering_annotation_summary"),
-
-                                ui.hr(),
-
-                                ui.row(
-                                    # Main output column
-                                    ui.column(
-                                        8,
-                                        ui.tags.div(
-                                            "Subcluster annotations",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.output_data_frame("subcluster_name_map_preview"),
-
-                                        ui.hr(),
-
-                                        ui.tags.div(
-                                            "Sub-PaCMAP embedding",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.tags.p(
-                                            "Sub-PaCMAP is calculated from sub-PCA scores and colored by the current subcluster names.",
-                                            class_="text-muted",
-                                        ),
-
-                                        ui.output_ui("subclustering_pacmap_plot_ui"),
-
-                                        ui.hr(),
-
-                                        ui.tags.div(
-                                            "Last exported subcluster heatmap matrix",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.tags.p(
-                                            "This table shows the most recently exported subcluster × marker heatmap matrix.",
-                                            class_="text-muted",
-                                        ),
-
-                                        ui.output_data_frame("subclustering_marker_summary_preview"),
-
-                                        ui.hr(),
-
-                                        ui.tags.div(
-                                            "Preview of columns to push back",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.tags.div(
-                                            "Preview of columns to push back",
-                                            class_="mask-section-title",
-                                        ),
-
-                                        ui.tags.p(
-                                            "This preview shows how the subcluster annotations will be written back to the master dataset.",
-                                            class_="text-muted",
-                                        ),
-
-                                        ui.output_data_frame("subcluster_pushback_preview"),
-
-                                        class_="clustering-main-column",
-                                    ),
-
-                                    # Right control column
-                                    ui.column(
-                                        4,
-                                        ui.tags.div(
-                                            subcluster_annotation_controls_card(),
-                                            subclustering_pacmap_controls_card(),
-                                            subclustering_embedding_display_controls_card(),
-                                            subcluster_heatmap_controls_card(),
-                                            subcluster_pushback_card(),
-                                            class_="clustering-control-column ms-auto",
-                                        ),
-                                    ),
-                                ),
-
-                                class_="compact-stack",
-                            ),
-                        ),
-                        
-                        id="clustering_workspace_mode",
+                        class_="compact-stack",
                     ),
-
-                    class_="seg-preview-card",
                 ),
-
-                class_="viewer-main",
             ),
 
-            class_="pint-main-layout",
+            ui.nav_panel(
+                "Columns",
+
+                clustering_tab_layout(
+                    ##Left side
+                    column_selection_card(),
+                    column_bulk_selection_card(),
+                    column_regex_card(),
+                    ##Right side
+                    content=ui.tags.div(
+                        ui.output_ui(
+                            "clustering_column_map_summary"
+                        ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Column names",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "Source column names are immutable. "
+                            "Edit only the display names used by PINT.",
+                            class_="text-muted",
+                        ),
+
+                        ui.tags.p(
+                            "Edit names directly in the Display name column. Double click the name you want to change"
+                            "The original Source column is protected and cannot be changed.",
+                            class_="text-muted",
+                        ),
+
+                        ui.output_data_frame(
+                            "clustering_column_map_editor"
+                        ),
+
+                        class_="compact-stack",
+                    ),
+                ),
+            ),
+
+            ui.nav_panel(
+                "Clustering",
+
+                clustering_tab_layout(
+
+                    # --------------------------------------------------------
+                    # LEFT: PCA / Leiden controls
+                    # --------------------------------------------------------
+                    pca_controls_card(),
+                    leiden_controls_card(),
+                    embedding_display_controls_card(),
+                    pca_loading_export_card(),
+
+                    # --------------------------------------------------------
+                    # RIGHT: clustering results
+                    # --------------------------------------------------------
+                    content=ui.tags.div(
+                        ui.output_ui(
+                            "clustering_analysis_summary"
+                        ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "PCA plot",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.output_ui(
+                            "clustering_pca_plot_ui"
+                        ),
+
+                        ui.hr(),
+
+                        ui.row(
+                            ui.column(
+                                8,
+                                ui.tags.div(
+                                    "PCA variance",
+                                    class_="mask-section-title",
+                                ),
+                                ui.output_data_frame(
+                                    "clustering_pca_variance_preview"
+                                ),
+                            ),
+
+                            ui.column(
+                                4,
+                                ui.tags.div(
+                                    "Leiden cluster counts",
+                                    class_="mask-section-title",
+                                ),
+                                ui.output_data_frame(
+                                    "clustering_leiden_counts_preview"
+                                ),
+                            ),
+                        ),
+
+                        class_="compact-stack",
+                    ),
+                ),
+            ),
+
+            ui.nav_panel(
+                "Annotation",
+
+                clustering_tab_layout(
+                    ##Left side
+                    cluster_annotation_controls_card(),
+                    pacmap_controls_card(),
+                    pacmap_display_controls_card(),
+                    heatmap_controls_card(),
+                    annotation_export_controls_card(),
+                    content=ui.tags.div(
+                        ui.output_ui(
+                            "clustering_annotation_summary"
+                        ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Cluster annotations",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.output_data_frame(
+                            "clustering_cluster_name_map_preview"
+                        ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "PaCMAP embedding",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "PaCMAP is calculated from PCA scores and colored by the current Leiden clusters.",
+                            class_="text-muted",
+                        ),
+
+                        ui.output_ui(
+                            "clustering_pacmap_plot_ui"
+                        ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Last exported heatmap matrix",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "This table shows the most recently exported cluster × marker heatmap matrix.",
+                            class_="text-muted",
+                        ),
+
+                        ui.output_data_frame(
+                            "clustering_marker_summary_preview"
+                            ),
+
+                        class_="compact-stack",
+                    ),
+                ),
+            ),
+
+            ui.nav_panel(
+                "Subclustering",
+                
+                clustering_tab_layout(
+                    ##Left side
+                    subclustering_setup_card(),
+                    subclustering_pca_controls_card(),
+                    subclustering_leiden_controls_card(),
+                    subclustering_embedding_display_controls_card(),
+
+                    ##Right side
+                    content=ui.tags.div(
+                        ui.output_ui(
+                            "subclustering_status_summary"
+                            ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Sub-PCA plot",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.output_ui("subclustering_pca_plot_ui"),
+
+                        ui.hr(),
+
+                        ui.row(
+                            ui.column(
+                                8,
+                                ui.tags.div(
+                                    "Sub-PCA variance",
+                                    class_="mask-section-title",
+                                ),
+                                ui.output_data_frame(
+                                    "subclustering_pca_variance_preview"
+                                ),
+                            ),
+                            ui.column(
+                                4,
+                                ui.tags.div(
+                                    "Sub-Leiden counts",
+                                    class_="mask-section-title",
+                                ),
+                                ui.output_data_frame(
+                                    "subclustering_leiden_counts_preview"
+                                    ),
+                            ),
+                        ),
+
+                        class_="compact-stack",
+                    ),
+                ),
+            ),
+
+            ui.nav_panel(
+                "Subcl. Annotation",
+
+                clustering_tab_layout(
+                    #Left side
+                    subcluster_annotation_controls_card(),
+                    subclustering_pacmap_controls_card(),
+                    subclustering_embedding_display_controls_card(),
+                    subcluster_heatmap_controls_card(),
+                    subcluster_pushback_card(),
+                    #Right side
+                    content=ui.tags.div(
+                    
+                        ui.output_ui(
+                            "subclustering_annotation_summary"
+                            ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Subcluster annotations",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.output_data_frame("subcluster_name_map_preview"),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Sub-PaCMAP embedding",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "Sub-PaCMAP is calculated from sub-PCA scores and colored by the current subcluster names.",
+                            class_="text-muted",
+                        ),
+
+                        ui.output_ui("subclustering_pacmap_plot_ui"),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Last exported subcluster heatmap matrix",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "This table shows the most recently exported subcluster × marker heatmap matrix.",
+                            class_="text-muted",
+                        ),
+
+                        ui.output_data_frame("subclustering_marker_summary_preview"),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Preview of columns to push back",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "This preview shows how the subcluster annotations will be written back to the master dataset.",
+                            class_="text-muted",
+                        ),
+
+                        ui.output_data_frame(
+                            "subcluster_pushback_preview"
+                            ),
+
+                        class_="compact-stack",
+                    ),
+                ),
+            ),
+            
+            id="clustering_workspace_mode",
         ),
         value="clustering",
     )

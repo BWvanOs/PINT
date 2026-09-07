@@ -659,3 +659,31 @@ def prepare_clustering_feature_matrix(
         sourceCols,
         displayCols,
     )
+
+def set_clustering_columns_by_suffix(
+    column_map: pd.DataFrame,
+    suffix: str,
+    include: bool,
+) -> tuple[pd.DataFrame, int]:
+
+    updated = column_map.copy()
+
+    source_names = (
+        updated["ChannelNamesForClustering"]
+        .fillna("")
+        .astype(str)
+    )
+
+    mask = source_names.str.endswith(
+        suffix,
+        na=False,
+    )
+
+    n_matched = int(mask.sum())
+
+    updated.loc[
+        mask,
+        "IncludeForClustering",
+    ] = include
+
+    return updated, n_matched
