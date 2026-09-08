@@ -41,12 +41,7 @@ def main() -> None:
     parser.add_argument("--out-mask", required=True, help="Output label-mask TIFF.")
     parser.add_argument("--out-json", required=True, help="Output JSON summary.")
     parser.add_argument("--image-mpp", type=float, default=1.0, help="Microns per pixel. IMC often uses ~1.0.")
-    parser.add_argument(
-        "--compartment",
-        default="whole-cell",
-        choices=["whole-cell", "nuclear"],
-        help="Mesmer compartment output.",
-    )
+    parser.add_argument("--compartment", default="whole-cell", choices=["whole-cell", "nuclear"], help="Mesmer compartment output.",)
 
     args = parser.parse_args()
 

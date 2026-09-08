@@ -42,6 +42,19 @@ from pint_app.core.composites import (
     screen_blend_layer,
 )
 
+from pint_app.core.clustering_metadata import (
+    initialize_metadata_workspace,
+    merge_metadata_into_workspace,
+    add_empty_metadata_column,
+    validate_metadata_workspace_complete,
+    append_metadata_columns_to_master,
+)
+
+from pint_app.core.clustering_session import (
+    save_clustering_session,
+    load_clustering_session,
+)
+
 from pint_app.core.dialogs import (
     pick_folder_dialog,
     pick_open_csv_dialog,
@@ -49,8 +62,11 @@ from pint_app.core.dialogs import (
     pick_save_png_dialog,
     pick_save_tiff_dialog,
     pick_open_table_dialog,
-    pick_open_mcd_files_dialog
+    pick_open_mcd_files_dialog,
+    pick_save_pint_session_dialog,
+    pick_open_pint_session_dialog,
 )
+
 from pint_app.core.formatting import fmt1
 
 from pint_app.core.selection import cycle_list, order_by_canonical
@@ -247,8 +263,7 @@ def server(input, output, session):
     #       "obsm": PCA/UMAP/PaCMAP embeddings,
     #       "source": input source,
     #   }
-
-    # Path awaiting confirmation because loading it would replace the currently active master clustering dataset. Overwriting an existing dataset would suck...
+    # Path awaiting confirmation because loading it would replace the currently active master clustering dataset. Overwriting an existing dataset would suck... 
     pending_clustering_table_path = reactive.Value("")
     clustering_data = reactive.Value(pd.DataFrame())
     clustering_source = reactive.Value("")
@@ -256,6 +271,18 @@ def server(input, output, session):
     clustering_feature_columns = reactive.Value([])
     clustering_metadata_columns = reactive.Value([])
     clustering_excluded_columns = reactive.Value([])
+    ##Reactive effects for the addition of the metadata
+    # Persistent sample-level metadata workspace. The master clustering dataframe remains authoritative for cell rows and sample identifiers. This workspace owns only
+    # user-added metadata. User can, for now, only add new data, not remove old
+    clustering_metadata_workspace = reactive.Value(pd.DataFrame())
+    # Once initialized, the matching key cannot silently change. This is improtant if you want to add more metadata later
+    clustering_metadata_key = reactive.Value(None)
+
+    #Explicitly track metadata columns that have already been committed to clustering_data. Later metadata rounds only
+    #append newly added columns. This prevents duplicates
+    clustering_metadata_applied_columns = reactive.Value([])
+    clustering_metadata_status = reactive.Value("No metadata workspace initialized.")
+
     ##User defined column to input cluster parameters and names to plot
     clustering_column_map = reactive.Value(pd.DataFrame(columns=["ChannelNamesForClustering", "ChannelNameToDisplay","IncludeForClustering",]))
     clustering_column_map_editor_data = reactive.Value(pd.DataFrame())
@@ -1477,7 +1504,69 @@ def server(input, output, session):
             processedChannels[sampleName] = channelNames
 
         return processedImages, processedChannels
+
     
+    def _initialize_clustering_metadata_workspace():
+        """
+        Initialize the persistent metadata workspace from the currently
+        selected master-dataset key.
+
+        Once initialized, the key is stored independently and is treated
+        as immutable until the metadata workspace is explicitly reset.
+        """
+        currentWorkspace = (
+            clustering_metadata_workspace.get()
+        )
+
+        if (
+            currentWorkspace is not None
+            and not currentWorkspace.empty
+        ):
+            return currentWorkspace
+
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            raise ValueError(
+                "Load a clustering dataset before adding metadata."
+            )
+
+        keyCol = (
+            input.clustering_metadata_key_col()
+            or ""
+        )
+
+        if not keyCol:
+            raise ValueError(
+                "Select a metadata matching key first."
+            )
+
+        workspace = initialize_metadata_workspace(
+            df,
+            key_col=keyCol,
+        )
+
+        clustering_metadata_key.set(
+            keyCol
+        )
+
+        clustering_metadata_workspace.set(
+            workspace
+        )
+
+        clustering_metadata_applied_columns.set(
+            []
+        )
+
+        clustering_metadata_status.set(
+            f"Metadata workspace initialized using "
+            f"{keyCol!r}: {len(workspace):,} unique key values."
+        )
+
+        return workspace
+
+    
+
     def _make_default_clustering_column_map(df: pd.DataFrame) -> pd.DataFrame:
         """
         Build a default clustering column map from the currently loaded table.
@@ -6335,7 +6424,7 @@ def server(input, output, session):
             parts.append(ui.tags.div(f"Cell table: {cellPath}", class_="compact-small-line"))
 
         return ui.div(*parts)
-
+    
     def _load_clustering_table_from_path(
         table_path: str,
     ) -> None:
@@ -6401,6 +6490,24 @@ def server(input, output, session):
             clustering_data.set(df)
             clustering_source.set("file_path")
 
+            # A metadata workspace belongs to exactly one master dataset.
+            # Never carry its key or metadata into a replacement dataset.
+            clustering_metadata_workspace.set(
+                pd.DataFrame()
+            )
+
+            clustering_metadata_key.set(
+                None
+            )
+
+            clustering_metadata_applied_columns.set(
+                []
+            )
+
+            clustering_metadata_status.set(
+                "No metadata workspace initialized."
+            )
+
             # Build a complete mapping from the newly loaded dataset.
             # Original source names remain immutable.
             newMap = _make_default_clustering_column_map(
@@ -6454,6 +6561,548 @@ def server(input, output, session):
             f"✅ {msg}",
             flush=True,
         )
+
+    @reactive.Effect
+    @reactive.event(
+        input.save_clustering_session
+    )
+    def _save_clustering_session():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            ui.notification_show(
+                "No clustering dataset is loaded.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        initialDir = (
+            last_loaded_folder.get()
+            or os.getcwd()
+        )
+
+        savePath = (
+            pick_save_pint_session_dialog(
+                initialdir=initialDir,
+            )
+        )
+
+        if not savePath:
+            print(
+                "🛑 Clustering session save canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            state = {
+                # ------------------------------------------------------------
+                # Master dataset
+                # ------------------------------------------------------------
+                "clustering_data":
+                    clustering_data.get(),
+
+                "clustering_source":
+                    clustering_source.get(),
+
+                # ------------------------------------------------------------
+                # Column configuration
+                # ------------------------------------------------------------
+                "clustering_feature_columns":
+                    clustering_feature_columns.get(),
+
+                "clustering_metadata_columns":
+                    clustering_metadata_columns.get(),
+
+                "clustering_excluded_columns":
+                    clustering_excluded_columns.get(),
+
+                "clustering_column_map":
+                    clustering_column_map.get(),
+
+                "clustering_column_map_editor_data":
+                    clustering_column_map_editor_data.get(),
+
+                # ------------------------------------------------------------
+                # Metadata workspace
+                # ------------------------------------------------------------
+                "clustering_metadata_workspace":
+                    clustering_metadata_workspace.get(),
+
+                "clustering_metadata_key":
+                    clustering_metadata_key.get(),
+
+                "clustering_metadata_applied_columns":
+                    clustering_metadata_applied_columns.get(),
+
+                # ------------------------------------------------------------
+                # Main PCA
+                # ------------------------------------------------------------
+                "clustering_feature_source_columns":
+                    clustering_feature_source_columns.get(),
+
+                "clustering_feature_display_columns":
+                    clustering_feature_display_columns.get(),
+
+                "clustering_pca_scores":
+                    clustering_pca_scores.get(),
+
+                "clustering_pca_loadings":
+                    clustering_pca_loadings.get(),
+
+                "clustering_pca_variance":
+                    clustering_pca_variance.get(),
+
+                # ------------------------------------------------------------
+                # Main clustering / annotation
+                # ------------------------------------------------------------
+                "clustering_leiden_labels":
+                    clustering_leiden_labels.get(),
+
+                "clustering_cluster_name_map":
+                    clustering_cluster_name_map.get(),
+
+                "clustering_marker_summary":
+                    clustering_marker_summary.get(),
+
+                "clustering_pacmap_embedding":
+                    clustering_pacmap_embedding.get(),
+
+                # ------------------------------------------------------------
+                # Subclustering
+                # ------------------------------------------------------------
+                "subclustering_parent_cluster":
+                    subclustering_parent_cluster.get(),
+
+                "subclustering_output_column":
+                    subclustering_output_column.get(),
+
+                "subclustering_active_cell_ids":
+                    subclustering_active_cell_ids.get(),
+
+                "subclustering_feature_source_columns":
+                    subclustering_feature_source_columns.get(),
+
+                "subclustering_feature_display_columns":
+                    subclustering_feature_display_columns.get(),
+
+                "subclustering_pca_scores":
+                    subclustering_pca_scores.get(),
+
+                "subclustering_pca_loadings":
+                    subclustering_pca_loadings.get(),
+
+                "subclustering_pca_variance":
+                    subclustering_pca_variance.get(),
+
+                "subclustering_leiden_labels":
+                    subclustering_leiden_labels.get(),
+
+                "subclustering_pacmap_embedding":
+                    subclustering_pacmap_embedding.get(),
+
+                "subclustering_cluster_name_map":
+                    subclustering_cluster_name_map.get(),
+
+                "subclustering_marker_summary":
+                    subclustering_marker_summary.get(),
+
+                "subclustering_pushed_columns":
+                    subclustering_pushed_columns.get(),
+            }
+
+            save_clustering_session(
+                savePath,
+                state,
+            )
+
+            msg = (
+                f"Clustering session saved: "
+                f"{len(df):,} cells × "
+                f"{len(df.columns):,} columns."
+            )
+
+            clustering_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg} → {savePath}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Clustering session save failed: {e}"
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+    @reactive.Effect
+    @reactive.event(
+        input.load_clustering_session
+    )
+    def _load_clustering_session():
+        initialDir = (
+            last_loaded_folder.get()
+            or os.getcwd()
+        )
+
+        loadPath = (
+            pick_open_pint_session_dialog(
+                initialdir=initialDir,
+            )
+        )
+
+        if not loadPath:
+            print(
+                "🛑 Clustering session load canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            state = load_clustering_session(
+                loadPath
+            )
+
+            # ------------------------------------------------------------
+            # Master dataset
+            # ------------------------------------------------------------
+            clustering_data.set(
+                state.get(
+                    "clustering_data",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_source.set(
+                state.get(
+                    "clustering_source",
+                    "restored_session",
+                )
+            )
+
+            # ------------------------------------------------------------
+            # Column configuration
+            # ------------------------------------------------------------
+            clustering_feature_columns.set(
+                state.get(
+                    "clustering_feature_columns",
+                    [],
+                )
+            )
+
+            clustering_metadata_columns.set(
+                state.get(
+                    "clustering_metadata_columns",
+                    [],
+                )
+            )
+
+            clustering_excluded_columns.set(
+                state.get(
+                    "clustering_excluded_columns",
+                    [],
+                )
+            )
+
+            clustering_column_map.set(
+                state.get(
+                    "clustering_column_map",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_column_map_editor_data.set(
+                state.get(
+                    "clustering_column_map_editor_data",
+                    pd.DataFrame(),
+                )
+            )
+
+            # ------------------------------------------------------------
+            # Metadata
+            # ------------------------------------------------------------
+            clustering_metadata_workspace.set(
+                state.get(
+                    "clustering_metadata_workspace",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_metadata_key.set(
+                state.get(
+                    "clustering_metadata_key",
+                    None,
+                )
+            )
+
+            clustering_metadata_applied_columns.set(
+                state.get(
+                    "clustering_metadata_applied_columns",
+                    [],
+                )
+            )
+
+            # ------------------------------------------------------------
+            # PCA
+            # ------------------------------------------------------------
+            clustering_feature_source_columns.set(
+                state.get(
+                    "clustering_feature_source_columns",
+                    [],
+                )
+            )
+
+            clustering_feature_display_columns.set(
+                state.get(
+                    "clustering_feature_display_columns",
+                    [],
+                )
+            )
+
+            clustering_pca_scores.set(
+                state.get(
+                    "clustering_pca_scores",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_pca_loadings.set(
+                state.get(
+                    "clustering_pca_loadings",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_pca_variance.set(
+                state.get(
+                    "clustering_pca_variance",
+                    pd.DataFrame(),
+                )
+            )
+
+            # ------------------------------------------------------------
+            # Leiden / annotation / PaCMAP
+            # ------------------------------------------------------------
+            clustering_leiden_labels.set(
+                state.get(
+                    "clustering_leiden_labels",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_cluster_name_map.set(
+                state.get(
+                    "clustering_cluster_name_map",
+                    pd.DataFrame(
+                        columns=[
+                            "OldClusterName",
+                            "NewClusterName",
+                        ]
+                    ),
+                )
+            )
+
+            clustering_marker_summary.set(
+                state.get(
+                    "clustering_marker_summary",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_pacmap_embedding.set(
+                state.get(
+                    "clustering_pacmap_embedding",
+                    pd.DataFrame(),
+                )
+            )
+
+            # ------------------------------------------------------------
+            # Subclustering
+            # ------------------------------------------------------------
+            subclustering_parent_cluster.set(
+                state.get(
+                    "subclustering_parent_cluster",
+                    "",
+                )
+            )
+
+            subclustering_output_column.set(
+                state.get(
+                    "subclustering_output_column",
+                    "",
+                )
+            )
+
+            subclustering_active_cell_ids.set(
+                state.get(
+                    "subclustering_active_cell_ids",
+                    None,
+                )
+            )
+
+            subclustering_feature_source_columns.set(
+                state.get(
+                    "subclustering_feature_source_columns",
+                    [],
+                )
+            )
+
+            subclustering_feature_display_columns.set(
+                state.get(
+                    "subclustering_feature_display_columns",
+                    [],
+                )
+            )
+
+            subclustering_pca_scores.set(
+                state.get(
+                    "subclustering_pca_scores",
+                    pd.DataFrame(),
+                )
+            )
+
+            subclustering_pca_loadings.set(
+                state.get(
+                    "subclustering_pca_loadings",
+                    pd.DataFrame(),
+                )
+            )
+
+            subclustering_pca_variance.set(
+                state.get(
+                    "subclustering_pca_variance",
+                    pd.DataFrame(),
+                )
+            )
+
+            subclustering_leiden_labels.set(
+                state.get(
+                    "subclustering_leiden_labels",
+                    pd.DataFrame(),
+                )
+            )
+
+            subclustering_pacmap_embedding.set(
+                state.get(
+                    "subclustering_pacmap_embedding",
+                    pd.DataFrame(),
+                )
+            )
+
+            subclustering_cluster_name_map.set(
+                state.get(
+                    "subclustering_cluster_name_map",
+                    pd.DataFrame(
+                        columns=[
+                            "OldClusterName",
+                            "NewClusterName",
+                        ]
+                    ),
+                )
+            )
+
+            subclustering_marker_summary.set(
+                state.get(
+                    "subclustering_marker_summary",
+                    pd.DataFrame(),
+                )
+            )
+
+            subclustering_pushed_columns.set(
+                state.get(
+                    "subclustering_pushed_columns",
+                    [],
+                )
+            )
+
+            # Intermediate matrices are intentionally not persisted.
+            clustering_feature_matrix.set(
+                None
+            )
+
+            subclustering_feature_matrix.set(
+                None
+            )
+
+            df = clustering_data.get()
+
+            msg = (
+                f"Clustering session restored: "
+                f"{len(df):,} cells × "
+                f"{len(df.columns):,} columns."
+            )
+
+            clustering_status.set(
+                msg
+            )
+
+            clustering_analysis_status.set(
+                "Clustering analysis restored from session."
+            )
+
+            clustering_annotation_status.set(
+                "Clustering annotations restored from session."
+            )
+
+            clustering_metadata_status.set(
+                "Metadata workspace restored from session."
+            )
+
+            subclustering_status.set(
+                "Subclustering state restored from session."
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=8,
+            )
+
+            print(
+                f"✅ {msg} ← {loadPath}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Clustering session load failed: {e}"
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=12,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
 
     @reactive.Effect
     @reactive.event(input.load_clustering_table)
@@ -6619,6 +7268,741 @@ def server(input, output, session):
             filters=True,
             height="750px",
             width="fit-content",
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.initialize_manual_metadata
+    )
+    def _initialize_manual_clustering_metadata():
+        try:
+            workspace = (
+                _initialize_clustering_metadata_workspace()
+            )
+
+            keyCol = (
+                clustering_metadata_key.get()
+            )
+
+            clustering_metadata_status.set(
+                f"Manual metadata workspace ready: "
+                f"{len(workspace):,} unique "
+                f"{keyCol} values."
+            )
+
+            ui.notification_show(
+                "Metadata workspace ready.",
+                type="message",
+                duration=4,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = str(e).strip() or (
+                f"Unexpected metadata error: {type(e).__name__}"
+            )
+
+            clustering_metadata_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=8,
+            )
+
+            print(
+                f"❌ Metadata workspace initialization failed: "
+                f"{type(e).__name__}: {e!r}",
+                flush=True,
+            )
+
+
+    @reactive.Effect
+    @reactive.event(
+        input.add_manual_metadata_column
+    )
+    def _add_manual_clustering_metadata_column():
+        try:
+            workspace = (
+                _initialize_clustering_metadata_workspace()
+            )
+
+            keyCol = (
+                clustering_metadata_key.get()
+            )
+
+            df = clustering_data.get()
+
+            newColumn = (
+                input.new_clustering_metadata_column()
+                or ""
+            )
+
+            updatedWorkspace = (
+                add_empty_metadata_column(
+                    workspace,
+                    key_col=keyCol,
+                    column_name=newColumn,
+                    master_columns=list(
+                        df.columns
+                    ),
+                )
+            )
+
+            clustering_metadata_workspace.set(
+                updatedWorkspace
+            )
+
+            ui.update_text(
+                "new_clustering_metadata_column",
+                value="",
+                session=session,
+            )
+
+            clustering_metadata_status.set(
+                f"Added metadata column "
+                f"{newColumn.strip()!r}."
+            )
+
+        except Exception as e:
+            ui.notification_show(
+                str(e),
+                type="error",
+                duration=8,
+            )
+
+    @output
+    @render.data_frame
+    def clustering_metadata_editor():
+        workspace = (
+            clustering_metadata_workspace.get()
+        )
+
+        if (
+            workspace is None
+            or workspace.empty
+        ):
+            return render.DataGrid(
+                pd.DataFrame(),
+                editable=False,
+                height="500px",
+            )
+
+        return render.DataGrid(
+            workspace,
+            editable=True,
+            filters=False,
+            height="650px",
+            width="fit-content",
+        )
+
+    @clustering_metadata_editor.set_patch_fn
+    def _edit_clustering_metadata(
+        *,
+        patch: render.CellPatch,
+    ):
+        rowIndex = int(
+            patch["row_index"]
+        )
+
+        colIndex = int(
+            patch["column_index"]
+        )
+
+        newValue = patch["value"]
+
+        workspace = (
+            clustering_metadata_workspace.get()
+            .copy()
+        )
+
+        if workspace.empty:
+            return newValue
+
+        keyCol = (
+            clustering_metadata_key.get()
+        )
+
+        # Column 0 is always the canonical PINT matching key.
+        # It belongs to the master dataset and cannot be edited here.
+        if (
+            colIndex == 0
+            or workspace.columns[colIndex] == keyCol
+        ):
+            ui.notification_show(
+                "The metadata matching key cannot be edited.",
+                type="warning",
+                duration=4,
+            )
+
+            return workspace.iloc[
+                rowIndex,
+                colIndex,
+            ]
+
+        # Empty values are allowed while the user is still editing.
+        # The full workspace is validated before committing to
+        # the master dataset.
+        workspace.iat[
+            rowIndex,
+            colIndex,
+        ] = newValue
+
+        clustering_metadata_workspace.set(
+            workspace
+        )
+
+        return newValue
+
+    @reactive.Effect
+    @reactive.event(
+        input.load_clustering_metadata_csv
+    )
+    def _load_clustering_metadata_csv():
+        try:
+            df = clustering_data.get()
+
+            if df is None or df.empty:
+                raise ValueError(
+                    "Load a clustering dataset first."
+                )
+
+            workspace = (
+                _initialize_clustering_metadata_workspace()
+            )
+
+            keyCol = (
+                clustering_metadata_key.get()
+            )
+
+            folder = (
+                last_loaded_folder.get()
+                or (input.path() or "").strip()
+            )
+
+            initdir = (
+                folder
+                if folder and os.path.isdir(folder)
+                else os.getcwd()
+            )
+
+            csvPath = pick_open_csv_dialog(
+                title="Select metadata CSV",
+                initialdir=initdir,
+            )
+
+            if not csvPath:
+                return
+
+            incomingDf = pd.read_csv(
+                csvPath
+            )
+
+            updatedWorkspace = (
+                merge_metadata_into_workspace(
+                    workspace,
+                    incomingDf,
+                    key_col=keyCol,
+                    master_columns=list(
+                        df.columns
+                    ),
+                )
+            )
+
+            clustering_metadata_workspace.set(
+                updatedWorkspace
+            )
+
+            addedCols = [
+                c
+                for c in incomingDf.columns[1:]
+            ]
+
+            clustering_metadata_status.set(
+                f"Loaded metadata from "
+                f"{Path(csvPath).name}: "
+                f"{len(addedCols)} new column(s)."
+            )
+
+            ui.notification_show(
+                f"Added {len(addedCols)} metadata column(s) "
+                "to the workspace.",
+                type="message",
+                duration=5,
+            )
+
+        except Exception as e:
+            clustering_metadata_status.set(
+                f"Metadata import failed: {e}"
+            )
+
+            ui.notification_show(
+                f"Metadata import failed: {e}",
+                type="error",
+                duration=12,
+            )
+
+            print(
+                f"❌ Metadata import failed: {e}",
+                flush=True,
+            )
+
+    @output
+    @render.ui
+    def clustering_metadata_key_control():
+        """
+        Show the column used to match metadata rows to the master dataset.
+
+        Before the metadata workspace is initialized, the user may choose
+        any column from the current master dataset.
+
+        After initialization, the key is locked because all existing and
+        future metadata in this workspace depends on that identifier.
+        """
+        df = clustering_data.get()
+        lockedKey = clustering_metadata_key.get()
+
+        if df is None or df.empty:
+            return ui.tags.small(
+                "Load a clustering dataset first.",
+                class_="text-muted",
+            )
+
+        # Once metadata exists, do not expose an editable selector anymore.
+        if lockedKey:
+            return ui.tags.div(
+                ui.tags.label(
+                    "Metadata matching key",
+                    class_="form-label",
+                ),
+                ui.tags.div(
+                    str(lockedKey),
+                    class_="form-control bg-light",
+                    style="cursor: default;",
+                ),
+            )
+
+        columnNames = list(df.columns)
+
+        if not columnNames:
+            return ui.tags.small(
+                "The current dataset does not contain any columns.",
+                class_="text-muted",
+            )
+
+        # Helpful default only. The user can still explicitly choose another key.
+        defaultKey = next(
+            (
+                columnName
+                for columnName in [
+                    "SampleName",
+                    "ROIName",
+                    "CellMaskName",
+                    "SampleNumber",
+                    "ImageNumber",
+                ]
+                if columnName in columnNames
+            ),
+            columnNames[0],
+        )
+
+        return ui.input_select(
+            "clustering_metadata_key_col",
+            "Metadata matching key",
+            choices=columnNames,
+            selected=defaultKey,
+            width="100%",
+        )
+
+    @output
+    @render.ui
+    def clustering_metadata_summary():
+        workspace = (
+            clustering_metadata_workspace.get()
+        )
+
+        keyCol = (
+            clustering_metadata_key.get()
+        )
+
+        appliedCols = (
+            clustering_metadata_applied_columns.get()
+            or []
+        )
+
+        status = (
+            clustering_metadata_status.get()
+        )
+
+        if (
+            workspace is None
+            or workspace.empty
+        ):
+            return ui.tags.small(
+                status,
+                class_="text-muted",
+            )
+
+        metadataCols = [
+            c
+            for c in workspace.columns
+            if c != keyCol
+        ]
+
+        pendingCols = [
+            c
+            for c in metadataCols
+            if c not in appliedCols
+        ]
+
+        return ui.div(
+            ui.tags.div(
+                f"Matching key: {keyCol}",
+                class_="compact-small-line",
+            ),
+
+            ui.tags.div(
+                f"Unique metadata rows: "
+                f"{len(workspace):,}",
+                class_="compact-small-line",
+            ),
+
+            ui.tags.div(
+                f"Metadata columns: "
+                f"{len(metadataCols):,}",
+                class_="compact-small-line",
+            ),
+
+            ui.tags.div(
+                f"Already added to dataset: "
+                f"{len(appliedCols):,}",
+                class_="compact-small-line",
+            ),
+
+            ui.tags.div(
+                f"Pending addition: "
+                f"{len(pendingCols):,}",
+                class_="compact-small-line",
+            ),
+
+            ui.tags.small(
+                status,
+                class_="text-muted",
+            ),
+        )
+    
+    @reactive.Effect
+    @reactive.event(
+        input.commit_clustering_metadata
+    )
+    def _commit_clustering_metadata():
+        try:
+            df = clustering_data.get()
+
+            workspace = (
+                clustering_metadata_workspace.get()
+            )
+
+            keyCol = (
+                clustering_metadata_key.get()
+            )
+
+            appliedCols = list(
+                clustering_metadata_applied_columns.get()
+                or []
+            )
+
+            if df is None or df.empty:
+                raise ValueError(
+                    "No clustering dataset is loaded."
+                )
+
+            if (
+                workspace is None
+                or workspace.empty
+            ):
+                raise ValueError(
+                    "Metadata workspace is empty."
+                )
+
+            if not keyCol:
+                raise ValueError(
+                    "Metadata matching key has not been initialized."
+                )
+
+            # Every metadata cell must be complete before ANY new
+            # columns are added to the master dataset.
+            validate_metadata_workspace_complete(
+                workspace,
+                key_col=keyCol,
+            )
+
+            metadataCols = [
+                c
+                for c in workspace.columns
+                if c != keyCol
+            ]
+
+            newCols = [
+                c
+                for c in metadataCols
+                if c not in appliedCols
+            ]
+
+            if not newCols:
+                ui.notification_show(
+                    "All metadata columns are already present "
+                    "in the master dataset.",
+                    type="message",
+                    duration=5,
+                )
+                return
+
+            updatedDf = (
+                append_metadata_columns_to_master(
+                    df,
+                    workspace,
+                    key_col=keyCol,
+                    id_col=PINT_CELL_ID_COL,
+                    columns_to_add=newCols,
+                )
+            )
+
+            clustering_data.set(
+                updatedDf
+            )
+
+            clustering_metadata_applied_columns.set(
+                appliedCols + newCols
+            )
+
+            #
+            # IMPORTANT:
+            # Extend the existing column map instead of rebuilding it.
+            #
+            # Rebuilding would destroy any display-name edits or
+            # IncludeForClustering selections the user has already made.
+            #
+            currentMap = (
+                clustering_column_map.get()
+                .copy()
+            )
+
+            existingMappedCols = set(
+                currentMap[
+                    "ChannelNamesForClustering"
+                ].astype(str)
+            )
+
+            rowsToAdd = []
+
+            for col in newCols:
+                if col in existingMappedCols:
+                    continue
+
+                rowsToAdd.append(
+                    {
+                        "ChannelNamesForClustering": col,
+                        "ChannelNameToDisplay": col,
+
+                        # Metadata should NEVER enter PCA/clustering
+                        # accidentally.
+                        "IncludeForClustering": False,
+                    }
+                )
+
+            if rowsToAdd:
+                addedMapDf = pd.DataFrame(
+                    rowsToAdd
+                )
+
+                updatedMap = pd.concat(
+                    [
+                        currentMap,
+                        addedMapDf,
+                    ],
+                    ignore_index=True,
+                )
+
+                clustering_column_map.set(
+                    updatedMap
+                )
+
+                clustering_column_map_editor_data.set(
+                    updatedMap.copy()
+                )
+
+            clustering_metadata_status.set(
+                "Added metadata column(s) to master dataset: "
+                + ", ".join(newCols)
+            )
+
+            ui.notification_show(
+                f"Added {len(newCols)} metadata column(s) "
+                "to the master dataset.",
+                type="message",
+                duration=6,
+            )
+
+            print(
+                "✅ Added metadata to clustering dataset: "
+                + ", ".join(newCols),
+                flush=True,
+            )
+
+        except Exception as e:
+            clustering_metadata_status.set(
+                f"Could not add metadata: {e}"
+            )
+
+            ui.notification_show(
+                f"Could not add metadata: {e}",
+                type="error",
+                duration=12,
+            )
+
+            print(
+                f"❌ Could not add metadata: {e}",
+                flush=True,
+            )
+
+    @output
+    @render.ui
+    def clustering_metadata_commit_summary():
+        workspace = (
+            clustering_metadata_workspace.get()
+        )
+
+        keyCol = (
+            clustering_metadata_key.get()
+        )
+
+        appliedCols = (
+            clustering_metadata_applied_columns.get()
+            or []
+        )
+
+        if (
+            workspace is None
+            or workspace.empty
+            or not keyCol
+        ):
+            return ui.tags.small(
+                "No metadata ready to add.",
+                class_="text-muted",
+            )
+
+        metadataCols = [
+            c
+            for c in workspace.columns
+            if c != keyCol
+        ]
+
+        pending = [
+            c
+            for c in metadataCols
+            if c not in appliedCols
+        ]
+
+        if not pending:
+            return ui.tags.small(
+                "All workspace metadata columns have been added "
+                "to the master dataset.",
+                class_="text-muted",
+            )
+
+        return ui.tags.small(
+            "Pending: "
+            + ", ".join(pending),
+            class_="text-muted",
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.reset_clustering_metadata
+    )
+    def _request_reset_clustering_metadata():
+        workspace = (
+            clustering_metadata_workspace.get()
+        )
+
+        if (
+            workspace is None
+            or workspace.empty
+        ):
+            return
+
+        ui.modal_show(
+            ui.modal(
+                ui.tags.p(
+                    "Reset the metadata workspace?"
+                ),
+
+                ui.tags.p(
+                    "This clears the metadata workspace and unlocks "
+                    "the matching-key selector.",
+                    class_="text-danger",
+                ),
+
+                ui.tags.p(
+                    "Metadata columns already added to the master dataset "
+                    "will NOT be removed.",
+                    class_="text-muted",
+                ),
+
+                footer=ui.tags.div(
+                    ui.input_action_button(
+                        "cancel_reset_clustering_metadata",
+                        "Cancel",
+                        class_="btn btn-secondary",
+                    ),
+
+                    ui.input_action_button(
+                        "confirm_reset_clustering_metadata",
+                        "Reset metadata workspace",
+                        class_="btn btn-danger ms-2",
+                    ),
+                ),
+
+                title="Reset metadata workspace?",
+                easy_close=False,
+            )
+        )
+
+
+    @reactive.Effect
+    @reactive.event(
+        input.cancel_reset_clustering_metadata
+    )
+    def _cancel_reset_clustering_metadata():
+        ui.modal_remove()
+
+
+    @reactive.Effect
+    @reactive.event(
+        input.confirm_reset_clustering_metadata
+    )
+    def _confirm_reset_clustering_metadata():
+        ui.modal_remove()
+
+        clustering_metadata_workspace.set(
+            pd.DataFrame()
+        )
+
+        clustering_metadata_key.set(
+            None
+        )
+
+        clustering_metadata_applied_columns.set(
+            []
+        )
+
+        clustering_metadata_status.set(
+            "Metadata workspace reset."
         )
 
     @clustering_column_map_editor.set_patch_fn
@@ -8248,59 +9632,6 @@ def server(input, output, session):
             msg = f"PaCMAP figure export failed: {e}"
             clustering_annotation_status.set(msg)
             print(f"❌ {msg}", flush=True)
-
-    @reactive.Effect
-    @reactive.event(input.export_annotation_csv)
-    def _export_annotation_csv():
-        try:
-            outDf = _build_full_annotation_export_table()
-
-            outDir = pick_folder_dialog()
-
-            if not outDir:
-                print("🛑 Annotation CSV export canceled.")
-                return
-
-            outDir = Path(outDir)
-            outDir.mkdir(parents=True, exist_ok=True)
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            csvPath = outDir / f"PINT_clustering_annotation_export_{timestamp}.csv"
-
-            outDf.to_csv(csvPath, index=False)
-
-            msg = (
-                f"Exported annotation CSV to: {csvPath}. "
-                f"Rows: {len(outDf):,}; columns: {len(outDf.columns):,}."
-            )
-
-            colorMap = active_annotation_cluster_color_map()
-
-            if colorMap:
-                colorDf = pd.DataFrame(
-                    {
-                        "PINT_ClusterName": list(colorMap.keys()),
-                        "Color": list(colorMap.values()),
-                    }
-                )
-
-                colorPath = outDir / f"PINT_cluster_color_map_{timestamp}.csv"
-                colorDf.to_csv(colorPath, index=False)
-
-                msg += f" Color map: {colorPath}."
-
-            clustering_annotation_status.set(msg)
-            print(f"✅ {msg}", flush=True)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-
-            msg = f"Annotation CSV export failed: {e}"
-            clustering_annotation_status.set(msg)
-            print(f"❌ {msg}", flush=True)
-
 
     @output
     @render.data_frame
@@ -10018,6 +11349,14 @@ def server(input, output, session):
         # This avoids duplicating a potentially large segmentation quantification table.
         clustering_data.set(cellDf)
         clustering_source.set("segmentation_quantification")
+
+        # Mesmer quantification replaces the current master clustering dataset.
+        # Metadata belonging to the previous dataset must not be carried across.
+        # So loading a new dataset will erase the old data, which it should
+        clustering_metadata_workspace.set(pd.DataFrame())
+        clustering_metadata_key.set(None)
+        clustering_metadata_applied_columns.set([])
+        clustering_metadata_status.set("No metadata workspace initialized.")
         #push into newMap
         newMap = _make_default_clustering_column_map(cellDf)
         ##Push NewMap into both the reactive object that are loaded into curernt Dataset and Columns tabs
@@ -11679,7 +13018,21 @@ def server(input, output, session):
             else:
                 raise ValueError(f"Unknown Cell ID method: {method}")
 
+            # Add/update PINT_Cell_ID and keep it as the first column. 
+            # Should also work ig the column exists already
             df_new[PINT_CELL_ID_COL] = ids.astype(str)
+
+            orderedCols = [
+                PINT_CELL_ID_COL
+            ] + [
+                col
+                for col in df_new.columns
+                if col != PINT_CELL_ID_COL
+            ]
+
+            df_new = df_new[
+                orderedCols
+            ]
 
             ok, msg = _validate_pint_cell_id_column(df_new)
 
@@ -11698,6 +13051,87 @@ def server(input, output, session):
             msg = f"Could not create PINT_Cell_ID: {e}"
             clustering_status.set(msg)
             print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(
+        input.export_current_clustering_dataset
+    )
+    def _export_current_clustering_dataset():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            ui.notification_show(
+                "No clustering dataset is loaded.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        folder = (
+            last_loaded_folder.get()
+            or (input.path() or "").strip()
+        )
+
+        initdir = (
+            folder
+            if folder and os.path.isdir(folder)
+            else os.getcwd()
+        )
+
+        savePath = pick_save_csv_dialog(
+            initialdir=initdir,
+            initialfile="PINT_current_dataset.csv",
+        )
+
+        if not savePath:
+            print(
+                "🛑 Current dataset export canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            # Export the authoritative master table exactly as it currently exists.
+            df.to_csv(
+                savePath,
+                index=False,
+            )
+
+            msg = (
+                f"Exported current dataset: "
+                f"{len(df):,} rows × "
+                f"{len(df.columns):,} columns."
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg} → {savePath}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Current dataset export failed: {e}"
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
 
     @output
     @render.ui

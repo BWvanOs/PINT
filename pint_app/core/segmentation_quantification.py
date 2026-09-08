@@ -92,8 +92,6 @@ def quantify_mask_intensities(
             "Location_Center_X": float(xs.mean()),
             "Location_Center_Y": float(ys.mean()),
             "Area": area,
-            "Cluster": "Unclustered",
-            "Condition": "Unassigned",
         }
 
         for channel_name, flat_img in zip(channel_names, flat_channels):

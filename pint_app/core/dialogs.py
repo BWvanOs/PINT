@@ -607,3 +607,221 @@ def pick_open_mcd_files_dialog(
             file=sys.stderr,
         )
         return []
+
+def pick_save_pint_session_dialog(
+    title: str = "Save PINT clustering session",
+    initialdir: str | None = None,
+    initialfile: str = "PINT_clustering_session.pintsession",
+) -> str:
+    """
+    Open a save-as dialog for a PINT clustering session.
+    """
+    if _is_linux() and _zenity_available():
+        try:
+            start = initialdir or os.getcwd()
+            suggested = os.path.join(
+                start,
+                initialfile,
+            )
+
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                "--title",
+                title,
+                "--filename",
+                suggested,
+                "--file-filter=PINT session files | *.pintsession",
+                "--file-filter=All files | *",
+            ]
+
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+            )
+
+            out = (
+                res.stdout.strip()
+                if res.returncode == 0
+                else ""
+            )
+
+            if (
+                out
+                and not out.lower().endswith(
+                    ".pintsession"
+                )
+            ):
+                out += ".pintsession"
+
+            return out
+
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            dpi = root.winfo_fpixels("1i")
+            scale = max(
+                1.0,
+                float(dpi) / 96.0,
+            )
+            root.tk.call(
+                "tk",
+                "scaling",
+                scale,
+            )
+        except Exception:
+            pass
+
+        try:
+            root.wm_attributes(
+                "-topmost",
+                1,
+            )
+        except Exception:
+            pass
+
+        path = filedialog.asksaveasfilename(
+            title=title,
+            initialdir=(
+                initialdir
+                or os.getcwd()
+            ),
+            initialfile=initialfile,
+            defaultextension=".pintsession",
+            filetypes=[
+                (
+                    "PINT session files",
+                    "*.pintsession",
+                ),
+                (
+                    "All files",
+                    "*.*",
+                ),
+            ],
+        )
+
+        root.destroy()
+
+        return path or ""
+
+    except Exception:
+        print(
+            "[file dialog] PINT session save picker failed",
+            file=sys.stderr,
+        )
+        return ""
+
+
+def pick_open_pint_session_dialog(
+    title: str = "Open PINT clustering session",
+    initialdir: str | None = None,
+) -> str:
+    """
+    Open a PINT clustering session.
+    """
+    if _is_linux() and _zenity_available():
+        try:
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--title",
+                title,
+            ]
+
+            if initialdir:
+                cmd += [
+                    "--filename",
+                    os.path.join(
+                        initialdir,
+                        "",
+                    ),
+                ]
+
+            cmd += [
+                "--file-filter=PINT session files | *.pintsession",
+                "--file-filter=All files | *",
+            ]
+
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+            )
+
+            return (
+                res.stdout.strip()
+                if res.returncode == 0
+                else ""
+            )
+
+        except Exception:
+            pass
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            dpi = root.winfo_fpixels("1i")
+            scale = max(
+                1.0,
+                float(dpi) / 96.0,
+            )
+            root.tk.call(
+                "tk",
+                "scaling",
+                scale,
+            )
+        except Exception:
+            pass
+
+        try:
+            root.wm_attributes(
+                "-topmost",
+                1,
+            )
+        except Exception:
+            pass
+
+        path = filedialog.askopenfilename(
+            title=title,
+            initialdir=(
+                initialdir
+                or os.getcwd()
+            ),
+            filetypes=[
+                (
+                    "PINT session files",
+                    "*.pintsession",
+                ),
+                (
+                    "All files",
+                    "*.*",
+                ),
+            ],
+        )
+
+        root.destroy()
+
+        return path or ""
+
+    except Exception:
+        print(
+            "[file dialog] PINT session open picker failed",
+            file=sys.stderr,
+        )
+        return ""

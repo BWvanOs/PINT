@@ -10,6 +10,46 @@ VIRIDIS_CHOICES = {
     "turbo": "turbo",
 }
 
+def clustering_session_card():
+    return ui.card(
+        ui.card_header(
+            "Clustering session"
+        ),
+
+        ui.tags.p(
+            "Save the current clustering workspace so expensive "
+            "PCA, Leiden, PaCMAP, metadata, and annotation work "
+            "can be restored later.",
+            class_="text-muted",
+        ),
+
+        ui.input_action_button(
+            "save_clustering_session",
+            "Save clustering session",
+            class_=(
+                "btn btn-primary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.input_action_button(
+            "load_clustering_session",
+            "Load clustering session",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.tags.small(
+            "Only load PINT session files that you created yourself "
+            "or obtained from a trusted source.",
+            class_="text-muted",
+        ),
+
+        class_="mb-2",
+    )
+
 
 def input_data_card():
     return ui.card(
@@ -86,6 +126,133 @@ def cell_identity_card():
         ),
 
         ui.output_ui("clustering_cell_id_summary"),
+
+        class_="mb-2",
+    )
+
+def export_data_card():
+    return ui.card(
+        ui.card_header("Cell identity"),
+
+        ui.tags.p(
+            "Export the loaded masterdataset exactly as is currently shown "
+            "If Leiden clustering, pacmap etc have not been run, it doesn't get exported.",
+            class_="text-muted",
+        ),
+
+        ui.input_action_button(
+            "export_current_clustering_dataset",
+            "Export current dataset",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        class_="mb-2",
+    )
+
+def metadata_source_card():
+    return ui.card(
+        ui.card_header(
+            "Metadata"
+        ),
+
+        ui.tags.p(
+            "Add sample-level metadata to the master clustering dataset. "
+            "PINT matches metadata using one selected key column.",
+            class_="text-muted",
+        ),
+
+        ui.output_ui(
+            "clustering_metadata_key_control"
+        ),
+
+        ui.tags.small(
+            "The matching key becomes locked after the metadata workspace "
+            "is initialized. PINT does not automatically repair or fuzzy-match "
+            "sample identifiers.",
+            class_="text-muted",
+        ),
+
+        ui.hr(),
+
+        ui.input_action_button(
+            "load_clustering_metadata_csv",
+            "Load Metadata CSV",
+            class_=(
+                "btn btn-primary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.input_action_button(
+            "initialize_manual_metadata",
+            "Manually add metadata",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.hr(),
+
+        ui.input_text(
+            "new_clustering_metadata_column",
+            "New metadata column",
+            value="",
+            placeholder="For example: Condition",
+        ),
+
+        ui.input_action_button(
+            "add_manual_metadata_column",
+            "Add metadata column",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        class_="mb-2",
+    )
+
+
+def metadata_commit_card():
+    return ui.card(
+        ui.card_header(
+            "Add metadata to dataset"
+        ),
+
+        ui.tags.p(
+            "Metadata remains in this workspace between additions. "
+            "Only metadata columns that have not previously been added "
+            "will be appended to the master dataset.",
+            class_="text-muted",
+        ),
+
+        ui.input_action_button(
+            "commit_clustering_metadata",
+            "Add metadata columns to dataset",
+            class_=(
+                "btn btn-primary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.output_ui(
+            "clustering_metadata_commit_summary"
+        ),
+
+        ui.hr(),
+
+        ui.input_action_button(
+            "reset_clustering_metadata",
+            "Reset metadata workspace",
+            class_=(
+                "btn btn-outline-danger "
+                "compact-action-button"
+            ),
+        ),
 
         class_="mb-2",
     )
@@ -423,7 +590,7 @@ def leiden_controls_card():
                 4,
                 ui.input_numeric(
                     "clustering_leiden_n_dims",
-                    "Number of PC's (dimensions) to use",
+                    "Number of PC's to use",
                     value=10,
                     min=2,
                     step=1,
@@ -813,12 +980,6 @@ def annotation_export_controls_card():
         ui.input_action_button(
             "export_pacmap_figure",
             "Export PaCMAP PNG + SVG",
-            class_="btn btn-secondary compact-action-button mb-2",
-        ),
-
-        ui.input_action_button(
-            "export_annotation_csv",
-            "Export annotation CSV",
             class_="btn btn-secondary compact-action-button mb-2",
         ),
 
@@ -1275,11 +1436,29 @@ def clustering_tab_layout(
         class_="clustering-tab-layout",
     )
 
+
 def clustering_panel():
     return ui.nav_panel(
         "Clustering",
 
         ui.navset_tab(
+
+            ui.nav_panel(
+                "Session",
+
+                clustering_tab_layout(
+                    clustering_session_card(),
+
+                    content=ui.tags.div(
+                        ui.output_ui(
+                            "clustering_session_summary"
+                        ),
+
+                        class_="compact-stack",
+                    ),
+                ),
+            ),
+
             ui.nav_panel(
                 "Current dataset",
 
@@ -1290,6 +1469,7 @@ def clustering_panel():
                     # --------------------------------------------------------
                     input_data_card(),
                     cell_identity_card(),
+                    export_data_card(),
 
                     # --------------------------------------------------------
                     # RIGHT: resulting dataset previews
@@ -1316,6 +1496,42 @@ def clustering_panel():
                                 "clustering_data_preview"
                             ),
                             class_="clustering-current-dataset-preview",
+                        ),
+
+                        class_="compact-stack",
+                    ),
+                ),
+            ),
+
+            ui.nav_panel(
+                "Metadata",
+
+                clustering_tab_layout(
+                    # LEFT
+                    metadata_source_card(),
+                    metadata_commit_card(),
+
+                    # RIGHT
+                    content=ui.tags.div(
+                        ui.output_ui(
+                            "clustering_metadata_summary"
+                        ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Metadata workspace",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "The matching-key column is protected. "
+                            "Metadata values can be edited directly in the table.",
+                            class_="text-muted",
+                        ),
+
+                        ui.output_data_frame(
+                            "clustering_metadata_editor"
                         ),
 
                         class_="compact-stack",
