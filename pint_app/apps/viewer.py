@@ -28,6 +28,10 @@ from tifffile import imwrite, imread
 ##Internal import from /core
 from pint_app.core.load_tiffs import load_tiffs_raw
 
+from pint_app.core.clustering_DEG import (
+    find_all_cluster_markers,
+)
+
 from pint_app.core.clustering_helpers import (
     prepare_clustering_feature_matrix,
     run_pca,
@@ -298,6 +302,8 @@ def server(input, output, session):
     clustering_leiden_labels = reactive.Value(pd.DataFrame())
     clustering_marker_summary = reactive.Value(pd.DataFrame())
     clustering_pacmap_embedding = reactive.Value(pd.DataFrame())
+    clustering_deg_results = reactive.Value(pd.DataFrame())
+    clustering_deg_status = reactive.Value("No cluster marker analysis run yet.")
     clustering_annotation_status = reactive.Value("No annotation visualizations generated yet.")
     # Future subclustering hook.
     # For now None means use all cells.
@@ -2859,6 +2865,12 @@ def server(input, output, session):
 
 
     def _get_main_cluster_choices_for_subclustering() -> dict[str, str]:
+        """
+        Return annotated main-cluster choices for subclustering.
+
+        Multiple Leiden clusters sharing the same annotation are merged
+        into one selectable parent population with a combined cell count.
+        """
         labelDf = _get_main_cluster_label_table()
 
         if labelDf is None or labelDf.empty:
@@ -2866,27 +2878,59 @@ def server(input, output, session):
 
         summary = (
             labelDf
-            .groupby(["PINT_Leiden_cluster", "PINT_ClusterName"], dropna=False)
-            .size()
-            .reset_index(name="n_cells")
+            .groupby(
+                "PINT_ClusterName",
+                dropna=False,
+            )
+            .agg(
+                n_cells=(
+                    PINT_CELL_ID_COL,
+                    "size",
+                ),
+                leiden_clusters=(
+                    "PINT_Leiden_cluster",
+                    lambda x: sorted(
+                        {
+                            str(v)
+                            for v in x
+                            if pd.notna(v)
+                        },
+                        key=_cluster_sort_key,
+                    ),
+                ),
+            )
+            .reset_index()
         )
 
-        summary["choice_value"] = summary["PINT_ClusterName"].astype(str)
+        summary["PINT_ClusterName"] = (
+            summary["PINT_ClusterName"]
+            .astype(str)
+        )
+
+        summary["choice_value"] = (
+            summary["PINT_ClusterName"]
+        )
+
         summary["choice_label"] = (
-            summary["PINT_ClusterName"].astype(str)
-            + " ["
-            + summary["PINT_Leiden_cluster"].astype(str)
-            + ", n="
-            + summary["n_cells"].map(lambda x: f"{x:,}")
+            summary["PINT_ClusterName"]
+            + " [n="
+            + summary["n_cells"].map(
+                lambda x: f"{x:,}"
+            )
             + "]"
         )
 
         summary = summary.sort_values(
-            "PINT_Leiden_cluster",
-            key=lambda s: s.map(_cluster_sort_key),
+            "PINT_ClusterName",
+            key=lambda s: s.str.lower(),
         )
 
-        return dict(zip(summary["choice_value"], summary["choice_label"]))
+        return dict(
+            zip(
+                summary["choice_value"],
+                summary["choice_label"],
+            )
+        )
 
     def _drop_subclustering_columns_from_master():
         """
@@ -6669,6 +6713,9 @@ def server(input, output, session):
                 "clustering_pacmap_embedding":
                     clustering_pacmap_embedding.get(),
 
+                "clustering_deg_results":
+                    clustering_deg_results.get(),
+
                 # ------------------------------------------------------------
                 # Subclustering
                 # ------------------------------------------------------------
@@ -6934,6 +6981,13 @@ def server(input, output, session):
             clustering_pacmap_embedding.set(
                 state.get(
                     "clustering_pacmap_embedding",
+                    pd.DataFrame(),
+                )
+            )
+
+            clustering_deg_results.set(
+                state.get(
+                    "clustering_deg_results",
                     pd.DataFrame(),
                 )
             )
@@ -8802,6 +8856,9 @@ def server(input, output, session):
             clustering_marker_summary.set(pd.DataFrame())
             clustering_pacmap_embedding.set(pd.DataFrame())
 
+            clustering_deg_results.set(pd.DataFrame())
+            clustering_deg_status.set("Cluster marker results cleared because PCA was rerun.")
+
             clustering_cluster_name_map.set(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
             clustering_annotation_status.set("Main PCA was rerun. Leiden clusters, annotations, PaCMAP, heatmaps, and subclusters were cleared.")
 
@@ -8877,6 +8934,480 @@ def server(input, output, session):
             style="max-width: 100%; overflow-x: auto;",
         )
 
+    @reactive.Effect
+    @reactive.event(
+        input.run_clustering_deg
+    )
+    def _run_clustering_deg():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            ui.notification_show(
+                "No clustering dataset is loaded.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        labelsDf = (
+            _get_annotated_cluster_labels()
+        )
+
+        if labelsDf is None or labelsDf.empty:
+            ui.notification_show(
+                "No cluster annotations are available. "
+                "Run Leiden clustering first.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        try:
+            # ------------------------------------------------------------
+            # Features
+            # ------------------------------------------------------------
+            featureMap = (
+                _get_valid_clustering_column_map()
+            )
+
+            if (
+                featureMap is None
+                or featureMap.empty
+            ):
+                raise ValueError(
+                    "No clustering features are currently selected."
+                )
+
+            sourceCols = (
+                featureMap[
+                    "ChannelNamesForClustering"
+                ]
+                .astype(str)
+                .tolist()
+            )
+
+            displayLookup = dict(
+                zip(
+                    featureMap[
+                        "ChannelNamesForClustering"
+                    ].astype(str),
+
+                    featureMap[
+                        "ChannelNameToDisplay"
+                    ].astype(str),
+                )
+            )
+
+            missingCols = [
+                col
+                for col in sourceCols
+                if col not in df.columns
+            ]
+
+            if missingCols:
+                raise ValueError(
+                    "Selected marker columns are missing from "
+                    "the current dataset: "
+                    + ", ".join(
+                        missingCols[:20]
+                    )
+                )
+
+            # ------------------------------------------------------------
+            # Attach current annotated cluster names
+            # ------------------------------------------------------------
+            analysisDf = df.copy()
+
+            # Avoid duplicate PINT_ClusterName if it is already
+            # present in the master table.
+            if "PINT_ClusterName" in analysisDf.columns:
+                analysisDf = analysisDf.drop(
+                    columns=[
+                        "PINT_ClusterName"
+                    ]
+                )
+
+            analysisDf = analysisDf.merge(
+                labelsDf[
+                    [
+                        PINT_CELL_ID_COL,
+                        "PINT_ClusterName",
+                    ]
+                ],
+                on=PINT_CELL_ID_COL,
+                how="left",
+                validate="one_to_one",
+            )
+
+            analysisDf = analysisDf.loc[
+                analysisDf[
+                    "PINT_ClusterName"
+                ].notna()
+            ].copy()
+
+            if analysisDf.empty:
+                raise ValueError(
+                    "No cells could be matched to current cluster annotations."
+                )
+
+            nClusters = int(
+                analysisDf[
+                    "PINT_ClusterName"
+                ]
+                .nunique()
+            )
+
+            if nClusters < 2:
+                raise ValueError(
+                    "At least two annotated clusters are required."
+                )
+
+            minPct = float(
+                input.clustering_deg_min_pct()
+                or 0
+            )
+
+            minLog2Fc = float(
+                input.clustering_deg_min_log2fc()
+                or 0
+            )
+
+            detectionThreshold = float(
+                input.clustering_deg_detection_threshold()
+                or 0
+            )
+
+            onlyPositive = bool(
+                input.clustering_deg_only_positive()
+            )
+
+            clustering_deg_status.set(
+                f"Running marker analysis for "
+                f"{nClusters:,} annotated clusters..."
+            )
+
+            # ------------------------------------------------------------
+            # Progress bar
+            # ------------------------------------------------------------
+            with ui.Progress(
+                min=0,
+                max=nClusters,
+                session=session,
+            ) as progress:
+
+                def updateDegProgress(
+                    message,
+                    current,
+                    total,
+                ):
+                    progress.set(
+                        value=current,
+                        message=(
+                            "Finding cluster markers"
+                        ),
+                        detail=message,
+                    )
+
+                resultDf = (
+                    find_all_cluster_markers(
+                        analysisDf,
+                        cluster_col=(
+                            "PINT_ClusterName"
+                        ),
+                        feature_cols=sourceCols,
+                        only_positive=onlyPositive,
+                        min_pct=minPct,
+                        min_log2fc=minLog2Fc,
+                        detection_threshold=(
+                            detectionThreshold
+                        ),
+                        progress_callback=(
+                            updateDegProgress
+                        ),
+                    )
+                )
+
+            # ------------------------------------------------------------
+            # Add user-facing feature names
+            # ------------------------------------------------------------
+            if not resultDf.empty:
+                resultDf = (
+                    resultDf.rename(
+                        columns={
+                            "Feature":
+                                "SourceFeature",
+                        }
+                    )
+                )
+
+                resultDf.insert(
+                    2,
+                    "Feature",
+                    resultDf[
+                        "SourceFeature"
+                    ].map(
+                        displayLookup
+                    ).fillna(
+                        resultDf[
+                            "SourceFeature"
+                        ]
+                    ),
+                )
+
+            clustering_deg_results.set(
+                resultDf
+            )
+
+            nResults = len(
+                resultDf
+            )
+
+            if resultDf.empty:
+                msg = (
+                    "Marker analysis finished, but no features "
+                    "passed the current filters."
+                )
+            else:
+                nSignificant = int(
+                    (
+                        resultDf[
+                            "p_adj_BH"
+                        ]
+                        < 0.05
+                    ).sum()
+                )
+
+                msg = (
+                    f"Marker analysis complete: "
+                    f"{nResults:,} marker result(s), "
+                    f"{nSignificant:,} with "
+                    f"BH-adjusted p < 0.05."
+                )
+
+            clustering_deg_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=8,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Cluster marker analysis failed: {e}"
+            )
+
+            clustering_deg_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+    @output
+    @render.ui
+    def clustering_deg_summary():
+        resultDf = (
+            clustering_deg_results.get()
+        )
+
+        status = (
+            clustering_deg_status.get()
+        )
+
+        if resultDf is None or resultDf.empty:
+            return ui.tags.small(
+                status,
+                class_="text-muted",
+            )
+
+        nClusters = (
+            resultDf["Cluster"]
+            .nunique()
+            if "Cluster" in resultDf.columns
+            else 0
+        )
+
+        nFeatures = (
+            resultDf["Feature"]
+            .nunique()
+            if "Feature" in resultDf.columns
+            else 0
+        )
+
+        return ui.tags.div(
+            ui.tags.div(
+                status,
+                class_="compact-small-line",
+            ),
+
+            ui.tags.div(
+                (
+                    f"Clusters: {nClusters:,} | "
+                    f"features represented: {nFeatures:,} | "
+                    f"rows: {len(resultDf):,}"
+                ),
+                class_=(
+                    "compact-small-line "
+                    "text-muted"
+                ),
+            ),
+        )
+
+    @output
+    @render.data_frame
+    def clustering_deg_preview():
+        resultDf = (
+            clustering_deg_results.get()
+        )
+
+        if resultDf is None or resultDf.empty:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No cluster marker results available."
+                        ]
+                    }
+                ),
+                height="220px",
+                filters=False,
+            )
+
+        displayCols = [
+            "Cluster",
+            "Feature",
+            "SourceFeature",
+            "Mean_in",
+            "Mean_out",
+            "Mean_difference",
+            "log2FC",
+            "pct_in",
+            "pct_out",
+            "p_value",
+            "p_adj_BH",
+        ]
+
+        displayDf = resultDf[
+            [
+                col
+                for col in displayCols
+                if col in resultDf.columns
+            ]
+        ].copy()
+
+        return render.DataGrid(
+            displayDf,
+            height="520px",
+            filters=True,
+            summary=(
+                "Showing marker results "
+                "{start}–{end} of {total}"
+            ),
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.export_clustering_deg
+    )
+    def _export_clustering_deg():
+        resultDf = (
+            clustering_deg_results.get()
+        )
+
+        if resultDf is None or resultDf.empty:
+            ui.notification_show(
+                "No cluster marker results are available to export.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        folder = (
+            last_loaded_folder.get()
+            or (input.path() or "").strip()
+        )
+
+        initdir = (
+            folder
+            if folder and os.path.isdir(folder)
+            else os.getcwd()
+        )
+
+        savePath = pick_save_csv_dialog(
+            title="Export PINT cluster markers",
+            initialdir=initdir,
+            initialfile=(
+                "PINT_cluster_markers.csv"
+            ),
+        )
+
+        if not savePath:
+            print(
+                "🛑 Cluster marker export canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            resultDf.to_csv(
+                savePath,
+                index=False,
+            )
+
+            msg = (
+                f"Exported {len(resultDf):,} "
+                f"cluster-marker results to: "
+                f"{savePath}"
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Cluster marker export failed: {e}"
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
 
     @output
     @render.ui
@@ -9021,17 +9552,33 @@ def server(input, output, session):
 
             clustering_data.set(master)
 
+            clusterNames = (
+                labelsDf["PINT_Leiden_cluster"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+
+            clusterNames = sorted(
+                clusterNames,
+                key=_cluster_sort_key,
+            )
+
             clustering_cluster_name_map.set(
                 pd.DataFrame(
-                    columns=[
-                        "OldClusterName",
-                        "NewClusterName",
-                    ]
+                    {
+                        "OldClusterName": clusterNames,
+                        "NewClusterName": clusterNames,
+                    }
                 )
             )
 
             clustering_pacmap_embedding.set(pd.DataFrame())
             clustering_marker_summary.set(pd.DataFrame())
+
+            clustering_deg_results.set(pd.DataFrame())
+            clustering_deg_status.set("Cluster marker results cleared because Leiden clustering was rerun.")
 
             msg = (
                 f"Leiden clustering complete: "
@@ -9696,12 +10243,26 @@ def server(input, output, session):
             print(f"⚠️ {msg}")
             return
 
-        templateDf = pd.DataFrame(
-            {
-                "OldClusterName": clusterNames,
-                "NewClusterName": clusterNames,
-            }
-        )
+        nameMap = clustering_cluster_name_map.get()
+
+        if nameMap is None or nameMap.empty:
+            clusterNames = (
+                _get_current_leiden_cluster_names()
+            )
+
+            nameMap = pd.DataFrame(
+                {
+                    "OldClusterName": clusterNames,
+                    "NewClusterName": clusterNames,
+                }
+            )
+
+        templateDf = nameMap[
+            [
+                "OldClusterName",
+                "NewClusterName",
+            ]
+        ].copy()
 
         folder = last_loaded_folder.get() or (input.path() or "").strip()
         initdir = folder if folder and os.path.isdir(folder) else os.getcwd()
@@ -9730,23 +10291,203 @@ def server(input, output, session):
     @output
     @render.data_frame
     def clustering_cluster_name_map_preview():
-        annDf = _get_annotated_cluster_labels()
+        nameMap = clustering_cluster_name_map.get()
 
-        if annDf is None or annDf.empty:
-            empty = pd.DataFrame(
-                {"Message": ["No cluster annotations available. Run Leiden clustering first."]}
+        if nameMap is None or nameMap.empty:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Message": [
+                            "No Leiden clusters available. Run Leiden clustering first."
+                        ]
+                    }
+                ),
+                height="220px",
+                filters=False,
             )
-            return render.DataGrid(empty, height="220px", filters=False)
 
-        out = (
-            annDf
-            .groupby(["PINT_Leiden_cluster", "PINT_ClusterName"], sort=False)
-            .size()
-            .reset_index(name="n_cells")
-            .sort_values("PINT_Leiden_cluster", key=lambda s: s.map(_cluster_sort_key))
+        nameMap = nameMap.reset_index(drop=True)
+
+        nClusters = len(nameMap)
+        nRows = int(np.ceil(nClusters / 3))
+
+        displayRows = []
+
+        for displayRow in range(nRows):
+            row = {}
+
+            for block in range(3):
+                sourceIndex = displayRow + block * nRows
+
+                clusterCol = f"Leiden cluster {block + 1}"
+                nameCol = f"New cluster name {block + 1}"
+
+                if sourceIndex < nClusters:
+                    row[clusterCol] = (
+                        nameMap.iloc[sourceIndex]["OldClusterName"]
+                    )
+
+                    row[nameCol] = (
+                        nameMap.iloc[sourceIndex]["NewClusterName"]
+                    )
+                else:
+                    row[clusterCol] = ""
+                    row[nameCol] = ""
+
+                if block < 2:
+                    row[f"__spacer_{block + 1}__"] = ""
+
+            displayRows.append(row)
+
+        displayDf = pd.DataFrame(displayRows)
+
+        displayDf = displayDf.rename(
+            columns={
+                "__spacer_1__": " ",
+                "__spacer_2__": "  ",
+            }
         )
 
-        return render.DataGrid(out, height="260px", filters=False)
+        return render.DataGrid(
+            displayDf,
+            editable=True,
+            height="fit-content",
+            filters=False,
+        )
+
+    @clustering_cluster_name_map_preview.set_patch_fn
+    def _edit_clustering_cluster_name_map(
+        *,
+        patch: render.CellPatch,
+    ):
+        displayRow = int(
+            patch["row_index"]
+        )
+
+        displayCol = int(
+            patch["column_index"]
+        )
+
+        nameMap = (
+            clustering_cluster_name_map.get()
+            .copy()
+            .reset_index(drop=True)
+        )
+
+        if nameMap is None or nameMap.empty:
+            return patch["value"]
+
+        nClusters = len(nameMap)
+        nRows = int(np.ceil(nClusters / 3))
+
+        # Display columns are:
+        #
+        # 0 = Leiden cluster 1
+        # 1 = Cluster name 1
+        # 2 = spacer
+        # 3 = Leiden cluster 2
+        # 4 = Cluster name 2
+        # 5 = spacer
+        # 6 = Leiden cluster 3
+        # 7 = Cluster name 3
+
+        editableColumns = {
+            1: 0,
+            4: 1,
+            7: 2,
+        }
+
+        protectedClusterColumns = {
+            0: 0,
+            3: 1,
+            6: 2,
+        }
+
+        # ------------------------------------------------------------
+        # Protect original Leiden cluster IDs
+        # ------------------------------------------------------------
+        if displayCol in protectedClusterColumns:
+            block = protectedClusterColumns[
+                displayCol
+            ]
+
+            sourceIndex = (
+                displayRow
+                + block * nRows
+            )
+
+            if sourceIndex >= nClusters:
+                return ""
+
+            return str(
+                nameMap.iloc[sourceIndex][
+                    "OldClusterName"
+                ]
+            )
+
+        # ------------------------------------------------------------
+        # Spacer columns are deliberately non-editable but you can 
+        # input somethere there. It's weird like this hahah
+        # ------------------------------------------------------------
+        if displayCol not in editableColumns:
+            return ""
+
+        # ------------------------------------------------------------
+        # Translate displayed cell -> source cluster row
+        # ------------------------------------------------------------
+        block = editableColumns[
+            displayCol
+        ]
+
+        sourceIndex = (
+            displayRow
+            + block * nRows
+        )
+
+        if sourceIndex >= nClusters:
+            return ""
+
+        oldValue = str(
+            nameMap.iloc[sourceIndex][
+                "NewClusterName"
+            ]
+        )
+
+        newValue = str(
+            patch["value"]
+            or ""
+        ).strip()
+
+        if not newValue:
+            ui.notification_show(
+                "Cluster names cannot be empty.",
+                type="warning",
+                duration=4,
+            )
+
+            return oldValue
+
+        nameMap.iat[
+            sourceIndex,
+            nameMap.columns.get_loc(
+                "NewClusterName"
+            ),
+        ] = newValue
+
+        clustering_cluster_name_map.set(nameMap)
+
+        _sync_cluster_annotations_to_master()
+
+        clustering_deg_results.set(pd.DataFrame())
+        clustering_deg_status.set("Cluster marker results cleared because cluster annotations changed.")
+
+        clustering_annotation_status.set(
+            f"Renamed "
+            f"{nameMap.iloc[sourceIndex]['OldClusterName']} "
+            f"to {newValue!r}."
+        )
+
+        return newValue
 
 
     @reactive.Effect
@@ -9806,13 +10547,86 @@ def server(input, output, session):
             nameMap = nameMap.loc[nameMap["NewClusterName"] != ""].copy()
             nameMap = nameMap.drop_duplicates(subset=["OldClusterName"], keep="first")
 
-            currentClusters = set(_get_current_leiden_cluster_names())
-            mappedClusters = set(nameMap["OldClusterName"].astype(str))
+            currentMap = (clustering_cluster_name_map.get().copy())
 
-            missingInCurrent = sorted(mappedClusters - currentClusters, key=_cluster_sort_key)
-            notAnnotated = sorted(currentClusters - mappedClusters, key=_cluster_sort_key)
+            if currentMap is None or currentMap.empty:
+                currentClusters = (_get_current_leiden_cluster_names())
 
-            clustering_cluster_name_map.set(nameMap)
+                currentMap = pd.DataFrame(
+                    {
+                        "OldClusterName": currentClusters,
+                        "NewClusterName": currentClusters,
+                    }
+                )
+
+            currentClusters = set(currentMap["OldClusterName"].astype(str))
+            importedClusters = set(nameMap["OldClusterName"].astype(str))
+
+            unknownClusters = sorted(
+                importedClusters - currentClusters,
+                key=_cluster_sort_key,
+            )
+
+            # Only annotations belonging to current Leiden clusters
+            # are applied.
+            validImported = nameMap.loc[
+                nameMap["OldClusterName"].isin(
+                    currentClusters
+                )
+            ].copy()
+
+            importLookup = dict(
+                zip(
+                    validImported["OldClusterName"],
+                    validImported["NewClusterName"],
+                )
+            )
+
+            # CSV annotations overwrite the existing editable names.
+            # Clusters absent from the CSV retain their current names.
+            currentMap["NewClusterName"] = [
+                importLookup.get(
+                    oldName,
+                    currentName,
+                )
+                for oldName, currentName in zip(
+                    currentMap["OldClusterName"],
+                    currentMap["NewClusterName"],
+                )
+            ]
+
+            clustering_cluster_name_map.set(currentMap)
+
+            _sync_cluster_annotations_to_master()
+
+            clustering_deg_results.set(pd.DataFrame())
+            clustering_deg_status.set("Cluster marker results cleared because cluster annotations changed.")
+
+            msg = (
+                f"Imported cluster names: "
+                f"{len(validImported):,} current cluster(s) updated."
+            )
+
+            if unknownClusters:
+                msg += (
+                    f" {len(unknownClusters):,} CSV cluster name(s) "
+                    "did not exist in the current Leiden result and were ignored."
+                )
+
+            clustering_annotation_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
 
             _sync_cluster_annotations_to_master()
 
@@ -10356,6 +11170,169 @@ def server(input, output, session):
             msg = f"Sub-Leiden clustering failed: {e}"
             subclustering_status.set(msg)
             print(f"❌ {msg}", flush=True)
+
+    @reactive.Effect
+    @reactive.event(
+        input.export_subclustering_pca_loadings_plot
+    )
+    def _export_subclustering_pca_loadings_plot():
+        loadingsDf = (
+            subclustering_pca_loadings.get()
+        )
+
+        if (
+            loadingsDf is None
+            or loadingsDf.empty
+        ):
+            msg = (
+                "No sub-PCA loadings available. "
+                "Run sub-PCA first."
+            )
+
+            subclustering_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="warning",
+                duration=6,
+            )
+
+            print(
+                f"⚠️ {msg}",
+                flush=True,
+            )
+
+            return
+
+        try:
+            nPcs = int(
+                input.subclustering_loadings_n_pcs()
+                or 20
+            )
+
+            topN = int(
+                input.subclustering_loadings_top_n()
+                or 20
+            )
+
+            outDir = pick_folder_dialog()
+
+            if not outDir:
+                print(
+                    "🛑 Sub-PCA loading export canceled.",
+                    flush=True,
+                )
+                return
+
+            outDir = Path(
+                outDir
+            )
+
+            outDir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            timestamp = datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            parentName = (
+                subclustering_parent_cluster.get()
+                or "subcluster"
+            )
+
+            safeParent = _safe_file_stem(
+                parentName
+            )
+
+            outPath = (
+                outDir
+                / (
+                    f"PINT_subPCA_loadings_"
+                    f"{safeParent}_"
+                    f"top{topN}_{nPcs}PCs_"
+                    f"{timestamp}.png"
+                )
+            )
+
+            fig = _make_pca_loadings_grid_figure(
+                loadingsDf,
+                n_pcs=nPcs,
+                top_n=topN,
+                n_cols=5,
+            )
+
+            fig.savefig(
+                outPath,
+                dpi=600,
+                bbox_inches="tight",
+            )
+
+            plt.close(
+                fig
+            )
+
+            csvPath = (
+                outDir
+                / (
+                    f"PINT_subPCA_loadings_table_"
+                    f"{safeParent}_"
+                    f"{timestamp}.csv"
+                )
+            )
+
+            loadingsDf.to_csv(
+                csvPath,
+                index=False,
+            )
+
+            msg = (
+                f"Exported sub-PCA loading plot and table "
+                f"for {parentName}."
+            )
+
+            subclustering_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg}\n"
+                f"   Plot: {outPath}\n"
+                f"   Table: {csvPath}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Sub-PCA loading export failed: {e}"
+            )
+
+            subclustering_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
 
     @reactive.Effect
     @reactive.event(input.run_subclustering_pacmap)

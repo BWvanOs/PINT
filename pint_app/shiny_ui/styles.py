@@ -4,6 +4,18 @@ from shiny import ui
 def app_styles():
     return ui.head_content(
         ui.tags.style("""
+            /* ============================================================
+                                General stuff
+            ============================================================ */
+            .compact-hr {
+                margin-top: 3px !important;
+                margin-bottom: 3px !important;
+            }
+
+            /* ============================================================
+                                 Viewer stuff
+            ============================================================ */
+
             .controls-left .card {
                 border: 1px solid #8f8f8f;
                 box-shadow: 0 0.15rem 0.45rem rgba(0, 0, 0, 0.18);
@@ -510,7 +522,33 @@ def app_styles():
                 display: block;
                 height: 2rem;
             }
-                      
+
+            /* ============================================================
+                                    Annotation
+            ============================================================ */
+
+            .cluster-annotation-table td:nth-child(2),
+            .cluster-annotation-table td:nth-child(5),
+            .cluster-annotation-table td:nth-child(8) {
+                background: #f7fbff;
+            }
+
+            .cluster-annotation-table th:nth-child(2),
+            .cluster-annotation-table th:nth-child(5),
+            .cluster-annotation-table th:nth-child(8) {
+                font-weight: 600;
+            }
+
+            .cluster-annotation-table td:nth-child(3),
+            .cluster-annotation-table td:nth-child(6),
+            .cluster-annotation-table th:nth-child(3),
+            .cluster-annotation-table th:nth-child(6) {
+                background: white;
+                border: none !important;
+                min-width: 28px;
+                width: 28px;
+            }
+
             /* ============================================================
                                 Thumbnail overview
             ============================================================ */

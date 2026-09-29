@@ -823,7 +823,7 @@ def heatmap_controls_card():
 
         ui.row(
             ui.column(
-                4,
+                6,
                 ui.input_select(
                     "clustering_heatmap_aggregation",
                     "Cluster expression summary",
@@ -835,7 +835,7 @@ def heatmap_controls_card():
                 ),
             ),
             ui.column(
-                4,
+                6,
                 ui.input_select(
                     "clustering_heatmap_mode",
                     "Heatmap value mode",
@@ -846,8 +846,11 @@ def heatmap_controls_card():
                     selected="absolute",
                 ),
             ),
+        ),
+
+        ui.row(
             ui.column(
-                4,
+                6,
                 ui.input_select(
                     "clustering_heatmap_palette",
                     "Heatmap palette",
@@ -913,7 +916,7 @@ def cluster_annotation_controls_card():
                 6,
                 ui.input_action_button(
                     "export_cluster_name_template",
-                    "Export a cluster-name template",
+                    "Export cluster names",
                     class_="btn btn-secondary compact-action-button mb-2",
                 ),
             ),
@@ -921,13 +924,15 @@ def cluster_annotation_controls_card():
                 6,
                 ui.input_action_button(
                     "import_cluster_name_map",
-                    "Import you custom cluster names",
+                    "Import cluster names",
                     class_="btn btn-primary compact-action-button mb-2",
                 ),
             ),
         ),
 
-        ui.hr(),
+        ui.hr(
+            class_="compact-hr"
+        ),
 
         ui.input_select(
             "annotation_cluster_color_palette",
@@ -945,6 +950,116 @@ def cluster_annotation_controls_card():
         ),
 
         ui.output_ui("annotation_cluster_custom_color_ui"),
+
+        class_="mb-2",
+    )
+
+def cluster_deg_controls_card():
+    return ui.card(
+        ui.card_header(
+            "Cluster marker analysis"
+        ),
+
+        ui.tags.p(
+            "Find features enriched in each annotated cluster compared "
+            "with all remaining cells.",
+            class_="text-muted",
+        ),
+
+        ui.tags.small(
+            "Clusters sharing the same annotation are treated as one population.",
+            class_="text-muted",
+        ),
+
+        ui.hr(
+            class_="compact-hr"
+        ),
+
+        ui.row(
+            ui.column(
+                6,
+                ui.input_numeric(
+                    "clustering_deg_min_pct",
+                    "Minimum detected fraction",
+                    value=0.10,
+                    min=0,
+                    max=1,
+                    step=0.05,
+                ),
+            ),
+
+            ui.column(
+                6,
+                ui.input_numeric(
+                    "clustering_deg_min_log2fc",
+                    "Minimum |log2FC|",
+                    value=0.25,
+                    min=0,
+                    step=0.05,
+                ),
+            ),
+        ),
+
+        ui.input_numeric(
+            "clustering_deg_detection_threshold",
+            "Detection threshold",
+            value=0,
+            step=0.1,
+        ),
+
+        ui.tags.small(
+            "Values above this threshold count as detected. "
+            "Zero is appropriate for count-like data; IMC may require "
+            "a higher biologically meaningful threshold.",
+            class_="text-muted",
+        ),
+
+        ui.hr(
+            class_="compact-hr"
+        ),
+
+        ui.input_checkbox(
+            "clustering_deg_only_positive",
+            "Positive markers only",
+            value=True,
+        ),
+
+        ui.input_action_button(
+            "run_clustering_deg",
+            "Find cluster markers",
+            class_=(
+                "btn btn-primary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.input_action_button(
+            "export_clustering_deg",
+            "Export marker table",
+            class_=(
+                "btn btn-secondary "
+                "compact-action-button mb-2"
+            ),
+        ),
+
+        ui.tooltip(
+            ui.tags.span("ⓘ"),
+            (
+                "Cluster = group being tested against all other cells. "
+                "Feature = display name; SourceFeature = original column name. "
+                "Mean_in/out = mean signal inside/outside the cluster. "
+                "Mean_difference = Mean_in − Mean_out. "
+                "log2FC = log2 ratio of Mean_in to Mean_out. "
+                "pct_in/out = fraction of cells above the detection threshold "
+                "inside/outside the cluster. "
+                "p_value = raw Mann–Whitney p-value; "
+                "p_adj_BH = Benjamini–Hochberg adjusted p-value."
+            ),
+        ),
+
+        ui.output_ui(
+            "clustering_deg_summary"
+        ),
 
         class_="mb-2",
     )
@@ -1076,6 +1191,50 @@ def subclustering_pca_controls_card():
         class_="mb-2",
     )
 
+def subclustering_pca_loading_export_card():
+    return ui.card(
+        ui.card_header(
+            "Sub-PCA loading export"
+        ),
+
+        ui.tags.p(
+            "Export one image showing the strongest positive and "
+            "negative marker loadings per sub-PC.",
+            class_="text-muted",
+        ),
+
+        ui.row(
+            ui.column(
+                6,
+                ui.input_numeric(
+                    "subclustering_loadings_n_pcs",
+                    "PCs to include",
+                    value=20,
+                    min=1,
+                    step=1,
+                ),
+            ),
+
+            ui.column(
+                6,
+                ui.input_numeric(
+                    "subclustering_loadings_top_n",
+                    "Top features per direction",
+                    value=20,
+                    min=1,
+                    step=1,
+                ),
+            ),
+        ),
+
+        ui.input_action_button(
+            "export_subclustering_pca_loadings_plot",
+            "Export sub-PCA loading plot",
+            class_="btn btn-secondary w-100 mb-2",
+        ),
+
+        class_="mb-2",
+    )
 
 def subclustering_leiden_controls_card():
     return ui.card(
@@ -1091,7 +1250,7 @@ def subclustering_leiden_controls_card():
                 4,
                 ui.input_numeric(
                     "subclustering_leiden_n_dims",
-                    "PC dimensions",
+                    "Number of PC's to use",
                     value=10,
                     min=2,
                     step=1,
@@ -1111,7 +1270,7 @@ def subclustering_leiden_controls_card():
                 4,
                 ui.input_numeric(
                     "subclustering_leiden_resolution",
-                    "Resolution",
+                    "Clustering resolution",
                     value=1.0,
                     min=0.01,
                     step=0.1,
@@ -1140,7 +1299,7 @@ def subclustering_embedding_display_controls_card():
 
         ui.row(
             ui.column(
-                4,
+                6,
                 ui.input_select(
                     "subclustering_scatter_palette",
                     "Palette",
@@ -1149,7 +1308,7 @@ def subclustering_embedding_display_controls_card():
                 ),
             ),
             ui.column(
-                4,
+                6,
                 ui.input_numeric(
                     "subclustering_embedding_plot_width",
                     "Plot width",
@@ -1159,8 +1318,11 @@ def subclustering_embedding_display_controls_card():
                     step=100,
                 ),
             ),
+        ),
+
+        ui.row(
             ui.column(
-                2,
+                6,
                 ui.input_numeric(
                     "subclustering_plot_point_size",
                     "Point size",
@@ -1170,7 +1332,7 @@ def subclustering_embedding_display_controls_card():
                 ),
             ),
             ui.column(
-                2,
+                6,
                 ui.input_numeric(
                     "subclustering_plot_alpha",
                     "Alpha",
@@ -1650,6 +1812,7 @@ def clustering_panel():
                 clustering_tab_layout(
                     ##Left side
                     cluster_annotation_controls_card(),
+                    cluster_deg_controls_card(),
                     pacmap_controls_card(),
                     pacmap_display_controls_card(),
                     heatmap_controls_card(),
@@ -1660,14 +1823,47 @@ def clustering_panel():
                         ),
 
                         ui.hr(),
+                        ui.tags.p(
+                            "Double-click a cluster name to edit it. "
+                            "Leiden cluster IDs are protected and cannot be changed. "
+                            "Multiple Leiden clusters may share the same annotation and will then be treated as one cluster.",
+                            class_="text-muted",
+                        ),
+
+                        ui.tags.div(
+                            ui.output_data_frame(
+                                "clustering_cluster_name_map_preview"
+                            ),
+                            class_="cluster-annotation-table",
+                        ),
 
                         ui.tags.div(
                             "Cluster annotations",
                             class_="mask-section-title",
                         ),
 
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "Cluster markers",
+                            class_="mask-section-title",
+                        ),
+
+                        ui.tags.p(
+                            "Each annotated cluster is compared with all remaining cells. "
+                            "Results are ordered by adjusted p-value and effect size.",
+                            class_="text-muted",
+                        ),
+
                         ui.output_data_frame(
-                            "clustering_cluster_name_map_preview"
+                            "clustering_deg_preview"
+                        ),
+
+                        ui.hr(),
+
+                        ui.tags.div(
+                            "PaCMAP embedding",
+                            class_="mask-section-title",
                         ),
 
                         ui.hr(),
@@ -1716,6 +1912,7 @@ def clustering_panel():
                     subclustering_pca_controls_card(),
                     subclustering_leiden_controls_card(),
                     subclustering_embedding_display_controls_card(),
+                    subclustering_pca_loading_export_card(),
 
                     ##Right side
                     content=ui.tags.div(
