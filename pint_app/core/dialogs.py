@@ -722,6 +722,114 @@ def pick_save_pint_session_dialog(
         )
         return ""
 
+def pick_open_xenium_dialog(
+    title: str = "Select Xenium experiment",
+    initialdir: str | None = None,
+) -> str:
+    """
+    Open a file-selection dialog for a Xenium experiment file.
+    """
+
+    # Linux: prefer zenity, because tkinter is awful on high-DPI screens.
+    if _is_linux() and _zenity_available():
+        try:
+            cmd = [
+                "zenity",
+                "--file-selection",
+                "--title",
+                title,
+            ]
+
+            if initialdir:
+                cmd += [
+                    "--filename",
+                    os.path.join(
+                        initialdir,
+                        "",
+                    ),
+                ]
+
+            cmd += [
+                "--file-filter=Xenium experiment files | *.xenium",
+                "--file-filter=All files | *",
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+            )
+
+            return (
+                result.stdout.strip()
+                if result.returncode == 0
+                else ""
+            )
+
+        except Exception:
+            pass
+
+    # Fallback: tkinter
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+
+        try:
+            dpi = root.winfo_fpixels("1i")
+
+            scale = max(
+                1.0,
+                float(dpi) / 96.0,
+            )
+
+            root.tk.call(
+                "tk",
+                "scaling",
+                scale,
+            )
+
+        except Exception:
+            pass
+
+        try:
+            root.wm_attributes(
+                "-topmost",
+                1,
+            )
+        except Exception:
+            pass
+
+        path = filedialog.askopenfilename(
+            title=title,
+            initialdir=(
+                initialdir
+                or os.getcwd()
+            ),
+            filetypes=[
+                (
+                    "Xenium experiment files",
+                    "*.xenium",
+                ),
+                (
+                    "All files",
+                    "*.*",
+                ),
+            ],
+        )
+
+        root.destroy()
+
+        return path or ""
+
+    except Exception:
+        print(
+            "[file dialog] Xenium picker fallback failed",
+            file=sys.stderr,
+        )
+        return ""
 
 def pick_open_pint_session_dialog(
     title: str = "Open PINT clustering session",

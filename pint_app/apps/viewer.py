@@ -18,7 +18,7 @@ import igraph as ig
 import leidenalg
 import pacmap
 
-import os, sys, subprocess
+import os, sys, subprocess, json
 import warnings
 from datetime import datetime
 
@@ -38,6 +38,7 @@ from pint_app.core.clustering_helpers import (
     run_leiden,
     run_pacmap,
     set_clustering_columns_by_suffix,
+    format_deg_table,
 )
 
 from pint_app.core.composites import (
@@ -69,6 +70,7 @@ from pint_app.core.dialogs import (
     pick_open_mcd_files_dialog,
     pick_save_pint_session_dialog,
     pick_open_pint_session_dialog,
+    pick_open_xenium_dialog,
 )
 
 from pint_app.core.formatting import fmt1
@@ -152,11 +154,17 @@ from pint_app.core.thumbnail_helpers import (
 
 from pint_app.core.segmentation_quantification import quantify_mesmer_masks_for_dataset
 
+from pint_app.core.xenium_loader import (
+    open_xenium_zarr,
+    inspect_zarr_group,
+    load_xenium_dataset,
+)
+
 ##Import of the UI modules
 ##CSS UI module
 from pint_app.shiny_ui.styles import app_styles
 ##Rest of the ui panels
-from pint_app.shiny_ui.image_handler_ui import image_handler_panel
+from pint_app.shiny_ui.data_input_ui import data_input_panel
 from pint_app.shiny_ui.segmentation_ui import segmentation_panel
 from pint_app.shiny_ui.clustering_ui import clustering_panel
 from pint_app.shiny_ui.mask_visualization_ui import mask_visualization_panel
@@ -188,7 +196,7 @@ app_ui = ui.page_sidebar(
                 ui.tags.div(
                     ui.navset_tab(
                         ##------->Image viewing, creation, and thumbnail tools<------##
-                        image_handler_panel(),
+                        data_input_panel(),
 
                         ##------->MESMER segmentation panel of the shiny app<------##
                         segmentation_panel(),
@@ -240,6 +248,16 @@ def server(input, output, session):
     mcd_loading_status = reactive.Value("No MCD file selected.")
 
     viewer_zoom_bounds = reactive.Value(None)
+
+    xenium_manifest_path = reactive.Value("")
+    xenium_manifest_data = reactive.Value({})
+    xenium_manifest_status_text = reactive.Value("No Xenium experiment loaded.")
+    xenium_cells_structure = reactive.Value(pd.DataFrame())
+    xenium_matrix_structure = reactive.Value(pd.DataFrame())
+    from pint_app.core.xenium_loader import (load_xenium_dataset,)
+    xenium_dataset = reactive.Value(None)
+    xenium_data_status_text = reactive.Value("No Xenium expression data loaded.")
+
 
     segmentation_mesmer_mask = reactive.Value(None)
     segmentation_mesmer_result = reactive.Value(None)
@@ -327,7 +345,11 @@ def server(input, output, session):
     subclustering_pacmap_embedding = reactive.Value(pd.DataFrame())
     subclustering_cluster_name_map = reactive.Value(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
     subclustering_marker_summary = reactive.Value(pd.DataFrame())
+    subclustering_deg_results = reactive.Value( pd.DataFrame())
+    subclustering_deg_status = reactive.Value("No subcluster marker analysis run yet.")
     subclustering_pushed_columns = reactive.Value([])
+
+    
 
     mask_input_df = reactive.Value(pd.DataFrame())
     mask_files_df = reactive.Value(pd.DataFrame())
@@ -5944,6 +5966,527 @@ def server(input, output, session):
             )
 
     
+    @reactive.Effect
+    @reactive.event(
+        input.open_xenium_manifest
+    )
+    def _open_xenium_manifest():
+        initialDir = (
+            last_loaded_folder.get()
+            or os.getcwd()
+        )
+
+        xeniumPath = pick_open_xenium_dialog(
+            initialdir=initialDir,
+        )
+
+        if not xeniumPath:
+            print(
+                "🛑 Xenium manifest selection canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            path = Path(
+                xeniumPath
+            )
+
+            if (
+                path.suffix.lower()
+                != ".xenium"
+            ):
+                raise ValueError(
+                    "Selected file does not have a .xenium extension."
+                )
+
+            # Clear any inspection results from a previously loaded dataset.
+            xenium_cells_structure.set(
+                pd.DataFrame()
+            )
+
+            xenium_matrix_structure.set(
+                pd.DataFrame()
+            )
+
+            with path.open(
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                manifest = json.load(
+                    handle
+                )
+
+            if not isinstance(
+                manifest,
+                dict,
+            ):
+                raise ValueError(
+                    "The Xenium manifest did not contain a JSON object."
+                )
+
+            xenium_manifest_path.set(
+                str(path)
+            )
+
+            xenium_manifest_data.set(
+                manifest
+            )
+
+            last_loaded_folder.set(
+                str(path.parent)
+            )
+
+            # ------------------------------------------------------------
+            # Resolve Xenium resources from the manifest
+            # ------------------------------------------------------------
+            resources = manifest.get(
+                "xenium_explorer_files",
+                {}
+            )
+
+            cellsRelative = resources.get(
+                "cells_zarr_filepath"
+            )
+
+            matrixRelative = resources.get(
+                "cell_features_zarr_filepath"
+            )
+
+            if not cellsRelative:
+                raise ValueError(
+                    "The Xenium manifest does not contain "
+                    "xenium_explorer_files.cells_zarr_filepath."
+                )
+
+            if not matrixRelative:
+                raise ValueError(
+                    "The Xenium manifest does not contain "
+                    "xenium_explorer_files.cell_features_zarr_filepath."
+                )
+
+            cellsPath = (
+                path.parent
+                / cellsRelative
+            )
+
+            matrixPath = (
+                path.parent
+                / matrixRelative
+            )
+
+            # ------------------------------------------------------------
+            # Inspect cells.zarr.zip
+            # ------------------------------------------------------------
+            cellsStore = None
+
+            try:
+                cellsRoot, cellsStore = (
+                    open_xenium_zarr(
+                        cellsPath
+                    )
+                )
+
+                cellsStructure = (
+                    inspect_zarr_group(
+                        cellsRoot
+                    )
+                )
+
+                xenium_cells_structure.set(
+                    cellsStructure
+                )
+
+            finally:
+                if cellsStore is not None:
+                    cellsStore.close()
+
+            # ------------------------------------------------------------
+            # Inspect cell_feature_matrix.zarr.zip
+            # ------------------------------------------------------------
+            matrixStore = None
+
+            try:
+                matrixRoot, matrixStore = (
+                    open_xenium_zarr(
+                        matrixPath
+                    )
+                )
+
+                matrixStructure = (
+                    inspect_zarr_group(
+                        matrixRoot
+                    )
+                )
+
+                xenium_matrix_structure.set(
+                    matrixStructure
+                )
+
+            finally:
+                if matrixStore is not None:
+                    matrixStore.close()
+
+            msg = (
+                f"Loaded Xenium dataset: "
+                f"{path.name}; "
+                f"{len(manifest):,} top-level manifest entries."
+            )
+
+            xenium_manifest_status_text.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+            print(
+                f"   Cells Zarr: {cellsPath}",
+                flush=True,
+            )
+
+            print(
+                f"   Matrix Zarr: {matrixPath}",
+                flush=True,
+            )
+
+            print(
+                "▶️ Xenium manifest top-level keys: "
+                + ", ".join(
+                    str(key)
+                    for key in manifest.keys()
+                ),
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Could not load Xenium dataset: {e}"
+            )
+
+            xenium_manifest_status_text.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+    @output
+    @render.ui
+    def xenium_manifest_status():
+        path = (
+            xenium_manifest_path.get()
+        )
+
+        status = (
+            xenium_manifest_status_text.get()
+        )
+
+        parts = [
+            ui.tags.div(
+                status,
+                class_="compact-small-line",
+            )
+        ]
+
+        if path:
+            parts.append(
+                ui.tags.div(
+                    path,
+                    class_=(
+                        "compact-small-line "
+                        "text-muted"
+                    ),
+                    style=(
+                        "word-break: break-all;"
+                    ),
+                )
+            )
+
+        return ui.tags.div(
+            *parts
+        )
+
+    def _flatten_json_for_preview(
+        value,
+        prefix="",
+    ):
+        rows = []
+
+        if isinstance(
+            value,
+            dict,
+        ):
+            for key, child in value.items():
+                childPrefix = (
+                    f"{prefix}.{key}"
+                    if prefix
+                    else str(key)
+                )
+
+                rows.extend(
+                    _flatten_json_for_preview(
+                        child,
+                        childPrefix,
+                    )
+                )
+
+        elif isinstance(
+            value,
+            list,
+        ):
+            if not value:
+                rows.append(
+                    {
+                        "Key": prefix,
+                        "Type": "list",
+                        "Value": "[]",
+                    }
+                )
+
+            else:
+                for index, child in enumerate(
+                    value
+                ):
+                    childPrefix = (
+                        f"{prefix}[{index}]"
+                    )
+
+                    rows.extend(
+                        _flatten_json_for_preview(
+                            child,
+                            childPrefix,
+                        )
+                    )
+
+        else:
+            rows.append(
+                {
+                    "Key": prefix,
+                    "Type": type(
+                        value
+                    ).__name__,
+                    "Value": (
+                        ""
+                        if value is None
+                        else str(value)
+                    ),
+                }
+            )
+
+        return rows
+
+    @output
+    @render.data_frame
+    def xenium_manifest_preview():
+        manifest = (
+            xenium_manifest_data.get()
+        )
+
+        if not manifest:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No Xenium manifest loaded."
+                        ]
+                    }
+                ),
+                height="350px",
+                filters=False,
+            )
+
+        rows = (
+            _flatten_json_for_preview(
+                manifest
+            )
+        )
+
+        previewDf = pd.DataFrame(
+            rows
+        )
+
+        return render.DataGrid(
+            previewDf,
+            height="650px",
+            filters=True,
+            summary=(
+                "Showing manifest entries "
+                "{start}–{end} of {total}"
+            ),
+        )
+
+
+    @output
+    @render.data_frame
+    def xenium_cells_structure_preview():
+        df = (
+            xenium_cells_structure.get()
+        )
+
+        if df is None or df.empty:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No cells Zarr inspected yet."
+                        ]
+                    }
+                ),
+                height="300px",
+                filters=False,
+            )
+
+        return render.DataGrid(
+            df,
+            height="650px",
+            filters=True,
+        )
+
+    @output
+    @render.data_frame
+    def xenium_matrix_structure_preview():
+        df = (
+            xenium_matrix_structure.get()
+        )
+
+        if df is None or df.empty:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No count-matrix Zarr inspected yet."
+                        ]
+                    }
+                ),
+                height="300px",
+                filters=False,
+            )
+
+        return render.DataGrid(
+            df,
+            height="650px",
+            filters=True,
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.load_xenium_data
+    )
+    def _load_xenium_data():
+        manifest_path = (
+            xenium_manifest_path.get()
+        )
+
+        if not manifest_path:
+            ui.notification_show(
+                "Select a Xenium experiment first.",
+                type="warning",
+            )
+            return
+
+        # Release the previous dataset before loading another.
+        xenium_dataset.set(None)
+
+        xenium_data_status_text.set(
+            "Loading Xenium expression data..."
+        )
+
+        try:
+            dataset = load_xenium_dataset(
+                manifest_path
+            )
+
+            xenium_dataset.set(
+                dataset
+            )
+
+            summary = dataset["summary"]
+
+            msg = (
+                f"Loaded {summary['n_cells']:,} cells "
+                f"and {summary['n_features']:,} features. "
+                f"Sparse matrix contains "
+                f"{summary['n_nonzero']:,} stored entries."
+            )
+
+            xenium_data_status_text.set(
+                msg
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            xenium_data_status_text.set(
+                f"Xenium loading failed: {e}"
+            )
+
+            ui.notification_show(
+                f"Xenium loading failed: {e}",
+                type="error",
+                duration=10,
+            )
+
+    @output
+    @render.ui
+    def xenium_data_status():
+        return ui.tags.div(
+            xenium_data_status_text.get(),
+            class_="compact-small-line",
+        )
+
+
+    @output
+    @render.data_frame
+    def xenium_data_preview():
+        dataset = xenium_dataset.get()
+
+        if dataset is None:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No Xenium data loaded."
+                        ]
+                    }
+                )
+            )
+
+        obs = dataset["obs"]
+
+        return render.DataGrid(
+            obs.head(100),
+            height="550px",
+            filters=True,
+        )
+
+
+
 
 
     def _get_mesmer_env_name() -> str:
@@ -6757,6 +7300,9 @@ def server(input, output, session):
 
                 "subclustering_pushed_columns":
                     subclustering_pushed_columns.get(),
+
+                "subclustering_deg_results":
+                    subclustering_deg_results.get(),
             }
 
             save_clustering_session(
@@ -7088,6 +7634,13 @@ def server(input, output, session):
                 state.get(
                     "subclustering_pushed_columns",
                     [],
+                )
+            )
+
+            subclustering_deg_results.set(
+                state.get(
+                    "subclustering_deg_results",
+                    pd.DataFrame(),
                 )
             )
 
@@ -9314,6 +9867,10 @@ def server(input, output, session):
             ]
         ].copy()
 
+        displayDf = format_deg_table(
+            displayDf
+        )
+
         return render.DataGrid(
             displayDf,
             height="520px",
@@ -9368,7 +9925,11 @@ def server(input, output, session):
             return
 
         try:
-            resultDf.to_csv(
+            exportDf = format_deg_table(
+                resultDf
+            )
+
+            exportDf.to_csv(
                 savePath,
                 index=False,
             )
@@ -10875,9 +11436,10 @@ def server(input, output, session):
             subclustering_pca_variance.set(pd.DataFrame())
             subclustering_leiden_labels.set(pd.DataFrame())
             subclustering_pacmap_embedding.set(pd.DataFrame())
-            subclustering_cluster_name_map.set(
-                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
-            )
+            subclustering_cluster_name_map.set(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
+
+            subclustering_deg_results.set(pd.DataFrame())
+            subclustering_deg_status.set("Subcluster marker results cleared because the parent population changed.")
 
             msg = (
                 f"Prepared subclustering subset: {parentName}; "
@@ -10991,6 +11553,9 @@ def server(input, output, session):
             subclustering_leiden_labels.set(pd.DataFrame())
             subclustering_pacmap_embedding.set(pd.DataFrame())
             subclustering_cluster_name_map.set(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
+
+            subclustering_deg_results.set(pd.DataFrame())
+            subclustering_deg_status.set("Subcluster marker results cleared because sub-PCA was rerun.")
 
             msg = (
                 f"Sub-PCA complete: "
@@ -11145,10 +11710,28 @@ def server(input, output, session):
 
             # Clear downstream sub-annotation state.
             subclustering_pacmap_embedding.set(pd.DataFrame())
-            subclustering_cluster_name_map.set(
-                pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+
+            subclusterNames = sorted(
+                labelsDf["PINT_SubLeiden_cluster"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist(),
+                key=_cluster_sort_key,
             )
 
+            subclustering_cluster_name_map.set(
+                pd.DataFrame(
+                    {
+                        "OldClusterName": subclusterNames,
+                        "NewClusterName": subclusterNames,
+                    }
+                )
+            )
+
+            subclustering_deg_results.set(pd.DataFrame())
+            subclustering_deg_status.set("Subcluster marker results cleared because sub-Leiden was rerun.")
+    
             nClusters = labelsDf["PINT_SubLeiden_cluster"].nunique()
 
             msg = (
@@ -11157,9 +11740,8 @@ def server(input, output, session):
             )
 
             subclustering_status.set(msg)
-            subclustering_annotation_status.set(
-                "Sub-Leiden was rerun. Subcluster annotations and sub-PaCMAP were cleared."
-            )
+            subclustering_annotation_status.set("Sub-Leiden was rerun. Subcluster annotations and sub-PaCMAP were cleared.")
+
 
             print(f"✅ {msg}", flush=True)
 
@@ -11433,12 +12015,11 @@ def server(input, output, session):
         subclustering_leiden_labels.set(pd.DataFrame())
         subclustering_pacmap_embedding.set(pd.DataFrame())
 
-        subclustering_cluster_name_map.set(
-            pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
-        )
-
+        subclustering_cluster_name_map.set(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
         subclustering_marker_summary.set(pd.DataFrame())
 
+        subclustering_deg_results.set(pd.DataFrame())
+        subclustering_deg_status.set("No subcluster marker analysis run yet.")
 
     def _drop_subclustering_columns_from_master():
         df = clustering_data.get()
@@ -11725,20 +12306,245 @@ def server(input, output, session):
     @output
     @render.data_frame
     def subcluster_name_map_preview():
-        annDf = _get_subcluster_annotated_labels()
-
-        if annDf is None or annDf.empty:
-            empty = pd.DataFrame({"Message": ["No subcluster annotations available yet."]})
-            return render.DataGrid(empty, height="260px", filters=False)
-
-        out = (
-            annDf
-            .groupby(["PINT_SubLeiden_cluster", "PINT_SubClusterName"], dropna=False)
-            .size()
-            .reset_index(name="n_cells")
+        nameMap = (
+            subclustering_cluster_name_map.get()
         )
 
-        return render.DataGrid(out, height="260px", filters=False)
+        if nameMap is None or nameMap.empty:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Message": [
+                            "No sub-Leiden clusters available. "
+                            "Run sub-Leiden clustering first."
+                        ]
+                    }
+                ),
+                height="220px",
+                filters=False,
+            )
+
+        nameMap = (
+            nameMap
+            .copy()
+            .reset_index(drop=True)
+        )
+
+        nClusters = len(nameMap)
+        nRows = int(
+            np.ceil(nClusters / 3)
+        )
+
+        displayRows = []
+
+        for displayRow in range(nRows):
+            row = {}
+
+            for block in range(3):
+                sourceIndex = (
+                    displayRow
+                    + block * nRows
+                )
+
+                clusterCol = (
+                    f"Sub-Leiden cluster {block + 1}"
+                )
+
+                nameCol = (
+                    f"New subcluster name {block + 1}"
+                )
+
+                if sourceIndex < nClusters:
+                    row[clusterCol] = (
+                        nameMap.iloc[
+                            sourceIndex
+                        ]["OldClusterName"]
+                    )
+
+                    row[nameCol] = (
+                        nameMap.iloc[
+                            sourceIndex
+                        ]["NewClusterName"]
+                    )
+
+                else:
+                    row[clusterCol] = ""
+                    row[nameCol] = ""
+
+                if block < 2:
+                    row[
+                        f"__spacer_{block + 1}__"
+                    ] = ""
+
+            displayRows.append(
+                row
+            )
+
+        displayDf = pd.DataFrame(
+            displayRows
+        )
+
+        displayDf = displayDf.rename(
+            columns={
+                "__spacer_1__": " ",
+                "__spacer_2__": "  ",
+            }
+        )
+
+        return render.DataGrid(
+            displayDf,
+            editable=True,
+            height="fit-content",
+            filters=False,
+        )
+
+    @subcluster_name_map_preview.set_patch_fn
+    def _edit_subcluster_name_map(
+        *,
+        patch: render.CellPatch,
+    ):
+        displayRow = int(
+            patch["row_index"]
+        )
+
+        displayCol = int(
+            patch["column_index"]
+        )
+
+        nameMap = (
+            subclustering_cluster_name_map.get()
+            .copy()
+            .reset_index(drop=True)
+        )
+
+        if nameMap is None or nameMap.empty:
+            return patch["value"]
+
+        nClusters = len(
+            nameMap
+        )
+
+        nRows = int(
+            np.ceil(nClusters / 3)
+        )
+
+        # Display columns:
+        #
+        # 0 = Sub-Leiden cluster 1
+        # 1 = Subcluster name 1
+        # 2 = spacer
+        # 3 = Sub-Leiden cluster 2
+        # 4 = Subcluster name 2
+        # 5 = spacer
+        # 6 = Sub-Leiden cluster 3
+        # 7 = Subcluster name 3
+
+        editableColumns = {
+            1: 0,
+            4: 1,
+            7: 2,
+        }
+
+        protectedClusterColumns = {
+            0: 0,
+            3: 1,
+            6: 2,
+        }
+
+        # ------------------------------------------------------------
+        # Protect original Sub-Leiden IDs
+        # ------------------------------------------------------------
+        if displayCol in protectedClusterColumns:
+            block = (
+                protectedClusterColumns[
+                    displayCol
+                ]
+            )
+
+            sourceIndex = (
+                displayRow
+                + block * nRows
+            )
+
+            if sourceIndex >= nClusters:
+                return ""
+
+            return str(
+                nameMap.iloc[
+                    sourceIndex
+                ]["OldClusterName"]
+            )
+
+        # Spacer columns cannot be edited.
+        if displayCol not in editableColumns:
+            return ""
+
+        # ------------------------------------------------------------
+        # Translate displayed cell -> source map row
+        # ------------------------------------------------------------
+        block = (
+            editableColumns[
+                displayCol
+            ]
+        )
+
+        sourceIndex = (
+            displayRow
+            + block * nRows
+        )
+
+        if sourceIndex >= nClusters:
+            return ""
+
+        oldValue = str(
+            nameMap.iloc[
+                sourceIndex
+            ]["NewClusterName"]
+        )
+
+        newValue = str(
+            patch["value"]
+            or ""
+        ).strip()
+
+        if not newValue:
+            ui.notification_show(
+                "Subcluster names cannot be empty.",
+                type="warning",
+                duration=4,
+            )
+
+            return oldValue
+
+        nameMap.iat[
+            sourceIndex,
+            nameMap.columns.get_loc(
+                "NewClusterName"
+            ),
+        ] = newValue
+
+        subclustering_cluster_name_map.set(
+            nameMap
+        )
+
+        # Annotation changes invalidate existing DEG results because
+        # multiple Sub-Leiden clusters may now represent one population.
+        subclustering_deg_results.set(
+            pd.DataFrame()
+        )
+
+        subclustering_deg_status.set(
+            "Subcluster marker results cleared because "
+            "subcluster annotations changed."
+        )
+
+        subclustering_annotation_status.set(
+            f"Renamed "
+            f"{nameMap.iloc[sourceIndex]['OldClusterName']} "
+            f"to {newValue!r}."
+        )
+
+        return newValue
 
 
     @output
@@ -11797,10 +12603,51 @@ def server(input, output, session):
     @output
     @render.ui
     def subclustering_pca_plot_ui():
-        return ui.output_plot(
-            "subclustering_pca_plot",
-            width="100%",
-            height="500px",
+        pcaDf = subclustering_pca_scores.get()
+
+        widthPx = 1200
+        heightPx = 500
+
+        try:
+            widthPx = int(
+                input.subclustering_embedding_plot_width()
+                or 1200
+            )
+
+            widthPx = max(
+                600,
+                min(1800, widthPx),
+            )
+
+        except Exception:
+            widthPx = 1200
+
+        if (
+            pcaDf is not None
+            and not pcaDf.empty
+            and {"PC_1", "PC_2"}.issubset(
+                pcaDf.columns
+            )
+        ):
+            _, _, heightPx = (
+                _get_equal_axis_plot_geometry(
+                    pcaDf,
+                    "PC_1",
+                    "PC_2",
+                    width_px=widthPx,
+                )
+            )
+
+        return ui.tags.div(
+            ui.output_plot(
+                "subclustering_pca_plot",
+                width=f"{widthPx}px",
+                height=f"{heightPx}px",
+            ),
+            style=(
+                "max-width: 100%; "
+                "overflow-x: auto;"
+            ),
         )
 
 
@@ -12163,7 +13010,88 @@ def server(input, output, session):
 
             notAnnotated = sorted(currentClusters - mappedClusters)
 
-            subclustering_cluster_name_map.set(nameMap)
+            currentMap = (
+                subclustering_cluster_name_map.get()
+                .copy()
+            )
+
+            if currentMap is None or currentMap.empty:
+                currentClusters = (
+                    _get_current_subcluster_names()
+                )
+
+                currentMap = pd.DataFrame(
+                    {
+                        "OldClusterName":
+                            currentClusters,
+                        "NewClusterName":
+                            currentClusters,
+                    }
+                )
+
+            currentClusters = set(
+                currentMap[
+                    "OldClusterName"
+                ].astype(str)
+            )
+
+            importedClusters = set(
+                nameMap[
+                    "OldClusterName"
+                ].astype(str)
+            )
+
+            unknownClusters = sorted(
+                importedClusters
+                - currentClusters,
+                key=_cluster_sort_key,
+            )
+
+            validImported = (
+                nameMap.loc[
+                    nameMap[
+                        "OldClusterName"
+                    ].isin(
+                        currentClusters
+                    )
+                ]
+                .copy()
+            )
+
+            importLookup = dict(
+                zip(
+                    validImported[
+                        "OldClusterName"
+                    ],
+                    validImported[
+                        "NewClusterName"
+                    ],
+                )
+            )
+
+            currentMap[
+                "NewClusterName"
+            ] = currentMap.apply(
+                lambda row: (
+                    importLookup.get(
+                        str(
+                            row[
+                                "OldClusterName"
+                            ]
+                        ),
+                        row[
+                            "NewClusterName"
+                        ],
+                    )
+                ),
+                axis=1,
+            )
+
+            subclustering_cluster_name_map.set(
+                currentMap
+            )
+            subclustering_deg_results.set(pd.DataFrame())
+            subclustering_deg_status.set("Subcluster marker results cleared because subcluster annotations changed.")
 
             msg = (
                 f"Imported subcluster-name map: {len(nameMap):,} rows. "
@@ -12184,6 +13112,491 @@ def server(input, output, session):
             subclustering_annotation_status.set(msg)
             print(f"❌ {msg}", flush=True)    
 
+    @reactive.Effect
+    @reactive.event(
+        input.run_subclustering_deg
+    )
+    def _run_subclustering_deg():
+        df = clustering_data.get()
+
+        if df is None or df.empty:
+            ui.notification_show(
+                "No clustering dataset is loaded.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        labelsDf = (
+            _get_subcluster_annotated_labels()
+        )
+
+        if labelsDf is None or labelsDf.empty:
+            ui.notification_show(
+                "No subcluster annotations are available. "
+                "Run sub-Leiden clustering first.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        try:
+            # ------------------------------------------------------------
+            # Features
+            # ------------------------------------------------------------
+            featureMap = (
+                _get_valid_clustering_column_map()
+            )
+
+            if (
+                featureMap is None
+                or featureMap.empty
+            ):
+                raise ValueError(
+                    "No clustering features are currently selected."
+                )
+
+            sourceCols = (
+                featureMap[
+                    "ChannelNamesForClustering"
+                ]
+                .astype(str)
+                .tolist()
+            )
+
+            displayLookup = dict(
+                zip(
+                    featureMap[
+                        "ChannelNamesForClustering"
+                    ].astype(str),
+
+                    featureMap[
+                        "ChannelNameToDisplay"
+                    ].astype(str),
+                )
+            )
+
+            missingCols = [
+                col
+                for col in sourceCols
+                if col not in df.columns
+            ]
+
+            if missingCols:
+                raise ValueError(
+                    "Selected marker columns are missing from "
+                    "the current dataset: "
+                    + ", ".join(
+                        missingCols[:20]
+                    )
+                )
+
+            # ------------------------------------------------------------
+            # Restrict master data to cells in the current subclustering
+            # result and attach the current annotated subcluster names.
+            # ------------------------------------------------------------
+            analysisDf = df[
+                [
+                    PINT_CELL_ID_COL,
+                    *sourceCols,
+                ]
+            ].copy()
+
+            analysisDf = analysisDf.merge(
+                labelsDf[
+                    [
+                        PINT_CELL_ID_COL,
+                        "PINT_SubClusterName",
+                    ]
+                ],
+                on=PINT_CELL_ID_COL,
+                how="inner",
+                validate="one_to_one",
+            )
+
+            if analysisDf.empty:
+                raise ValueError(
+                    "No cells could be matched to the current "
+                    "subcluster annotations."
+                )
+
+            nClusters = int(
+                analysisDf[
+                    "PINT_SubClusterName"
+                ]
+                .nunique()
+            )
+
+            if nClusters < 2:
+                raise ValueError(
+                    "At least two annotated subclusters are required."
+                )
+
+            minPct = float(
+                input.subclustering_deg_min_pct()
+                or 0
+            )
+
+            minLog2Fc = float(
+                input.subclustering_deg_min_log2fc()
+                or 0
+            )
+
+            detectionThreshold = float(
+                input.subclustering_deg_detection_threshold()
+                or 0
+            )
+
+            onlyPositive = bool(
+                input.subclustering_deg_only_positive()
+            )
+
+            subclustering_deg_status.set(
+                f"Running marker analysis for "
+                f"{nClusters:,} annotated subclusters..."
+            )
+
+            # ------------------------------------------------------------
+            # Progress bar
+            # ------------------------------------------------------------
+            with ui.Progress(
+                min=0,
+                max=nClusters,
+                session=session,
+            ) as progress:
+
+                def updateSubDegProgress(
+                    message,
+                    current,
+                    total,
+                ):
+                    progress.set(
+                        value=current,
+                        message=(
+                            "Finding subcluster markers"
+                        ),
+                        detail=message,
+                    )
+
+                resultDf = (
+                    find_all_cluster_markers(
+                        analysisDf,
+                        cluster_col=(
+                            "PINT_SubClusterName"
+                        ),
+                        feature_cols=sourceCols,
+                        only_positive=onlyPositive,
+                        min_pct=minPct,
+                        min_log2fc=minLog2Fc,
+                        detection_threshold=(
+                            detectionThreshold
+                        ),
+                        progress_callback=(
+                            updateSubDegProgress
+                        ),
+                    )
+                )
+
+            # ------------------------------------------------------------
+            # Add display names while retaining original source columns.
+            # ------------------------------------------------------------
+            if not resultDf.empty:
+                resultDf = resultDf.rename(
+                    columns={
+                        "Feature":
+                            "SourceFeature",
+                    }
+                )
+
+                resultDf.insert(
+                    2,
+                    "Feature",
+                    resultDf[
+                        "SourceFeature"
+                    ]
+                    .map(
+                        displayLookup
+                    )
+                    .fillna(
+                        resultDf[
+                            "SourceFeature"
+                        ]
+                    ),
+                )
+
+            subclustering_deg_results.set(
+                resultDf
+            )
+
+            nResults = len(
+                resultDf
+            )
+
+            if resultDf.empty:
+                msg = (
+                    "Subcluster marker analysis finished, "
+                    "but no features passed the current filters."
+                )
+
+            else:
+                nSignificant = int(
+                    (
+                        resultDf[
+                            "p_adj_BH"
+                        ]
+                        < 0.05
+                    ).sum()
+                )
+
+                msg = (
+                    f"Subcluster marker analysis complete: "
+                    f"{nResults:,} marker result(s), "
+                    f"{nSignificant:,} with "
+                    f"BH-adjusted p < 0.05."
+                )
+
+            subclustering_deg_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=8,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Subcluster marker analysis failed: {e}"
+            )
+
+            subclustering_deg_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
+
+    @output
+    @render.ui
+    def subclustering_deg_summary():
+        resultDf = (
+            subclustering_deg_results.get()
+        )
+
+        status = (
+            subclustering_deg_status.get()
+        )
+
+        if resultDf is None or resultDf.empty:
+            return ui.tags.small(
+                status,
+                class_="text-muted",
+            )
+
+        nClusters = (
+            resultDf["Cluster"]
+            .nunique()
+            if "Cluster" in resultDf.columns
+            else 0
+        )
+
+        nFeatures = (
+            resultDf["Feature"]
+            .nunique()
+            if "Feature" in resultDf.columns
+            else 0
+        )
+
+        return ui.tags.div(
+            ui.tags.div(
+                status,
+                class_="compact-small-line",
+            ),
+
+            ui.tags.div(
+                (
+                    f"Subclusters: {nClusters:,} | "
+                    f"features represented: {nFeatures:,} | "
+                    f"rows: {len(resultDf):,}"
+                ),
+                class_=(
+                    "compact-small-line "
+                    "text-muted"
+                ),
+            ),
+        )
+
+    @output
+    @render.data_frame
+    def subclustering_deg_preview():
+        resultDf = (
+            subclustering_deg_results.get()
+        )
+
+        if resultDf is None or resultDf.empty:
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No subcluster marker results available."
+                        ]
+                    }
+                ),
+                height="220px",
+                filters=False,
+            )
+
+        displayCols = [
+            "Cluster",
+            "Feature",
+            "SourceFeature",
+            "Mean_in",
+            "Mean_out",
+            "Mean_difference",
+            "log2FC",
+            "pct_in",
+            "pct_out",
+            "p_value",
+            "p_adj_BH",
+        ]
+
+        displayDf = resultDf[
+            [
+                col
+                for col in displayCols
+                if col in resultDf.columns
+            ]
+        ].copy()
+
+        displayDf = format_deg_table(
+            displayDf
+        )
+
+        return render.DataGrid(
+            displayDf,
+            height="520px",
+            filters=True,
+            summary=(
+                "Showing marker results "
+                "{start}–{end} of {total}"
+            ),
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.export_subclustering_deg
+    )
+    def _export_subclustering_deg():
+        resultDf = (
+            subclustering_deg_results.get()
+        )
+
+        if resultDf is None or resultDf.empty:
+            ui.notification_show(
+                "No subcluster marker results are available to export.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        folder = (
+            last_loaded_folder.get()
+            or (input.path() or "").strip()
+        )
+
+        initdir = (
+            folder
+            if folder and os.path.isdir(folder)
+            else os.getcwd()
+        )
+
+        parentName = (
+            subclustering_parent_cluster.get()
+            or "subcluster"
+        )
+
+        safeParent = _safe_file_stem(
+            parentName
+        )
+
+        savePath = pick_save_csv_dialog(
+            title="Export PINT subcluster markers",
+            initialdir=initdir,
+            initialfile=(
+                f"PINT_subcluster_markers_"
+                f"{safeParent}.csv"
+            ),
+        )
+
+        if not savePath:
+            print(
+                "🛑 Subcluster marker export canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            exportDf = format_deg_table(
+                resultDf
+            )
+
+            exportDf.to_csv(
+                savePath,
+                index=False,
+            )
+
+            msg = (
+                f"Exported {len(resultDf):,} "
+                f"subcluster-marker results to: "
+                f"{savePath}"
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Subcluster marker export failed: {e}"
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {msg}",
+                flush=True,
+            )
 
     @reactive.Effect
     @reactive.event(input.push_mesmer_to_mask_visualization)

@@ -2,7 +2,7 @@
 
 # PINT
 
-**Current version:** 0.6.1
+**Current version:** 0.6.9
 
 
 PINT is an IMC/CyTOF viewer for image loading, normalization, mask visualization, and neighborhood analysis.

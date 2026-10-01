@@ -6,9 +6,9 @@ from pint_app.shiny_ui.thumbnail_ui import thumbnail_panel
 from pint_app.shiny_ui.image_loading_ui import image_loading_panel
 
 
-def image_handler_panel():
+def imc_panel():
     return ui.nav_panel(
-        "Image Handler",
+        "IMC",
 
         ui.navset_tab(
             image_loading_panel(),
@@ -18,5 +18,5 @@ def image_handler_panel():
             id="image_handler_mode",
         ),
 
-        value="image_handler",
+        value="imc",
     )

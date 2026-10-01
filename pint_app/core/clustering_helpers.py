@@ -687,3 +687,47 @@ def set_clustering_columns_by_suffix(
     ] = include
 
     return updated, n_matched
+
+def format_deg_table(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    ordinaryCols = [
+        "Mean_in",
+        "Mean_out",
+        "Mean_difference",
+        "log2FC",
+        "pct_in",
+        "pct_out",
+    ]
+
+    for col in ordinaryCols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(
+                out[col],
+                errors="coerce",
+            ).round(3)
+
+    for col in [
+        "p_value",
+        "p_adj_BH",
+    ]:
+        if col in out.columns:
+            values = pd.to_numeric(
+                out[col],
+                errors="coerce",
+            )
+
+            out[col] = values.map(
+                lambda x: (
+                    f"{x:.3e}"
+                    if pd.notna(x)
+                    else ""
+                )
+            )
+
+    return out

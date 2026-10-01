@@ -18,6 +18,7 @@ dependencies:
   - leidenalg
   - pillow>=10
   - imageio>=2.34
+  - zarr>=3
   - pip:
       - -e .
       - shiny==1.4.0
