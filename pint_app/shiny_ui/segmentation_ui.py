@@ -2,8 +2,244 @@ from shiny import ui
 
 from pint_app.core.mesmer_backend import DEFAULT_MESMER_ENV_NAME
 
-
 def segmentation_panel():
+    return ui.nav_panel(
+        "Segmentation and quantification",
+
+        ui.navset_tab(
+            mesmer_segmentation_panel(),
+            quantification_panel(),
+            id="segmentation_quantification_mode",
+        ),
+
+        value="segmentation",
+    )
+
+def quantification_panel():
+    return ui.nav_panel(
+        "Quantification",
+
+        ui.tags.div(
+
+            # ============================================================
+            # LEFT CONTROL COLUMN
+            # ============================================================
+            ui.tags.div(
+
+                # --------------------------------------------------------
+                # Quantification images
+                # --------------------------------------------------------
+                ui.card(
+                    ui.card_header(
+                        "Quantification images"
+                    ),
+
+                    ui.tags.div(
+                        ui.tags.strong(
+                            "Important"
+                        ),
+                        ui.tags.p(
+                            "PINT quantifies the pixel values in the images "
+                            "selected here. Load the preprocessed images that "
+                            "you actually want to quantify. If you use raw "
+                            "images, the resulting cell table will contain "
+                            "raw intensities.",
+                            class_="mb-0",
+                        ),
+                        class_="alert alert-info",
+                    ),
+
+                    ui.input_action_button(
+                        "quant_use_pint_images",
+                        "Use current PINT images",
+                        class_="btn btn-primary w-100 mb-2",
+                    ),
+
+                    ui.input_action_button(
+                        "quant_load_image_folder",
+                        "Load image folder",
+                        class_="btn btn-secondary w-100",
+                    ),
+
+                    ui.output_ui(
+                        "quantification_image_summary"
+                    ),
+
+                    class_="mb-2",
+                ),
+
+                # --------------------------------------------------------
+                # Segmentation masks
+                # --------------------------------------------------------
+                ui.card(
+                    ui.card_header(
+                        "Segmentation masks"
+                    ),
+
+                    ui.tags.p(
+                        "Use masks created by Mesmer in this PINT session "
+                        "or load an existing folder containing labelled "
+                        "segmentation masks.",
+                        class_="text-muted",
+                    ),
+
+                    ui.input_action_button(
+                        "quant_use_mesmer_masks",
+                        "Use current Mesmer masks",
+                        class_="btn btn-primary w-100 mb-2",
+                    ),
+
+                    ui.input_action_button(
+                        "quant_load_mask_folder",
+                        "Load mask folder",
+                        class_="btn btn-secondary w-100",
+                    ),
+
+                    ui.output_ui(
+                        "quantification_mask_summary"
+                    ),
+
+                    class_="mb-2",
+                ),
+
+                # --------------------------------------------------------
+                # Matching
+                # --------------------------------------------------------
+                ui.card(
+                    ui.card_header(
+                        "Image / mask matching"
+                    ),
+
+                    ui.input_action_button(
+                        "quant_match_images_masks",
+                        "Match images and masks",
+                        class_="btn btn-primary w-100",
+                    ),
+
+                    ui.output_ui(
+                        "quantification_match_summary"
+                    ),
+
+                    ui.hr(),
+
+                    ui.input_select(
+                        "quant_selected_roi",
+                        "ROI / mask",
+                        choices=[],
+                        selected=None,
+                        width="100%",
+                    ),
+
+                    ui.row(
+                        ui.column(
+                            6,
+                            ui.input_action_button(
+                                "quant_prev_roi",
+                                "← Previous",
+                                class_="btn btn-secondary w-100",
+                            ),
+                        ),
+                        ui.column(
+                            6,
+                            ui.input_action_button(
+                                "quant_next_roi",
+                                "Next →",
+                                class_="btn btn-secondary w-100",
+                            ),
+                        ),
+                        class_="gx-2",
+                    ),
+
+                    class_="mb-2",
+                ),
+
+                # --------------------------------------------------------
+                # Quantification controls
+                # --------------------------------------------------------
+                ui.card(
+                    ui.card_header(
+                        "Quantification"
+                    ),
+
+                    ui.input_select(
+                        "seg_quantification_mode",
+                        "Image values",
+                        choices={
+                            "pint": "PINT-processed images",
+                            "raw": "Raw images (not recommended)",
+                        },
+                        selected="pint",
+                        width="100%",
+                    ),
+
+                    ui.input_action_button(
+                        "quantify_mesmer_masks",
+                        "Create cell table",
+                        class_="btn btn-primary w-100 mt-2",
+                    ),
+
+                    ui.input_action_button(
+                        "push_mesmer_to_clustering",
+                        "Push quantification to Clustering",
+                        class_="btn btn-success w-100 mt-2",
+                    ),
+
+                    ui.input_action_button(
+                        "push_mesmer_to_mask_visualization",
+                        "Push results to Mask visualization",
+                        class_="btn btn-secondary w-100 mt-2",
+                    ),
+
+                    ui.output_ui(
+                        "segmentation_quantification_summary"
+                    ),
+
+                    class_="mb-2",
+                ),
+
+                class_="controls-left",
+            ),
+
+            # ============================================================
+            # RIGHT VIEWER COLUMN
+            # ============================================================
+            ui.tags.div(
+
+                ui.card(
+                    ui.card_header(
+                        "Segmentation mask overview"
+                    ),
+
+                    ui.output_plot(
+                        "quantification_mask_preview",
+                        width="100%",
+                        height="700px",
+                    ),
+
+                    class_="mb-2",
+                ),
+
+                ui.card(
+                    ui.card_header(
+                        "Matched datasets"
+                    ),
+
+                    ui.output_data_frame(
+                        "quantification_match_preview"
+                    ),
+                ),
+
+                class_="viewer-main",
+            ),
+
+            class_="pint-main-layout",
+        ),
+
+        value="quantification",
+    )
+
+
+def mesmer_segmentation_panel():
     return ui.nav_panel(
         "Segmentation",
         ui.tags.div(
@@ -182,29 +418,6 @@ def segmentation_panel():
                     ui.output_ui("segmentation_mesmer_result_summary"),
 
                     ui.hr(),
-
-                    ui.input_select(
-                        "seg_quantification_mode",
-                        "Cell-table quantification images",
-                        choices={
-                            "raw": "Raw image values",
-                            "pint": "Current PINT-processed values",
-                        },
-                        selected="pint",
-                        width="100%",
-                    ),
-
-                    ui.input_action_button(
-                        "quantify_mesmer_masks",
-                        "Create cell table from Mesmer masks",
-                        class_="btn btn-primary w-100 mt-2",
-                    ),
-
-                    ui.input_action_button(
-                        "push_mesmer_to_clustering",
-                        "Push quantification to Clustering",
-                        class_="btn btn-success w-100 mt-2",
-                    ),
 
                     ui.input_action_button(
                         "push_mesmer_to_mask_visualization",

@@ -58,12 +58,22 @@ open issues/to do
 0.6.8.2
     -Fixed channelname inconsistency between MCD nad ome.tiff import
     -Removed annoy as dependancy, PaCMAP switched to FAISS
-0.6.9.0
+0.6.9
     -Cleaned up clustering UI
     -You can now enter the cluster names directly into PINT
     -Added DEG expression between clusters (as a prep for Xenium)
     -Added a .Xenium viewer (not functional, only able to read the experiments)
     -Fixed tiny bug where the number of cells in the subclustering didn't match the actual number
+0.6.9.1
+    -Rework of the segmentation interface
+    -Fixed a bug where the PINT image export option would use the path from the image handler tab, which would be empty when the user inported MCD files
+    -10 times performance increase of the cell mask quantification
+
+    Open bugs
+        -Interface of the clustering tab doesn't scroll all the way download
+        -Long processes will still crash -> Browser disconnect from shiny. This happens because the shiny and the analyses processes are in one worker (this has priority)
+            Only crashes when the thread is "locked" long enough for the browser to assume the process is dead. 
+
 
 
 

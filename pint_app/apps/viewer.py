@@ -26,7 +26,10 @@ from tifffile import imwrite, imread
 
 
 ##Internal import from /core
-from pint_app.core.load_tiffs import load_tiffs_raw
+from pint_app.core.load_tiffs import (
+    load_tiffs_raw,
+    inspect_tiff_stack,
+)
 
 from pint_app.core.clustering_DEG import (
     find_all_cluster_markers,
@@ -152,7 +155,7 @@ from pint_app.core.thumbnail_helpers import (
     generate_channel_thumbnails,
 )
 
-from pint_app.core.segmentation_quantification import quantify_mesmer_masks_for_dataset
+from pint_app.core.segmentation_quantification import quantify_mask_intensities
 
 from pint_app.core.xenium_loader import (
     open_xenium_zarr,
@@ -249,6 +252,9 @@ def server(input, output, session):
 
     viewer_zoom_bounds = reactive.Value(None)
 
+    thumbnail_cache = reactive.Value({})
+    thumbnail_status = reactive.Value("No thumbnails generated yet.")
+
     xenium_manifest_path = reactive.Value("")
     xenium_manifest_data = reactive.Value({})
     xenium_manifest_status_text = reactive.Value("No Xenium experiment loaded.")
@@ -258,7 +264,13 @@ def server(input, output, session):
     xenium_dataset = reactive.Value(None)
     xenium_data_status_text = reactive.Value("No Xenium expression data loaded.")
 
+    mesmer_backend_status = reactive.Value(None)
+    mesmer_backend_detail_text = reactive.Value(
+        "Mesmer backend has not been checked yet.\n\n"
+        "This Alpha tab currently only manages optional Mesmer/DeepCell installation."
+    ) 
 
+    segmentation_input_data = reactive.Value(None) 
     segmentation_mesmer_mask = reactive.Value(None)
     segmentation_mesmer_result = reactive.Value(None)
     segmentation_mesmer_mask_path = reactive.Value("")
@@ -269,8 +281,12 @@ def server(input, output, session):
     segmentation_mask_table_path = reactive.Value("")
     segmentation_quantification_status = reactive.Value("No Mesmer mask quantification run yet.")
 
-    thumbnail_cache = reactive.Value({})
-    thumbnail_status = reactive.Value("No thumbnails generated yet.")
+    quantification_input_data = reactive.Value(None)
+    quantification_image_folder = reactive.Value("")
+    quantification_mask_folder = reactive.Value("")
+    quantification_mask_files = reactive.Value(pd.DataFrame())
+    quantification_match_table = reactive.Value(pd.DataFrame())
+    quantification_status = reactive.Value("No quantification dataset prepared yet.")
 
     # Shared clustering dataset state.
     # This is intentionally one central object used by all clustering sub-tabs:
@@ -369,14 +385,7 @@ def server(input, output, session):
     neighborhood_touching_results = reactive.Value(pd.DataFrame())
     neighborhood_sample_matrix = reactive.Value(pd.DataFrame())
     neighborhood_permanova_results = reactive.Value(pd.DataFrame())
-
-    mesmer_backend_status = reactive.Value(None)
-    mesmer_backend_detail_text = reactive.Value(
-        "Mesmer backend has not been checked yet.\n\n"
-        "This Alpha tab currently only manages optional Mesmer/DeepCell installation."
-    ) 
-    segmentation_input_data = reactive.Value(None) 
-    
+ 
     ##Reserved column for the clustering data table
     PINT_CELL_ID_COL = "PINT_Cell_ID"
     RESERVED_CLUSTERING_COLUMNS = {PINT_CELL_ID_COL}
@@ -1393,7 +1402,10 @@ def server(input, output, session):
         return fig
 
     def _safe_file_stem(name: str) -> str:
-        return "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in str(name))
+        return "".join(
+            ch if ch.isalnum() or ch in ("_", "-", ".", "(", ")") else "_"
+            for ch in str(name)
+        )
 
 
     def _get_segmentation_output_dir() -> Path:
@@ -1491,6 +1503,896 @@ def server(input, output, session):
         }
 
         return nuclearPath, boundaryPath, maskPath, jsonPath, meta    
+
+    @reactive.Effect
+    @reactive.event(input.quant_use_pint_images)
+    def _quant_use_pint_images():
+        imgs = images.get()
+        chs = channels.get()
+
+        if not imgs:
+            ui.notification_show(
+                "No images are currently loaded in PINT.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        quantification_input_data.set(
+            {
+                "images": imgs,
+                "channels": chs,
+                "source": "pint",
+                "source_folder": (
+                    last_loaded_folder.get()
+                    or ""
+                ),
+            }
+        )
+
+        msg = (
+            f"Using {len(imgs):,} current PINT image(s) "
+            "for quantification."
+        )
+
+        quantification_status.set(
+            msg
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+
+    @reactive.Effect
+    @reactive.event(input.quant_load_image_folder)
+    def _quant_load_image_folder():
+        initialDir = (
+            last_loaded_folder.get()
+            or os.getcwd()
+        )
+
+        folder = pick_folder_dialog(
+            title="Select quantification image folder",
+            initialdir=initialDir,
+        )
+
+        if not folder:
+            print("🛑 Quantification image loading canceled.", flush=True,)
+            return
+
+        folderPath = Path(
+            folder
+        )
+
+        allTiffs = sorted(
+            path
+            for path in folderPath.iterdir()
+            if (
+                path.is_file()
+                and path.suffix.lower()
+                in {".tif", ".tiff"}
+            )
+        )
+
+        pint32Files = [
+            path
+            for path in allTiffs
+            if path.stem.lower().endswith(
+                " normalized 32bit"
+            )
+        ]
+
+        pint16Files = [
+            path
+            for path in allTiffs
+            if path.stem.lower().endswith(
+                " normalized uint16"
+            )
+        ]
+
+        if pint32Files:
+            filesToUse = pint32Files
+
+            print(
+                f"ℹ️ Detected PINT processed output. "
+                f"Using {len(pint32Files):,} 32-bit image(s).",
+                flush=True,
+            )
+
+            if pint16Files:
+                print(
+                    f"   Ignoring {len(pint16Files):,} "
+                    "uint16 compatibility image(s).",
+                    flush=True,
+                )
+
+        else:
+            filesToUse = allTiffs
+
+        if not filesToUse:
+            raise ValueError(
+                "No supported TIFF images were found "
+                "in the selected folder."
+            )
+
+        try:
+            imageRecords = []
+
+            for i, filePath in enumerate(
+                filesToUse,
+                start=1,
+            ):
+                record = inspect_tiff_stack(
+                    filePath,
+                    standardize_channel_names=True,
+                )
+
+                # Store the logical ROI/sample name separately
+                # from the actual filename on disk.
+                record["SampleName"] = (
+                    _quantification_image_name(
+                        filePath
+                    )
+                )
+
+                imageRecords.append(
+                    record
+                )
+
+                print(
+                    f"Found {filePath.name} "
+                    f"→ shape "
+                    f"({record['NChannels']}, "
+                    f"{record['Height']}, "
+                    f"{record['Width']}), "
+                    f"dtype={record['DType']}",
+                    flush=True,
+                )
+
+            if not imageRecords:
+                raise ValueError(
+                    "No supported TIFF images were found "
+                    "in the selected folder."
+                )
+
+            imageDf = pd.DataFrame(
+                imageRecords
+            )
+
+            quantification_input_data.set(
+                {
+                    "image_table": imageDf,
+                    "source": "folder",
+                    "source_folder": folder,
+                }
+            )
+
+            quantification_image_folder.set(
+                folder
+            )
+
+            last_loaded_folder.set(
+                folder
+            )
+
+            msg = (
+                f"Prepared {len(imageDf):,} image(s) "
+                "for quantification without loading "
+                "their pixel data into memory."
+            )
+
+            quantification_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=5,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+                import traceback
+                traceback.print_exc()
+
+                msg = (
+                    f"Could not prepare quantification images: {e}"
+                )
+
+                quantification_status.set(
+                    msg
+                )
+
+                ui.notification_show(
+                    msg,
+                    type="error",
+                    duration=10,
+                )
+
+    def _quantification_image_name(
+        filePath: str | Path,
+    ) -> str:
+        """
+        Return the logical ROI/sample name for a quantification image.
+
+        PINT processed exports are written as:
+            <ROI> Normalized 32bit.tiff
+            <ROI> Normalized uint16.tiff
+
+        For matching to masks we want only the original ROI name.
+        """
+
+        name = Path(
+            filePath
+        ).stem
+
+        suffixes = [
+            " Normalized 32bit",
+            " Normalized uint16",
+        ]
+
+        for suffix in suffixes:
+            if name.lower().endswith(
+                suffix.lower()
+            ):
+                name = name[
+                    :-len(suffix)
+                ].strip()
+
+                break
+
+        return name
+
+   
+    def _discover_quantification_masks(
+        folder: str | Path,
+    ) -> pd.DataFrame:
+        folder = Path(folder)
+
+        if not folder.exists():
+            raise FileNotFoundError(
+                f"Mask folder does not exist: {folder}"
+            )
+
+        maskPaths = sorted(
+            [
+                path
+                for path in folder.iterdir()
+                if (
+                    path.is_file()
+                    and path.suffix.lower()
+                    in {".tif", ".tiff"}
+                )
+            ]
+        )
+
+        rows = []
+
+        for path in maskPaths:
+            rows.append(
+                {
+                    "MaskName": path.stem,
+                    "MaskFile": path.name,
+                    "MaskPath": str(path),
+                }
+            )
+
+        return pd.DataFrame(
+            rows
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.quant_load_mask_folder
+    )
+    def _quant_load_mask_folder():
+        initialDir = (
+            last_loaded_folder.get()
+            or os.getcwd()
+        )
+
+        folder = pick_folder_dialog(
+            title="Select segmentation mask folder",
+            initialdir=initialDir,
+        )
+
+        if not folder:
+            print(
+                "🛑 Mask loading canceled.",
+                flush=True,
+            )
+            return
+
+        try:
+            maskDf = (
+                _discover_quantification_masks(
+                    folder
+                )
+            )
+
+            if maskDf.empty:
+                raise ValueError(
+                    "No TIFF masks were found "
+                    "in the selected folder."
+                )
+
+            quantification_mask_folder.set(
+                folder
+            )
+
+            quantification_mask_files.set(
+                maskDf
+            )
+
+            last_loaded_folder.set(
+                folder
+            )
+
+            msg = (
+                f"Loaded {len(maskDf):,} candidate "
+                "segmentation mask(s)."
+            )
+
+            quantification_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="message",
+                duration=5,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            msg = (
+                f"Could not load segmentation masks: {e}"
+            )
+
+            quantification_status.set(
+                msg
+            )
+
+            ui.notification_show(
+                msg,
+                type="error",
+                duration=10,
+            )
+
+    @reactive.Effect
+    @reactive.event(
+        input.quant_use_mesmer_masks
+    )
+    def _quant_use_mesmer_masks():
+        outDir = (
+            _get_segmentation_output_dir()
+        )
+
+        maskPaths = sorted(
+            outDir.glob(
+                "*_mesmer_mask_uint32.tiff"
+            )
+        )
+
+        if not maskPaths:
+            ui.notification_show(
+                "No Mesmer masks are available yet.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        maskDf = pd.DataFrame(
+            {
+                "MaskName": [
+                    path.stem
+                    for path in maskPaths
+                ],
+                "MaskFile": [
+                    path.name
+                    for path in maskPaths
+                ],
+                "MaskPath": [
+                    str(path)
+                    for path in maskPaths
+                ],
+            }
+        )
+
+        quantification_mask_folder.set(
+            str(outDir)
+        )
+
+        quantification_mask_files.set(
+            maskDf
+        )
+
+        msg = (
+            f"Using {len(maskDf):,} Mesmer "
+            "mask(s) from the current PINT session."
+        )
+
+        quantification_status.set(
+            msg
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+
+    def _clean_quantification_name(
+        value: str,
+    ) -> str:
+        value = Path(
+            str(value)
+        ).stem.strip().lower()
+
+        removableSuffixes = [
+            # PINT processed image exports
+            " normalized 32bit",
+            " normalized uint16",
+
+            # Mesmer / generic masks
+            "_mesmer_mask_uint32",
+            "_mesmer_mask",
+            "_cell_mask",
+            "_cellmask",
+            "_masks",
+            "_mask",
+        ]
+
+        changed = True
+
+        while changed:
+            changed = False
+
+            for suffix in removableSuffixes:
+                if value.endswith(
+                    suffix
+                ):
+                    value = value[
+                        :-len(suffix)
+                    ].strip()
+
+                    changed = True
+
+        return value
+
+
+    @reactive.Effect
+    @reactive.event(
+        input.quant_match_images_masks
+    )
+    def _quant_match_images_masks():
+        obj = quantification_input_data.get()
+        maskDf = quantification_mask_files.get()
+
+        if obj is None:
+            ui.notification_show(
+                "Load quantification images first.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        if (
+            maskDf is None
+            or maskDf.empty
+        ):
+            ui.notification_show(
+                "Load segmentation masks first.",
+                type="warning",
+                duration=6,
+            )
+            return
+
+        # --------------------------------------------------------
+        # Build image table
+        # --------------------------------------------------------
+
+        imageTable = obj.get(
+            "image_table"
+        )
+
+        if (
+            imageTable is not None
+            and not imageTable.empty
+        ):
+            # Metadata-only image folder workflow
+            imageDf = imageTable.copy()
+
+        else:
+            # Existing in-memory PINT image workflow
+            imgs = obj.get(
+                "images",
+                {}
+            )
+
+            if not imgs:
+                ui.notification_show(
+                    "No quantification images are available.",
+                    type="warning",
+                    duration=6,
+                )
+                return
+
+            imageDf = pd.DataFrame(
+                {
+                    "SampleName": list(
+                        imgs.keys()
+                    )
+                }
+            )
+
+        if (
+            "SampleName"
+            not in imageDf.columns
+        ):
+            raise ValueError(
+                "Quantification image table is missing "
+                "the SampleName column."
+            )
+
+        # --------------------------------------------------------
+        # Create normalized image matching keys
+        # --------------------------------------------------------
+
+        imageDf["MatchKey"] = (
+            imageDf["SampleName"]
+            .astype(str)
+            .map(
+                _clean_quantification_name
+            )
+        )
+
+        # --------------------------------------------------------
+        # Create normalized mask matching keys
+        # --------------------------------------------------------
+
+        masks = maskDf.copy()
+
+        if (
+            "MaskName"
+            not in masks.columns
+        ):
+            raise ValueError(
+                "Segmentation mask table is missing "
+                "the MaskName column."
+            )
+
+        masks["MatchKey"] = (
+            masks["MaskName"]
+            .astype(str)
+            .map(
+                _clean_quantification_name
+            )
+        )
+
+        # --------------------------------------------------------
+        # Match
+        # --------------------------------------------------------
+
+        matchDf = imageDf.merge(
+            masks,
+            on="MatchKey",
+            how="left",
+            suffixes=(
+                "_image",
+                "_mask",
+            ),
+        )
+
+        matchDf["Matched"] = (
+            matchDf["MaskPath"]
+            .notna()
+        )
+
+        quantification_match_table.set(
+            matchDf
+        )
+
+        matched = int(
+            matchDf["Matched"].sum()
+        )
+
+        missing = int(
+            (~matchDf["Matched"]).sum()
+        )
+
+        choices = (
+            matchDf.loc[
+                matchDf["Matched"],
+                "SampleName",
+            ]
+            .astype(str)
+            .tolist()
+        )
+
+        ui.update_select(
+            "quant_selected_roi",
+            choices=choices,
+            selected=(
+                choices[0]
+                if choices
+                else None
+            ),
+            session=session,
+        )
+
+        msg = (
+            f"Matched {matched:,}/{len(matchDf):,} "
+            f"image(s) to masks."
+        )
+
+        if missing:
+            msg += (
+                f" Missing masks: {missing:,}."
+            )
+
+        quantification_status.set(
+            msg
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+
+    @output
+    @render.ui
+    def quantification_image_summary():
+        obj = quantification_input_data.get()
+
+        if obj is None:
+            return ui.tags.small(
+                "No quantification images loaded.",
+                class_="text-muted",
+            )
+
+        imgs = obj.get(
+            "images",
+            {}
+        )
+
+        source = obj.get(
+            "source",
+            "unknown",
+        )
+
+        return ui.tags.div(
+            f"{len(imgs):,} image(s) loaded. "
+            f"Source: {source}.",
+            class_="compact-small-line",
+        )
+
+    @output
+    @render.ui
+    def quantification_mask_summary():
+        df = quantification_mask_files.get()
+
+        if (
+            df is None
+            or df.empty
+        ):
+            return ui.tags.small(
+                "No segmentation masks loaded.",
+                class_="text-muted",
+            )
+
+        return ui.tags.div(
+            f"{len(df):,} mask(s) available.",
+            class_="compact-small-line",
+        )
+
+    @output
+    @render.ui
+    def quantification_match_summary():
+        return ui.tags.div(
+            quantification_status.get(),
+            class_="compact-small-line",
+        )   
+
+    @output
+    @render.data_frame
+    def quantification_match_preview():
+        df = (
+            quantification_match_table.get()
+        )
+
+        if (
+            df is None
+            or df.empty
+        ):
+            return render.DataGrid(
+                pd.DataFrame(
+                    {
+                        "Status": [
+                            "No image/mask matching performed yet."
+                        ]
+                    }
+                ),
+                height="250px",
+                filters=False,
+            )
+
+        showCols = [
+            column
+            for column in [
+                "SampleName",
+                "MaskFile",
+                "Matched",
+            ]
+            if column in df.columns
+        ]
+
+        return render.DataGrid(
+            df[showCols],
+            height="300px",
+            filters=True,
+        )
+
+    @output
+    @render.plot
+    def quantification_mask_preview():
+        matchDf = (
+            quantification_match_table.get()
+        )
+
+        selected = (
+            input.quant_selected_roi()
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(10, 8),
+            dpi=120,
+        )
+
+        if (
+            matchDf is None
+            or matchDf.empty
+            or not selected
+        ):
+            ax.text(
+                0.5,
+                0.5,
+                "Load and match images and masks",
+                ha="center",
+                va="center",
+            )
+
+            ax.set_axis_off()
+            return fig
+
+        row = matchDf.loc[
+            matchDf["SampleName"].astype(str)
+            == str(selected)
+        ]
+
+        if row.empty:
+            ax.text(
+                0.5,
+                0.5,
+                "Selected ROI was not found.",
+                ha="center",
+                va="center",
+            )
+
+            ax.set_axis_off()
+            return fig
+
+        maskPath = row.iloc[0].get(
+            "MaskPath"
+        )
+
+        if (
+            not maskPath
+            or not Path(maskPath).exists()
+        ):
+            ax.text(
+                0.5,
+                0.5,
+                "No matched mask available.",
+                ha="center",
+                va="center",
+            )
+
+            ax.set_axis_off()
+            return fig
+
+        mask = imread(
+            str(maskPath)
+        )
+
+        ax.imshow(
+            mask,
+            cmap="nipy_spectral",
+            interpolation="nearest",
+        )
+
+        ax.set_title(
+            str(selected)
+        )
+
+        ax.set_axis_off()
+
+        return fig
+
+    def _cycle_quantification_roi(
+        direction: int,
+    ):
+        df = quantification_match_table.get()
+
+        if (
+            df is None
+            or df.empty
+        ):
+            return
+
+        names = (
+            df.loc[
+                df["Matched"],
+                "SampleName",
+            ]
+            .astype(str)
+            .tolist()
+        )
+
+        if not names:
+            return
+
+        current = (
+            input.quant_selected_roi()
+        )
+
+        try:
+            index = names.index(
+                current
+            )
+        except ValueError:
+            index = 0
+
+        newIndex = (
+            index + direction
+        ) % len(names)
+
+        ui.update_select(
+            "quant_selected_roi",
+            choices=names,
+            selected=names[newIndex],
+            session=session,
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.quant_prev_roi
+    )
+    def _quant_prev_roi():
+        _cycle_quantification_roi(
+            -1
+        )
+
+    @reactive.Effect
+    @reactive.event(
+        input.quant_next_roi
+    )
+    def _quant_next_roi():
+        _cycle_quantification_roi(
+            +1
+        )
 
     def _build_pint_processed_stack_for_sample(sampleName: str) -> tuple[np.ndarray, list[str]]:
         imgs = images.get()
@@ -14152,102 +15054,376 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.quantify_mesmer_masks)
     def _quantify_mesmer_masks():
-        obj = segmentation_input_data.get()
+        obj = quantification_input_data.get()
+        matchDf = quantification_match_table.get()
 
         if obj is None:
-            segmentation_quantification_status.set("No images pushed to Segmentation.")
-            print("⚠️ No images pushed to Segmentation.")
+            segmentation_quantification_status.set(
+                "No quantification images loaded."
+            )
+            print("⚠️ No quantification images loaded.")
             return
 
-        quantMode = input.seg_quantification_mode() or "raw"
-
-        try:
-            if quantMode == "pint":
-                imgs, chs = _build_pint_processed_dataset_for_quantification()
-                quantModeLabel = "current PINT-processed images"
-            else:
-                imgs = obj.get("images", {})
-                chs = obj.get("channels", {})
-                quantModeLabel = "raw pushed images"
-
-        except Exception as e:
-            segmentation_cell_table.set(pd.DataFrame())
-            segmentation_mask_table.set(pd.DataFrame())
-            segmentation_cell_table_path.set("")
-            segmentation_mask_table_path.set("")
-            segmentation_quantification_status.set(f"Could not prepare quantification images: {e}")
-            print(f"❌ Could not prepare quantification images: {e}")
+        if (
+            matchDf is None
+            or matchDf.empty
+            or "Matched" not in matchDf.columns
+        ):
+            segmentation_quantification_status.set(
+                "Match images and masks before quantification."
+            )
+            print("⚠️ Image/mask matching has not been performed.")
             return
 
-        if not imgs:
-            segmentation_quantification_status.set("No pushed images available.")
-            print("⚠️ No pushed images available.")
-            return
-
-        outDir = _get_segmentation_output_dir()
-        cellTablePath = outDir / "mesmer_cell_table.csv"
-        maskTablePath = outDir / "mesmer_mask_table.csv"
-
-        sampleNames = list(imgs.keys())
-
-        print(f"▶️ Quantifying Mesmer masks for {len(sampleNames):,} ROI(s).")
-        print(f"   Quantification mode: {quantModeLabel}")
-        print(f"   Mask folder: {outDir}")
-
-        with ui.Progress(min=0, max=max(len(sampleNames), 1), session=session) as p:
-            step = 0
-
-            def progress(msg: str):
-                nonlocal step
-                step = min(step + 1, len(sampleNames))
-                p.set(value=step, message=msg)
-                print(msg, flush=True)
-
-            p.set(value=0, message="Starting Mesmer mask quantification...")
-
-            try:
-                cellDf, maskDf = quantify_mesmer_masks_for_dataset(
-                    images=imgs,
-                    channels=chs,
-                    mask_folder=outDir,
-                    mask_suffix="_mesmer_mask_uint32.tiff",
-                    progress=progress,
-                )
-            except Exception as e:
-                segmentation_cell_table.set(pd.DataFrame())
-                segmentation_mask_table.set(pd.DataFrame())
-                segmentation_cell_table_path.set("")
-                segmentation_mask_table_path.set("")
-                segmentation_quantification_status.set(f"Quantification failed: {e}")
-                print(f"❌ Quantification failed: {e}")
-                return
-
-        segmentation_cell_table.set(cellDf)
-        segmentation_mask_table.set(maskDf)
-
-        try:
-            cellDf.to_csv(cellTablePath, index=False)
-            maskDf.to_csv(maskTablePath, index=False)
-
-            segmentation_cell_table_path.set(str(cellTablePath))
-            segmentation_mask_table_path.set(str(maskTablePath))
-
-        except Exception as e:
-            segmentation_quantification_status.set(f"Quantified masks, but saving failed: {e}")
-            print(f"⚠️ Quantified masks, but saving failed: {e}")
-            return
-
-        nMasks = int(maskDf["MaskExists"].sum()) if not maskDf.empty and "MaskExists" in maskDf.columns else 0
-        nCells = len(cellDf)
-
-        msg = (
-            f"Quantification complete: {nCells:,} cells from {nMasks:,} mask(s). "
-            f"Mode: {quantModeLabel}. "
-            f"Saved cell table to: {cellTablePath}"
+        matchedDf = (
+            matchDf.loc[matchDf["Matched"]]
+            .copy()
+            .reset_index(drop=True)
         )
 
-        segmentation_quantification_status.set(msg)
-        print(f"✅ {msg}")
+        if matchedDf.empty:
+            segmentation_quantification_status.set(
+                "No matched image/mask pairs available."
+            )
+            print("⚠️ No matched image/mask pairs available.")
+            return
+
+        source = obj.get("source", "unknown")
+        quantMode = input.seg_quantification_mode() or "pint"
+
+        if source == "pint":
+            if quantMode == "pint":
+                quantModeLabel = "current PINT-processed images"
+            else:
+                quantModeLabel = "loaded/raw PINT images"
+
+        elif source == "folder":
+            # Folder images are quantified exactly as stored on disk.
+            # PINT processed folders are already preprocessed.
+            quantModeLabel = "loaded image values"
+
+        else:
+            segmentation_quantification_status.set(
+                f"Unsupported quantification source: {source}"
+            )
+            return
+
+        outputFolder = (
+            quantification_mask_folder.get()
+            or obj.get("source_folder")
+            or os.getcwd()
+        )
+
+        outDir = Path(outputFolder)
+        outDir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        cellTablePath = (
+            outDir / "mesmer_cell_table.csv"
+        )
+
+        maskTablePath = (
+            outDir / "mesmer_mask_table.csv"
+        )
+
+        allCells = []
+        maskRows = []
+
+        total = len(matchedDf)
+
+        print(
+            f"▶️ Quantifying {total:,} matched image/mask pair(s)."
+        )
+        print(
+            f"   Quantification mode: {quantModeLabel}"
+        )
+        print(
+            f"   Output folder: {outDir}"
+        )
+
+        with ui.Progress(
+            min=0,
+            max=max(total, 1),
+            session=session,
+        ) as p:
+
+            p.set(
+                value=0,
+                message="Starting mask quantification...",
+            )
+
+            for i, row in matchedDf.iterrows():
+
+                sampleName = str(
+                    row["SampleName"]
+                )
+
+                maskPath = Path(
+                    str(row["MaskPath"])
+                )
+
+                p.set(
+                    value=i,
+                    message=(
+                        f"Quantifying {sampleName} "
+                        f"({i + 1}/{total})"
+                    ),
+                )
+
+                print(
+                    f"Quantifying {sampleName} "
+                    f"({i + 1}/{total})",
+                    flush=True,
+                )
+
+                maskRow = {
+                    "SampleName": sampleName,
+                    "ROIName": sampleName,
+                    "CellMaskName": sampleName,
+                    "MaskFile": maskPath.name,
+                    "MaskPath": str(maskPath),
+                    "MaskExists": maskPath.exists(),
+                    "NCells": 0,
+                    "Status": "Not started",
+                    "Error": "",
+                }
+
+                if not maskPath.exists():
+                    maskRow["Status"] = "Mask missing"
+                    maskRow["Error"] = (
+                        f"Mask not found: {maskPath}"
+                    )
+
+                    maskRows.append(
+                        maskRow
+                    )
+
+                    continue
+
+                try:
+                    # --------------------------------------------
+                    # Current in-memory PINT image library
+                    # --------------------------------------------
+
+                    if source == "pint":
+
+                        if quantMode == "pint":
+                            (
+                                imageStack,
+                                channelNames,
+                            ) = (
+                                _build_pint_processed_stack_for_sample(
+                                    sampleName
+                                )
+                            )
+
+                        else:
+                            imageStack = obj[
+                                "images"
+                            ][sampleName]
+
+                            channelNames = obj[
+                                "channels"
+                            ][sampleName]
+
+                    # --------------------------------------------
+                    # External image folder
+                    # --------------------------------------------
+
+                    else:
+                        imagePathValue = row.get(
+                            "ImagePath"
+                        )
+
+                        if (
+                            imagePathValue is None
+                            or pd.isna(imagePathValue)
+                        ):
+                            raise ValueError(
+                                "Matched row has no ImagePath."
+                            )
+
+                        imagePath = Path(
+                            str(imagePathValue)
+                        )
+
+                        loadedImages, loadedChannels = (
+                            load_tiffs_raw(
+                                str(imagePath.parent),
+                                validate_consistent=False,
+                                standardize_channel_names=True,
+                                file_paths=[
+                                    imagePath
+                                ],
+                            )
+                        )
+
+                        if len(loadedImages) != 1:
+                            raise ValueError(
+                                f"Expected one image from "
+                                f"{imagePath.name}, but loaded "
+                                f"{len(loadedImages)}."
+                            )
+
+                        loadedName = next(
+                            iter(loadedImages)
+                        )
+
+                        imageStack = loadedImages[
+                            loadedName
+                        ]
+
+                        channelNames = loadedChannels[
+                            loadedName
+                        ]
+
+                    mask = imread(
+                        str(maskPath)
+                    )
+
+                    cellDf = quantify_mask_intensities(
+                        image_stack=imageStack,
+                        channel_names=channelNames,
+                        mask=mask,
+                        sample_name=sampleName,
+                        mask_name=sampleName,
+                    )
+
+                    maskRow["NCells"] = int(
+                        len(cellDf)
+                    )
+
+                    maskRow["Status"] = "OK"
+
+                    if not cellDf.empty:
+                        allCells.append(
+                            cellDf
+                        )
+
+                except Exception as e:
+                    maskRow["Status"] = "Failed"
+                    maskRow["Error"] = str(e)
+
+                    print(
+                        f"❌ {sampleName}: {e}",
+                        flush=True,
+                    )
+
+                maskRows.append(
+                    maskRow
+                )
+
+                # Drop per-ROI references before the next image.
+                try:
+                    del imageStack
+                    del mask
+                except Exception:
+                    pass
+
+                if source == "folder":
+                    try:
+                        del loadedImages
+                        del loadedChannels
+                    except Exception:
+                        pass
+
+            p.set(
+                value=total,
+                message="Finalizing cell table...",
+            )
+
+        cellDf = (
+            pd.concat(
+                allCells,
+                ignore_index=True,
+            )
+            if allCells
+            else pd.DataFrame()
+        )
+
+        maskDf = pd.DataFrame(
+            maskRows
+        )
+
+        segmentation_cell_table.set(
+            cellDf
+        )
+
+        segmentation_mask_table.set(
+            maskDf
+        )
+
+        try:
+            cellDf.to_csv(
+                cellTablePath,
+                index=False,
+            )
+
+            maskDf.to_csv(
+                maskTablePath,
+                index=False,
+            )
+
+            segmentation_cell_table_path.set(
+                str(cellTablePath)
+            )
+
+            segmentation_mask_table_path.set(
+                str(maskTablePath)
+            )
+
+        except Exception as e:
+            msg = (
+                "Quantification completed, "
+                f"but saving failed: {e}"
+            )
+
+            segmentation_quantification_status.set(
+                msg
+            )
+
+            print(
+                f"⚠️ {msg}",
+                flush=True,
+            )
+
+            return
+
+        successfulMasks = int(
+            (maskDf["Status"] == "OK").sum()
+        )
+
+        failedMasks = int(
+            (maskDf["Status"] != "OK").sum()
+        )
+
+        nCells = len(
+            cellDf
+        )
+
+        msg = (
+            f"Quantification complete: "
+            f"{nCells:,} cells from "
+            f"{successfulMasks:,}/{total:,} matched mask(s). "
+            f"Mode: {quantModeLabel}."
+        )
+
+        if failedMasks:
+            msg += (
+                f" Failed masks: {failedMasks:,}. "
+                "See mesmer_mask_table.csv for details."
+            )
+
+        segmentation_quantification_status.set(
+            msg
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
 
 
     @reactive.Effect
@@ -15878,63 +17054,424 @@ def server(input, output, session):
 
     @reactive.Effect
     @reactive.event(input.perform_analysis)
-    ##The moment you hit "analyze" this will popup to give the user a chance to cancel if it was by accident
     def _confirm_start_modal():
-        folder = (input.path() or "").strip()
+        nImages = len(images.get())
+
+        if nImages == 0:
+            ui.notification_show(
+                "No images are currently loaded in PINT.",
+                type="warning",
+                duration=6,
+            )
+            return
+
         msg = ui.div(
-            ui.p("Start image processing?"),
-            ui.tags.small(f"Folder: {folder or '— (no folder chosen)'}")
+            ui.p(
+                f"Process {nImages:,} currently loaded image(s)?"
+            ),
+            ui.tags.small(
+                "Select location where to safe next, a new folder will be created for the processed images.",
+            ),
         )
+
         m = ui.modal(
             msg,
-            title="Confirm",
-            easy_close=True,  # clicking outside = Cancel
+            title="Confirm image processing",
+            easy_close=True,
             footer=ui.div(
-                ui.modal_button("Cancel", class_="btn btn-secondary"),
-                ui.input_action_button("confirm_start", "Start", class_="btn btn-primary ms-2"),
+                ui.modal_button(
+                    "Cancel",
+                    class_="btn btn-secondary",
+                ),
+                ui.input_action_button(
+                    "confirm_start",
+                    "Start",
+                    class_="btn btn-primary ms-2",
+                ),
             ),
             size="m",
         )
-        ui.modal_show(m, session=session)
+
+        ui.modal_show(
+            m,
+            session=session,
+        )
 
 
     @reactive.Effect
     @reactive.event(input.confirm_start)
-    ##This will run the batch of images through he analysis.py pipeline
     def _run_batch_analysis():
-        #Close the modal (the yes i'm sure button), see above block
-        ui.modal_remove(session=session)
-        ##reads the folder path, uses the input folder, checks if its non-empty and it exist. Strips all the white space.
-        ##Throws an exception if not
-        folder = (input.path() or "").strip()
-        if not folder or not os.path.isdir(folder):
-            print(f"⚠️ Invalid folder: {folder!r}")
+        ui.modal_remove(
+            session=session
+        )
+
+        imgs = images.get()
+        chs = channels.get()
+
+        if not imgs:
+            print(
+                "⚠️ No images are currently loaded in PINT.",
+                flush=True,
+            )
             return
-        ##Create new folder inside of the input one.
-        out_dir = os.path.join(folder, "normalized images")
-        os.makedirs(out_dir, exist_ok=True)
-        ##Makes an output path for the parameter file to save it
-        ##If the table is empty it will return a messege to tell the user
-        params_path = os.path.join(out_dir, "parameter_table.csv")
-        df = params_df.get().copy()
-        if df.empty:
-            print("⚠️ Parameter table is empty — nothing to analyze.")
+
+        paramsDf = params_df.get().copy()
+
+        if paramsDf.empty:
+            print(
+                "⚠️ Parameter table is empty — nothing to analyze.",
+                flush=True,
+            )
             return
-        df.to_csv(params_path, index=False)
-        print(f"✅ Saved parameter table → {params_path}")
-        ##Tries to open de analysis.py file from the same folder as the viewer.
-        cmd = [
-            sys.executable, "-m", "pint_app.core.analysis",
-            "--input-dir", folder,
-            "--params-csv", params_path,
-            "--output-dir", out_dir,
-        ]   
-        print("▶️ Running analysis:", " ".join(cmd))
-        try:
-            subprocess.run(cmd, check=True)
-            print("✅ Analysis finished.")
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Analysis script failed: {e}")
+
+        # --------------------------------------------------------
+        # Choose output folder
+        # --------------------------------------------------------
+
+        initialDir = (
+            last_loaded_folder.get()
+            or os.getcwd()
+        )
+
+        outputRoot = pick_folder_dialog(
+            title="Select output folder for processed images",
+            initialdir=initialDir,
+        )
+
+        if not outputRoot:
+            print(
+                "🛑 Image processing canceled.",
+                flush=True,
+            )
+            return
+
+        outDir = (
+            Path(outputRoot)
+            / "normalized images"
+        )
+
+        outDir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        # --------------------------------------------------------
+        # Save parameter table used for this run
+        # --------------------------------------------------------
+
+        paramsPath = (
+            outDir
+            / "parameter_table.csv"
+        )
+
+        paramsDf.to_csv(
+            paramsPath,
+            index=False,
+        )
+
+        print(
+            f"✅ Saved parameter table → {paramsPath}",
+            flush=True,
+        )
+
+        # --------------------------------------------------------
+        # Process currently loaded PINT images
+        # --------------------------------------------------------
+
+        sampleNames = list(
+            imgs.keys()
+        )
+
+        total = len(
+            sampleNames
+        )
+
+        resultsRows = []
+
+        print(
+            f"▶️ Processing {total:,} loaded image(s).",
+            flush=True,
+        )
+
+        with ui.Progress(
+            min=0,
+            max=max(total, 1),
+            session=session,
+        ) as p:
+
+            p.set(
+                value=0,
+                message="Starting image processing...",
+            )
+
+            for i, sampleName in enumerate(
+                sampleNames,
+                start=1,
+            ):
+                p.set(
+                    value=i - 1,
+                    message=(
+                        f"Processing {sampleName} "
+                        f"({i}/{total})"
+                    ),
+                )
+
+                print(
+                    f"Processing {sampleName} "
+                    f"({i}/{total})",
+                    flush=True,
+                )
+
+                channelNames = chs.get(
+                    sampleName,
+                    [],
+                )
+
+                processedChannels = []
+                channelIsUnit = []
+
+                for channelName in channelNames:
+                    processed = (
+                        _process_channel_from_table(
+                            sampleName,
+                            channelName,
+                        )
+                    )
+
+                    if processed is None:
+                        raise ValueError(
+                            f"Could not process channel "
+                            f"'{channelName}' for "
+                            f"'{sampleName}'."
+                        )
+
+                    processed = np.asarray(
+                        processed,
+                        dtype=np.float32,
+                    )
+
+                    processedChannels.append(
+                        processed
+                    )
+
+                    row = _get_channel_param_row(
+                        channelName
+                    )
+
+                    isUnit = bool(
+                        row is not None
+                        and row.get(
+                            "DoNorm",
+                            True,
+                        )
+                    )
+
+                    channelIsUnit.append(
+                        isUnit
+                    )
+
+                    resultsRows.append(
+                        {
+                            "Image": sampleName,
+                            "Channel": channelName,
+                        }
+                    )
+
+                processedStack = np.stack(
+                    processedChannels,
+                    axis=0,
+                ).astype(
+                    np.float32,
+                    copy=False,
+                )
+
+                # ------------------------------------------------
+                # Write float32 output:
+                # exact processed values
+                # ------------------------------------------------
+
+                out32 = (
+                    outDir
+                    / (
+                        f"{sampleName} "
+                        "Normalized 32bit.tiff"
+                    )
+                )
+
+                imwrite(
+                    out32,
+                    processedStack,
+                    dtype=np.float32,
+                    ome=True,
+                    metadata={
+                        "axes": "CYX",
+                        "Channel": {
+                            "Name": [
+                                str(ch)
+                                for ch in channelNames
+                            ]
+                        },
+                    },
+                )
+
+                # ------------------------------------------------
+                # Write uint16 compatibility output
+                # ------------------------------------------------
+
+                uint16Stack = np.zeros(
+                    processedStack.shape,
+                    dtype=np.uint16,
+                )
+
+                for channelIndex in range(
+                    processedStack.shape[0]
+                ):
+                    channelImage = (
+                        processedStack[
+                            channelIndex
+                        ]
+                    )
+
+                    if channelIsUnit[
+                        channelIndex
+                    ]:
+                        scaled = np.clip(
+                            channelImage,
+                            0.0,
+                            1.0,
+                        )
+
+                    else:
+                        finite = np.isfinite(
+                            channelImage
+                        )
+
+                        if not finite.any():
+                            scaled = np.zeros_like(
+                                channelImage,
+                                dtype=np.float32,
+                            )
+
+                        else:
+                            mn = float(
+                                np.nanmin(
+                                    channelImage
+                                )
+                            )
+
+                            mx = float(
+                                np.nanmax(
+                                    channelImage
+                                )
+                            )
+
+                            if mx > mn:
+                                scaled = (
+                                    channelImage - mn
+                                ) / (
+                                    mx - mn
+                                )
+
+                            else:
+                                scaled = np.zeros_like(
+                                    channelImage,
+                                    dtype=np.float32,
+                                )
+
+                    uint16Stack[
+                        channelIndex
+                    ] = np.clip(
+                        np.round(
+                            scaled * 65535.0
+                        ),
+                        0,
+                        65535,
+                    ).astype(
+                        np.uint16
+                    )
+
+                out16 = (
+                    outDir
+                    / (
+                        f"{sampleName} "
+                        "Normalized uint16.tiff"
+                    )
+                )
+
+                imwrite(
+                    out16,
+                    uint16Stack,
+                    dtype=np.uint16,
+                    ome=True,
+                    metadata={
+                        "axes": "CYX",
+                        "Channel": {
+                            "Name": [
+                                str(ch)
+                                for ch in channelNames
+                            ]
+                        },
+                    },
+                )
+
+                print(
+                    f"   ✓ Wrote {out32.name}",
+                    flush=True,
+                )
+
+                print(
+                    f"   ✓ Wrote {out16.name}",
+                    flush=True,
+                )
+
+                del processedStack
+                del uint16Stack
+                del processedChannels
+
+            p.set(
+                value=total,
+                message="Finalizing...",
+            )
+
+        # --------------------------------------------------------
+        # Save simple processing summary
+        # --------------------------------------------------------
+
+        if resultsRows:
+            resultsDf = pd.DataFrame(
+                resultsRows
+            )
+
+            resultsPath = (
+                outDir
+                / "Parameters Of all images.csv"
+            )
+
+            resultsDf.to_csv(
+                resultsPath,
+                index=False,
+            )
+
+        last_loaded_folder.set(
+            str(outputRoot)
+        )
+
+        msg = (
+            f"Processing complete: "
+            f"{total:,} image(s) exported to "
+            f"{outDir}"
+        )
+
+        print(
+            f"✅ {msg}",
+            flush=True,
+        )
+
+        ui.notification_show(
+            msg,
+            type="message",
+            duration=8,
+        )
     
     @output
     @render.ui

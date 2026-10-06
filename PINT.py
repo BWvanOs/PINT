@@ -2,7 +2,7 @@ from pathlib import Path
 import subprocess, sys, threading, webbrowser, time
 
 def run_viewer():
-    url = "http://127.0.0.1:8000/"
+    url = "http://127.0.0.1:8001/"
 
     def _open():
         time.sleep(1.0)
@@ -12,7 +12,7 @@ def run_viewer():
 
     cmd = [
     sys.executable, "-m", "uvicorn", "pint_app.asgi:app",
-    "--host", "127.0.0.1", "--port", "8000",
+    "--host", "127.0.0.1", "--port", "8001",
     "--ws-ping-interval", "120",
     "--ws-ping-timeout", "120",
     ]

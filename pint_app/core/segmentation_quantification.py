@@ -18,7 +18,7 @@ def _safe_channel_name(channel_name: str) -> str:
 
 def _safe_file_stem(name: str) -> str:
     return "".join(
-        ch if ch.isalnum() or ch in ("_", "-", ".") else "_"
+        ch if ch.isalnum() or ch in ("_", "-", ".", "(", ")") else "_"
         for ch in str(name)
     )
 
@@ -34,16 +34,26 @@ def quantify_mask_intensities(
     include_sum: bool = False,
 ) -> pd.DataFrame:
     """
-    Quantify all image channels per Mesmer label.
+    Quantify all image channels per segmentation label.
 
     image_stack must be shaped (channels, y, x).
     mask must be shaped (y, x), with 0 as background.
+
+    The mask is indexed once up front. Geometry and channel statistics
+    are then calculated from that shared cell-to-pixel mapping rather
+    than repeatedly scanning the complete mask for every cell.
     """
+
     if image_stack.ndim != 3:
-        raise ValueError(f"Expected image_stack shape (C, Y, X), got {image_stack.shape}")
+        raise ValueError(
+            f"Expected image_stack shape (C, Y, X), "
+            f"got {image_stack.shape}"
+        )
 
     if mask.ndim != 2:
-        raise ValueError(f"Expected 2D mask, got {mask.shape}")
+        raise ValueError(
+            f"Expected 2D mask, got {mask.shape}"
+        )
 
     n_channels, img_h, img_w = image_stack.shape
 
@@ -55,69 +65,250 @@ def quantify_mask_intensities(
 
     if len(channel_names) != n_channels:
         raise ValueError(
-            f"Number of channel names ({len(channel_names)}) does not match "
-            f"image channels ({n_channels})"
+            f"Number of channel names ({len(channel_names)}) "
+            f"does not match image channels ({n_channels})"
         )
 
-    mask = np.asarray(mask)
-    labels = np.unique(mask)
-    labels = labels[labels > 0]
+    # --------------------------------------------------------
+    # Build the cell-to-pixel mapping once
+    # --------------------------------------------------------
 
-    if labels.size == 0:
+    flat_mask = np.asarray(
+        mask
+    ).ravel()
+
+    foreground_positions = np.flatnonzero(
+        flat_mask > 0
+    )
+
+    if foreground_positions.size == 0:
         return pd.DataFrame()
 
-    flat_mask = mask.ravel()
-
-    flat_channels = [
-        np.asarray(image_stack[i], dtype=np.float32).ravel()
-        for i in range(n_channels)
+    foreground_labels = flat_mask[
+        foreground_positions
     ]
 
-    rows = []
+    # Convert arbitrary mask labels to compact indices:
+    #
+    # original labels:
+    #   1, 2, 7, 19
+    #
+    # compact indices:
+    #   0, 1, 2, 3
+    #
+    # This means bincount does not allocate up to the largest
+    # possible label number.
+    labels, inverse = np.unique(
+        foreground_labels,
+        return_inverse=True,
+    )
 
-    for label in labels:
-        pix = flat_mask == label
-        area = int(pix.sum())
+    n_objects = len(labels)
 
-        if area == 0:
-            continue
+    # Number of mask pixels belonging to every cell.
+    areas = np.bincount(
+        inverse,
+        minlength=n_objects,
+    )
 
-        ys, xs = np.nonzero(mask == label)
+    # --------------------------------------------------------
+    # Geometry
+    # --------------------------------------------------------
 
-        row = {
-            "SampleName": sample_name,
-            "ROIName": sample_name,
-            "CellMaskName": mask_name or sample_name,
-            "ObjectNumber": int(label),
-            "Location_Center_X": float(xs.mean()),
-            "Location_Center_Y": float(ys.mean()),
-            "Area": area,
-        }
+    # Convert flattened pixel positions back to X/Y coordinates.
+    ys = foreground_positions // img_w
+    xs = foreground_positions % img_w
 
-        for channel_name, flat_img in zip(channel_names, flat_channels):
-            prefix = _safe_channel_name(channel_name)
-            vals = flat_img[pix]
-            vals = vals[np.isfinite(vals)]
+    x_sums = np.bincount(
+        inverse,
+        weights=xs,
+        minlength=n_objects,
+    )
 
-            if vals.size == 0:
-                row[f"{prefix}_mean"] = np.nan
-                if include_median:
-                    row[f"{prefix}_median"] = np.nan
-                if include_sum:
-                    row[f"{prefix}_sum"] = np.nan
-                continue
+    y_sums = np.bincount(
+        inverse,
+        weights=ys,
+        minlength=n_objects,
+    )
 
-            row[f"{prefix}_mean"] = float(np.mean(vals))
+    center_x = x_sums / areas
+    center_y = y_sums / areas
 
-            if include_median:
-                row[f"{prefix}_median"] = float(np.median(vals))
+    # --------------------------------------------------------
+    # Prepare shared grouping for exact medians
+    # --------------------------------------------------------
 
-            if include_sum:
-                row[f"{prefix}_sum"] = float(np.sum(vals))
+    # Sorting the compact cell indices groups all pixels belonging
+    # to the same cell together.
+    #
+    # Importantly, this sort depends only on the mask, so it is
+    # calculated once and reused for every image channel.
+    if include_median:
+        pixel_order = np.argsort(
+            inverse,
+            kind="stable",
+        )
 
-        rows.append(row)
+        group_ends = np.cumsum(
+            areas
+        )
 
-    return pd.DataFrame(rows)
+        group_starts = (
+            group_ends - areas
+        )
+
+    # --------------------------------------------------------
+    # Create the cell table
+    # --------------------------------------------------------
+
+    result_columns = {
+        "SampleName": np.repeat(
+            sample_name,
+            n_objects,
+        ),
+        "ROIName": np.repeat(
+            sample_name,
+            n_objects,
+        ),
+        "CellMaskName": np.repeat(
+            mask_name or sample_name,
+            n_objects,
+        ),
+        "ObjectNumber": labels.astype(
+            np.int64
+        ),
+        "Location_Center_X": center_x,
+        "Location_Center_Y": center_y,
+        "Area": areas.astype(
+            np.int64
+        ),
+    }
+
+    # --------------------------------------------------------
+    # Quantify every channel
+    # --------------------------------------------------------
+
+    for channel_index, channel_name in enumerate(
+        channel_names
+    ):
+        prefix = _safe_channel_name(
+            channel_name
+        )
+
+        flat_image = np.asarray(
+            image_stack[channel_index],
+            dtype=np.float32,
+        ).ravel()
+
+        # Only retrieve image pixels that actually belong to cells.
+        values = flat_image[
+            foreground_positions
+        ]
+
+        # Preserve the old behaviour:
+        # NaN/inf pixels are ignored for intensity statistics.
+        finite = np.isfinite(
+            values
+        )
+
+        finite_counts = np.bincount(
+            inverse[finite],
+            minlength=n_objects,
+        )
+
+        sums = np.bincount(
+            inverse[finite],
+            weights=values[finite],
+            minlength=n_objects,
+        )
+
+        means = np.full(
+            n_objects,
+            np.nan,
+            dtype=np.float64,
+        )
+
+        np.divide(
+            sums,
+            finite_counts,
+            out=means,
+            where=finite_counts > 0,
+        )
+
+        result_columns[
+            f"{prefix}_mean"
+        ] = means
+
+        if include_sum:
+            channel_sums = sums.astype(
+                np.float64,
+                copy=True,
+            )
+
+            channel_sums[
+                finite_counts == 0
+            ] = np.nan
+
+            result_columns[
+                f"{prefix}_sum"
+            ] = channel_sums
+
+        # ----------------------------------------------------
+        # Exact medians
+        # ----------------------------------------------------
+
+        if include_median:
+            sorted_values = values[
+                pixel_order
+            ]
+
+            medians = np.full(
+                n_objects,
+                np.nan,
+                dtype=np.float64,
+            )
+
+            for object_index in range(
+                n_objects
+            ):
+                start = int(
+                    group_starts[
+                        object_index
+                    ]
+                )
+
+                end = int(
+                    group_ends[
+                        object_index
+                    ]
+                )
+
+                object_values = (
+                    sorted_values[
+                        start:end
+                    ]
+                )
+
+                object_values = (
+                    object_values[
+                        np.isfinite(
+                            object_values
+                        )
+                    ]
+                )
+
+                if object_values.size:
+                    medians[
+                        object_index
+                    ] = np.median(
+                        object_values
+                    )
+
+            result_columns[
+                f"{prefix}_median"
+            ] = medians
+
+    return pd.DataFrame(result_columns)
 
 
 def quantify_mesmer_masks_for_dataset(
@@ -151,7 +342,7 @@ def quantify_mesmer_masks_for_dataset(
             progress(f"Quantifying {sample_name} ({i}/{len(sample_names)})")
 
         safe_stem = _safe_file_stem(sample_name)
-        mask_path = mask_folder / f"{safe_stem}{mask_suffix}"
+        mask_path = (mask_folder / f"{safe_stem}_mesmer_mask_uint32.tiff")
 
         mask_row = {
             "SampleName": sample_name,

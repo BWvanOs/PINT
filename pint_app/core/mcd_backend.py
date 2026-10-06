@@ -400,6 +400,70 @@ def _safe_image_name(
 
     return text or fallback
 
+def _make_mcd_roi_name(
+    acquisition: Any,
+    *,
+    acquisition_index: int,
+) -> str:
+    """
+    Construct the canonical PINT sample name for an MCD acquisition.
+
+    The slide description is deliberately excluded because it should
+    not become part of the biological ROI/sample identifier.
+
+    Example:
+        acquisition ID:          1
+        acquisition description: 3_4_1(1)
+
+    becomes:
+        ROI001_3_4_1(1)
+    """
+
+    acquisitionId = getattr(
+        acquisition,
+        "id",
+        acquisition_index + 1,
+    )
+
+    try:
+        roiId = f"{int(acquisitionId):03d}"
+    except (TypeError, ValueError):
+        roiId = str(
+            acquisitionId
+        ).strip()
+
+    description = str(
+        getattr(
+            acquisition,
+            "description",
+            None,
+        )
+        or ""
+    ).strip()
+
+    # Keep characters PINT commonly uses in ROI names,
+    # including parentheses.
+    description = re.sub(
+        r"[^\w\-+.()]+",
+        "_",
+        description,
+        flags=re.UNICODE,
+    )
+
+    description = re.sub(
+        r"_+",
+        "_",
+        description,
+    ).strip("_")
+
+    if description:
+        return (
+            f"ROI{roiId}_"
+            f"{description}"
+        )
+
+    return f"ROI{roiId}"
+
 def load_mcd_acquisitions(
     path: str | Path,
     selected_acquisitions: pd.DataFrame,
@@ -548,38 +612,9 @@ def load_mcd_acquisitions(
 
                     channelNames.append(name)
 
-            acquisitionId = getattr(
+            sampleName = _make_mcd_roi_name(
                 acquisition,
-                "id",
-                acquisitionIndex,
-            )
-
-            slideDescription = (
-                _safe_image_name(
-                    getattr(
-                        slide,
-                        "description",
-                        None,
-                    ),
-                    f"Slide{slideIndex + 1}",
-                )
-            )
-
-            acquisitionDescription = (
-                _safe_image_name(
-                    getattr(
-                        acquisition,
-                        "description",
-                        None,
-                    ),
-                    f"ROI{acquisitionId}",
-                )
-            )
-
-            sampleName = (
-                f"{slideDescription}_"
-                f"ROI{acquisitionId}_"
-                f"{acquisitionDescription}"
+                acquisition_index=acquisitionIndex,
             )
 
             # Avoid accidental duplicate dictionary keys.
@@ -808,42 +843,14 @@ def _make_acquisition_export_stem(
     acquisition_index: int,
 ) -> str:
     """
-    Construct a readable and filesystem-safe ROI filename stem.
+    Construct the canonical PINT ROI filename stem for an MCD acquisition.
+
+    The slide metadata is intentionally not included in the sample name.
     """
-    slideId = getattr(
-        slide,
-        "id",
-        slide_index + 1,
-    )
 
-    acquisitionId = getattr(
+    return _make_mcd_roi_name(
         acquisition,
-        "id",
-        acquisition_index + 1,
-    )
-
-    slideDescription = _safe_image_name(
-        getattr(
-            slide,
-            "description",
-            None,
-        ),
-        f"Slide{slideId}",
-    )
-
-    acquisitionDescription = _safe_image_name(
-        getattr(
-            acquisition,
-            "description",
-            None,
-        ),
-        f"ROI{acquisitionId}",
-    )
-
-    return (
-        f"{slideDescription}_"
-        f"ROI{acquisitionId}_"
-        f"{acquisitionDescription}"
+        acquisition_index=acquisition_index,
     )
 
 def _write_mcd_acquisition_ome_tiff(

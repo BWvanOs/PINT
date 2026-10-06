@@ -4,6 +4,8 @@ import re
 import numpy as np
 import tifffile
 
+from xml.etree import ElementTree as ET
+
 from pint_app.core.channel_names import (
     _normalize_channel_name,
     _make_unique_channel_names,
@@ -193,43 +195,41 @@ def _channel_names_from_ome_xml(
     tif: tifffile.TiffFile,
 ) -> list[str] | None:
     """
-    Best-effort fallback for TIFFs without PageName tags.
+    Read channel names directly from OME-XML.
 
-    Attempts to read channel names from OME-XML.
+    Uses Python's standard XML parser rather than ome-types so TIFF
+    loading does not depend on pydantic / pydantic-core.
     """
 
     try:
-        ome_xml = tif.ome_metadata
+        omeXml = tif.ome_metadata
 
-        if not ome_xml:
+        if not omeXml:
             return None
 
-        from ome_types import from_xml
+        root = ET.fromstring(omeXml)
 
-        ome = from_xml(ome_xml)
+        # OME XML uses namespaces. The {*} wildcard allows this
+        # to work across OME schema versions without hard-coding
+        # a particular namespace URI.
+        pixels = root.find(".//{*}Image/{*}Pixels")
 
-        channels = getattr(
-            ome.images[0].pixels,
-            "channels",
-            None,
-        )
+        if pixels is None: return None
 
-        if not channels:
-            return None
+        channels = pixels.findall("{*}Channel")
+
+        if not channels: return None
 
         names = []
 
         for i, channel in enumerate(channels):
             name = (
-                getattr(channel, "name", None)
-                or getattr(channel, "id", None)
+                channel.attrib.get("Name")
+                or channel.attrib.get("ID")
                 or f"Channel{i + 1}"
             )
 
-            if isinstance(name, str):
-                name = name.strip()
-
-            names.append(name)
+            names.append(str(name).strip())
 
         return names or None
 
@@ -241,6 +241,102 @@ def _channel_names_from_ome_xml(
 
         return None
 
+def inspect_tiff_stack(
+    filePath: str | Path,
+    *,
+    standardize_channel_names: bool = True,
+) -> dict:
+    """
+    Inspect a TIFF stack without loading pixel data.
+
+    Returns path, sample name, dimensions, dtype,
+    and channel names.
+    """
+
+    filePath = Path(
+        filePath
+    )
+
+    with tifffile.TiffFile(
+        filePath
+    ) as tif:
+
+        nChannels = len(
+            tif.pages
+        )
+
+        if nChannels == 0:
+            raise ValueError(
+                f"No TIFF pages found: {filePath}"
+            )
+
+        firstPage = tif.pages[0]
+
+        height = int(
+            firstPage.imagelength
+        )
+
+        width = int(
+            firstPage.imagewidth
+        )
+
+        dtype = str(
+            firstPage.dtype
+        )
+
+        channelNames = (
+            _channel_names_from_page_tags(
+                tif
+            )
+        )
+
+        if not channelNames:
+            channelNames = (
+                _channel_names_from_ome_xml(
+                    tif
+                )
+            )
+
+    if not channelNames:
+        channelNames = [
+            f"Channel{i + 1}"
+            for i in range(nChannels)
+        ]
+
+    if len(channelNames) < nChannels:
+        channelNames = (
+            channelNames
+            + [
+                f"Channel{i + 1}"
+                for i in range(
+                    len(channelNames),
+                    nChannels,
+                )
+            ]
+        )
+
+    elif len(channelNames) > nChannels:
+        channelNames = channelNames[
+            :nChannels
+        ]
+
+    if standardize_channel_names:
+        channelNames = (
+            _standardize_mcd_channel_names(
+                channelNames
+            )
+        )
+
+    return {
+        "SampleName": filePath.stem,
+        "ImagePath": str(filePath),
+        "Channels": channelNames,
+        "NChannels": nChannels,
+        "Height": height,
+        "Width": width,
+        "DType": dtype,
+    }
+
 
 # ============================================================
 # Main TIFF loader
@@ -251,9 +347,10 @@ def load_tiffs_raw(
     *,
     validate_consistent: bool = True,
     standardize_channel_names: bool = True,
+    file_paths: list[str | Path] | None = None,
 ):
     """
-    Load IMC OME-TIFFs as raw multi-page TIFF files.
+    Load (OME-)TIFFs as raw multi-page TIFF files.
 
     Each TIFF page/frame is treated as one channel.
 
@@ -267,9 +364,22 @@ def load_tiffs_raw(
 
     folderPath = Path(folderPath)
 
-    tiffFiles = sorted(
-        folderPath.glob("*.ome.tif*")
-    )
+    if file_paths is None:
+        tiffFiles = sorted(
+            path
+            for path in folderPath.iterdir()
+            if (
+                path.is_file()
+                and path.suffix.lower()
+                in {".tif", ".tiff"}
+            )
+        )
+
+    else:
+        tiffFiles = sorted(
+            Path(path)
+            for path in file_paths
+        )
 
     imagesDict: dict[str, np.ndarray] = {}
     channelNamesDict: dict[str, list[str]] = {}
@@ -292,32 +402,18 @@ def load_tiffs_raw(
                 for page in tif.pages
             ]
 
-            imageArray = np.stack(
-                pages,
-                axis=0,
-            )
+            imageArray = np.stack(pages, axis=0,)
 
             # Preferred:
             # TIFF PageName tag 285
-            ch_names = _channel_names_from_page_tags(
-                tif
-            )
+            ch_names = _channel_names_from_page_tags(tif)
 
             # Fallback:
             # OME-XML metadata
-            if not ch_names:
-                ch_names = _channel_names_from_ome_xml(
-                    tif
-                )
+            if not ch_names: ch_names = _channel_names_from_ome_xml(tif)
 
-        sampleName = filePath.stem.replace(
-            ".ome",
-            "",
-        )
-
-        nC = int(
-            imageArray.shape[0]
-        )
+        sampleName = filePath.stem.replace(".ome", "",)
+        nC = int(imageArray.shape[0])
 
         # ----------------------------------------------------
         # Ensure exactly one name per channel
