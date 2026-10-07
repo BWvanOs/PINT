@@ -12,7 +12,7 @@ def run_viewer():
 
     cmd = [
     sys.executable, "-m", "uvicorn", "pint_app.asgi:app",
-    "--host", "127.0.0.1", "--port", "8001",
+    "--host", "127.0.0.1", "--port", "8000",
     "--ws-ping-interval", "120",
     "--ws-ping-timeout", "120",
     ]
