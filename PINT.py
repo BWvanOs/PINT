@@ -2,7 +2,7 @@ from pathlib import Path
 import subprocess, sys, threading, webbrowser, time
 
 def run_viewer():
-    url = "http://127.0.0.1:8001/"
+    url = "http://127.0.0.1:8000/"
 
     def _open():
         time.sleep(1.0)
