@@ -166,6 +166,8 @@ def find_all_cluster_markers(
     - Mann-Whitney U / Wilcoxon rank-sum p-value
     - Benjamini-Hochberg adjusted p-value
 
+    Biological cutoffs are applied to the results view rather than before
+    testing, so BH correction covers every evaluated feature.
     Multiple-testing correction is performed separately for each
     cluster-versus-rest comparison.
 
@@ -388,6 +390,11 @@ def find_all_cluster_markers(
                 np.mean(y)
             )
 
+            median_in = float(np.median(x))
+            median_out = float(np.median(y))
+            q75_in = float(np.quantile(x, 0.75))
+            q75_out = float(np.quantile(y, 0.75))
+
             pct_in = float(
                 np.mean(
                     x > detection_threshold
@@ -402,11 +409,7 @@ def find_all_cluster_markers(
 
             # Similar to Seurat's min.pct concept:
             # do not test features essentially absent everywhere.
-            if max(
-                pct_in,
-                pct_out,
-            ) < min_pct:
-                continue
+            # No prefilter: prevalence is reported for display filtering.
 
             # A log ratio is meaningful for the non-negative
             # expression/intensity values PINT currently expects.
@@ -430,17 +433,7 @@ def find_all_cluster_markers(
                     )
                 )
 
-            if np.isfinite(
-                log2fc
-            ):
-                if only_positive:
-                    if log2fc < min_log2fc:
-                        continue
-                else:
-                    if abs(
-                        log2fc
-                    ) < min_log2fc:
-                        continue
+            # Log2FC is reported, not used to exclude hypotheses.
 
             try:
                 _, p_value = mannwhitneyu(
@@ -467,6 +460,10 @@ def find_all_cluster_markers(
                     "n_out": n_out,
                     "Mean_in": mean_in,
                     "Mean_out": mean_out,
+                    "Median_in": median_in,
+                    "Median_out": median_out,
+                    "Q75_in": q75_in,
+                    "Q75_out": q75_out,
                     "Mean_difference": (
                         mean_in
                         - mean_out
@@ -474,6 +471,7 @@ def find_all_cluster_markers(
                     "log2FC": log2fc,
                     "pct_in": pct_in,
                     "pct_out": pct_out,
+                    "Delta_pct": pct_in - pct_out,
                     "p_value": p_value,
                 }
             )
@@ -559,10 +557,15 @@ def find_all_cluster_markers(
                 "n_out",
                 "Mean_in",
                 "Mean_out",
+                "Median_in",
+                "Median_out",
+                "Q75_in",
+                "Q75_out",
                 "Mean_difference",
                 "log2FC",
                 "pct_in",
                 "pct_out",
+                "Delta_pct",
                 "p_value",
                 "p_adj_BH",
             ]
