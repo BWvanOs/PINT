@@ -10677,6 +10677,34 @@ def server(input, output, session):
                 flush=True,
             )
 
+    def _filter_marker_results(result_df, prefix):
+        """Apply display/export filters without changing the tested hypotheses."""
+        if result_df is None or result_df.empty:
+            return result_df
+        df = result_df.copy()
+        def number(suffix, default):
+            value = getattr(input, f"{prefix}_deg_{suffix}")()
+            return default if value is None else float(value)
+
+        detected = number("min_pct", 0)
+        threshold_mean = number("min_mean_in", 0)
+        threshold_median = number("min_median_in", 0)
+        logfc = number("min_log2fc", 0)
+        max_adj = number("max_p_adj", 1)
+        positive = bool(getattr(input, f"{prefix}_deg_only_positive")())
+
+        df = df.loc[
+            (df["pct_in"] >= detected)
+            & (df["Mean_in"] >= threshold_mean)
+            & (df["Median_in"] >= threshold_median)
+            & (df["p_adj_BH"] <= max_adj)
+        ]
+        if positive:
+            df = df.loc[df["log2FC"] >= logfc]
+        else:
+            df = df.loc[df["log2FC"].abs() >= logfc]
+        return df
+
     @output
     @render.ui
     def clustering_deg_summary():
@@ -10747,18 +10775,26 @@ def server(input, output, session):
                 filters=False,
             )
 
+        resultDf = _filter_marker_results(resultDf, "clustering")
+
         displayCols = [
             "Cluster",
             "Feature",
-            "SourceFeature",
             "Mean_in",
             "Mean_out",
+            "Median_in",
+            "Median_out",
+            "Q75_in",
+            "Q75_out",
             "Mean_difference",
             "log2FC",
             "pct_in",
             "pct_out",
+            "Delta_pct",
             "p_value",
             "p_adj_BH",
+            "n_in",
+            "n_out",
         ]
 
         displayDf = resultDf[
@@ -10776,7 +10812,7 @@ def server(input, output, session):
         return render.DataGrid(
             displayDf,
             height="520px",
-            filters=True,
+            filters=False,
             summary=(
                 "Showing marker results "
                 "{start}–{end} of {total}"
@@ -10827,6 +10863,9 @@ def server(input, output, session):
             return
 
         try:
+            if bool(input.clustering_deg_export_filtered()):
+                resultDf = _filter_marker_results(resultDf, "clustering")
+
             exportDf = format_deg_table(
                 resultDf
             )
@@ -14365,18 +14404,26 @@ def server(input, output, session):
                 filters=False,
             )
 
+        resultDf = _filter_marker_results(resultDf, "subclustering")
+
         displayCols = [
             "Cluster",
             "Feature",
-            "SourceFeature",
             "Mean_in",
             "Mean_out",
+            "Median_in",
+            "Median_out",
+            "Q75_in",
+            "Q75_out",
             "Mean_difference",
             "log2FC",
             "pct_in",
             "pct_out",
+            "Delta_pct",
             "p_value",
             "p_adj_BH",
+            "n_in",
+            "n_out",
         ]
 
         displayDf = resultDf[
@@ -14394,7 +14441,7 @@ def server(input, output, session):
         return render.DataGrid(
             displayDf,
             height="520px",
-            filters=True,
+            filters=False,
             summary=(
                 "Showing marker results "
                 "{start}–{end} of {total}"
@@ -14455,6 +14502,9 @@ def server(input, output, session):
             return
 
         try:
+            if bool(input.subclustering_deg_export_filtered()):
+                resultDf = _filter_marker_results(resultDf, "subclustering")
+
             exportDf = format_deg_table(
                 resultDf
             )
