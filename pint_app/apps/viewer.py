@@ -18,7 +18,7 @@ import igraph as ig
 import leidenalg
 import pacmap
 
-import os, sys, subprocess, json
+import os, sys, subprocess, json, asyncio, time
 import warnings
 from datetime import datetime
 
@@ -287,6 +287,9 @@ def server(input, output, session):
     quantification_mask_files = reactive.Value(pd.DataFrame())
     quantification_match_table = reactive.Value(pd.DataFrame())
     quantification_status = reactive.Value("No quantification dataset prepared yet.")
+
+    ##Seperated the quantification worker
+    quantification_worker_process = (reactive.Value(None))
 
     # Shared clustering dataset state.
     # This is intentionally one central object used by all clustering sub-tabs:
@@ -3388,6 +3391,72 @@ def server(input, output, session):
 
         return max(600, min(1800, widthPx))
 
+    
+
+    
+    
+    def _add_pacmap_cluster_legend(
+        ax,
+        cluster_names,
+        color_map,
+        fontsize=8,
+    ):
+        """
+        Add a PaCMAP legend within the figure boundaries.
+
+        Uses the existing subplot, avoiding additional axes
+        that can interfere with Python Shiny's coordinate map.
+        """
+        if not cluster_names:
+            return
+
+        fig = ax.figure
+
+        handles = [
+            Patch(
+                facecolor=color_map.get(name, "#808080"),
+                edgecolor="none",
+                label=name,
+            )
+            for name in cluster_names
+        ]
+
+        n_clusters = len(handles)
+        ncol = max(1, (n_clusters + 19) // 20)
+
+        if n_clusters > 40:
+            fontsize = min(fontsize, 7)
+
+        # Allocate horizontal space for the legend.
+        legend_fraction = min(
+            0.65,
+            0.30 + 0.10 * (ncol - 1),
+        )
+
+        plot_right = 1.0 - legend_fraction
+
+        fig.subplots_adjust(
+            left=0.08,
+            right=plot_right,
+            bottom=0.12,
+            top=0.90,
+        )
+
+        # The legend belongs to the existing axes.
+        ax.legend(
+            handles=handles,
+            loc="center left",
+            bbox_to_anchor=(1.03, 0.5),
+            bbox_transform=ax.transAxes,
+            ncol=ncol,
+            frameon=False,
+            fontsize=fontsize,
+            borderaxespad=0,
+            handlelength=1.2,
+            handletextpad=0.5,
+            columnspacing=1.0,
+        )
+
 
     def _make_cluster_marker_heatmap_figure(
         plotMatrix: pd.DataFrame,
@@ -3741,26 +3810,14 @@ def server(input, output, session):
             key=lambda x: x.lower(),
         )
 
-        if include_legend and 0 < len(clusterNames) <= 40:
-            handles = [
-                Patch(
-                    facecolor=colorMap.get(name, "#808080"),
-                    edgecolor="none",
-                    label=name,
-                )
-                for name in clusterNames
-            ]
 
-            ax.legend(
-                handles=handles,
-                loc="center left",
-                bbox_to_anchor=(1.02, 0.5),
-                frameon=False,
+        if include_legend:
+            _add_pacmap_cluster_legend(
+                ax,
+                clusterNames,
+                colorMap,
                 fontsize=7,
-                markerscale=3,
             )
-
-        plt.tight_layout()
 
         return fig
 
@@ -8968,9 +9025,7 @@ def server(input, output, session):
         return newValue
 
     @reactive.Effect
-    @reactive.event(
-        input.load_clustering_metadata_csv
-    )
+    @reactive.event(input.load_clustering_metadata_csv)
     def _load_clustering_metadata_csv():
         try:
             df = clustering_data.get()
@@ -8988,6 +9043,11 @@ def server(input, output, session):
                 clustering_metadata_key.get()
             )
 
+            if not keyCol:
+                raise ValueError(
+                    "No metadata matching key is selected."
+                )
+
             folder = (
                 last_loaded_folder.get()
                 or (input.path() or "").strip()
@@ -8999,16 +9059,20 @@ def server(input, output, session):
                 else os.getcwd()
             )
 
-            csvPath = pick_open_csv_dialog(
-                title="Select metadata CSV",
+            tablePath = pick_open_table_dialog(
+                title="Select metadata table",
                 initialdir=initdir,
             )
 
-            if not csvPath:
+            if not tablePath:
+                print(
+                    "🛑 Metadata import canceled.",
+                    flush=True,
+                )
                 return
 
-            incomingDf = pd.read_csv(
-                csvPath
+            incomingDf = _read_metadata_table(
+                tablePath
             )
 
             updatedWorkspace = (
@@ -9028,20 +9092,30 @@ def server(input, output, session):
 
             addedCols = [
                 c
-                for c in incomingDf.columns[1:]
+                for c in incomingDf.columns
+                if c != keyCol
             ]
 
-            clustering_metadata_status.set(
+            msg = (
                 f"Loaded metadata from "
-                f"{Path(csvPath).name}: "
-                f"{len(addedCols)} new column(s)."
+                f"{Path(tablePath).name}: "
+                f"{len(addedCols)} metadata column(s), "
+                f"{len(incomingDf):,} matched key value(s)."
+            )
+
+            clustering_metadata_status.set(
+                msg
             )
 
             ui.notification_show(
-                f"Added {len(addedCols)} metadata column(s) "
-                "to the workspace.",
+                msg,
                 type="message",
-                duration=5,
+                duration=6,
+            )
+
+            print(
+                f"✅ {msg}",
+                flush=True,
             )
 
         except Exception as e:
@@ -9059,6 +9133,122 @@ def server(input, output, session):
                 f"❌ Metadata import failed: {e}",
                 flush=True,
             )
+
+    def _read_metadata_table(
+        path: str | Path,
+    ) -> pd.DataFrame:
+        """
+        Read a metadata table from CSV, TSV/TXT or Excel.
+
+        Text files are delimiter-detected and support comma,
+        tab and semicolon separated data.
+        """
+
+        path = Path(path)
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Metadata file does not exist: {path}"
+            )
+
+        suffix = path.suffix.lower()
+
+        if suffix in {".xlsx", ".xls"}:
+            df = pd.read_excel(
+                path,
+                sheet_name=0,
+                dtype=str,
+                keep_default_na=False,
+            )
+
+        elif suffix in {
+            ".csv",
+            ".tsv",
+            ".txt",
+        }:
+            readAttempts = [
+                {
+                    "sep": None,
+                    "engine": "python",
+                },
+                {
+                    "sep": "\t",
+                },
+                {
+                    "sep": ";",
+                },
+                {
+                    "sep": ",",
+                },
+            ]
+
+            df = None
+            errors = []
+
+            for kwargs in readAttempts:
+                try:
+                    candidate = pd.read_csv(
+                        path,
+                        dtype=str,
+                        keep_default_na=False,
+                        encoding="utf-8-sig",
+                        **kwargs,
+                    )
+
+                    if len(candidate.columns) >= 2:
+                        df = candidate
+                        break
+
+                    errors.append(
+                        f"{kwargs}: only "
+                        f"{len(candidate.columns)} column(s)"
+                    )
+
+                except Exception as e:
+                    errors.append(
+                        f"{kwargs}: {e}"
+                    )
+
+            if df is None:
+                raise ValueError(
+                    "Could not determine metadata table delimiter. "
+                    "Supported separators are comma, tab and semicolon.\n"
+                    + "\n".join(errors)
+                )
+
+        else:
+            raise ValueError(
+                "Unsupported metadata file type. "
+                "Use CSV, TXT, TSV, XLSX or XLS."
+            )
+
+        # Clean imported headers only.
+        df.columns = [
+            str(column)
+            .replace("\ufeff", "")
+            .strip()
+            for column in df.columns
+        ]
+
+        if df.columns.duplicated().any():
+            duplicated = (
+                pd.Index(df.columns)[
+                    pd.Index(df.columns).duplicated(
+                        keep=False
+                    )
+                ]
+                .unique()
+                .tolist()
+            )
+
+            raise ValueError(
+                "Metadata table contains duplicate column names: "
+                + ", ".join(
+                    map(str, duplicated)
+                )
+            )
+
+        return df
 
     @output
     @render.ui
@@ -10677,6 +10867,37 @@ def server(input, output, session):
                 flush=True,
             )
 
+    def _filter_marker_results(result_df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        """Filter a cached marker table without changing statistical tests."""
+        if result_df is None or result_df.empty:
+            return result_df
+
+        def numeric_input(suffix: str, default: float) -> float:
+            value = getattr(input, f"{prefix}_deg_{suffix}")()
+            return default if value is None else float(value)
+
+        min_pct = numeric_input("min_pct", 0.0)
+        min_mean = numeric_input("min_mean_in", 0.0)
+        min_median = numeric_input("min_median_in", 0.0)
+        min_log2fc = numeric_input("min_log2fc", 0.0)
+        max_adj = numeric_input("max_p_adj", 1.0)
+        positive = bool(getattr(input, f"{prefix}_deg_only_positive")())
+
+        mask = (
+            (result_df["pct_in"] >= min_pct)
+            & (result_df["Mean_in"] >= min_mean)
+            & (result_df["Median_in"] >= min_median)
+            & (
+                (result_df["p_adj_BH"] <= max_adj)
+                | ((max_adj >= 1.0) & result_df["p_adj_BH"].isna())
+            )
+        )
+        if positive:
+            mask &= result_df["log2FC"] >= min_log2fc
+        else:
+            mask &= result_df["log2FC"].abs() >= min_log2fc
+        return result_df.loc[mask].copy()
+
     @output
     @render.ui
     def clustering_deg_summary():
@@ -10747,18 +10968,26 @@ def server(input, output, session):
                 filters=False,
             )
 
+        resultDf = _filter_marker_results(resultDf, "clustering")
+
         displayCols = [
             "Cluster",
             "Feature",
-            "SourceFeature",
             "Mean_in",
             "Mean_out",
+            "Median_in",
+            "Median_out",
+            "Q75_in",
+            "Q75_out",
             "Mean_difference",
             "log2FC",
             "pct_in",
             "pct_out",
+            "Delta_pct",
             "p_value",
             "p_adj_BH",
+            "n_in",
+            "n_out",
         ]
 
         displayDf = resultDf[
@@ -10776,7 +11005,7 @@ def server(input, output, session):
         return render.DataGrid(
             displayDf,
             height="520px",
-            filters=True,
+            filters=False,
             summary=(
                 "Showing marker results "
                 "{start}–{end} of {total}"
@@ -10827,6 +11056,9 @@ def server(input, output, session):
             return
 
         try:
+            if bool(input.clustering_deg_export_filtered()):
+                resultDf = _filter_marker_results(resultDf, "clustering")
+
             exportDf = format_deg_table(
                 resultDf
             )
@@ -11168,8 +11400,6 @@ def server(input, output, session):
         ax.set_ylabel("PC 2")
         ax.set_title("PCA")
 
-        plt.tight_layout()
-
         return fig
 
     @reactive.Effect
@@ -11468,7 +11698,11 @@ def server(input, output, session):
     @output
     @render.plot
     def clustering_pacmap_plot():
+        # Track annotation changes as a reactive dependency.
+        clustering_cluster_name_map.get()
+
         embDf = clustering_pacmap_embedding.get()
+
 
         if embDf is None or embDf.empty:
             fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
@@ -11559,26 +11793,13 @@ def server(input, output, session):
             key=lambda x: x.lower(),
         )
 
-        if 0 < len(clusterNames) <= 30:
-            handles = [
-                Patch(
-                    facecolor=colorMap.get(name, "#808080"),
-                    edgecolor="none",
-                    label=name,
-                )
-                for name in clusterNames
-            ]
-
-            ax.legend(
-                handles=handles,
-                loc="center left",
-                bbox_to_anchor=(1.02, 0.5),
-                frameon=False,
-                fontsize=8,
-                markerscale=3,
-            )
-
-        plt.tight_layout()
+        # Always display all cluster labels. This changes due to the labels being hid instead of being split into moe than 1 column
+        _add_pacmap_cluster_legend(
+            ax,
+            clusterNames,
+            colorMap,
+            fontsize=8,
+        )
 
         return fig
 
@@ -11941,8 +12162,12 @@ def server(input, output, session):
 
         _sync_cluster_annotations_to_master()
 
-        clustering_deg_results.set(pd.DataFrame())
-        clustering_deg_status.set("Cluster marker results cleared because cluster annotations changed.")
+        if not clustering_deg_results.get().empty:
+            clustering_deg_status.set(
+                "Cluster annotations changed after marker analysis. "
+                "The current marker table still reflects the cluster names "
+                "used when it was calculated. Rerun marker analysis to update it."
+            )
 
         clustering_annotation_status.set(
             f"Renamed "
@@ -13431,14 +13656,13 @@ def server(input, output, session):
 
         # Annotation changes invalidate existing DEG results because
         # multiple Sub-Leiden clusters may now represent one population.
-        subclustering_deg_results.set(
-            pd.DataFrame()
-        )
-
-        subclustering_deg_status.set(
-            "Subcluster marker results cleared because "
-            "subcluster annotations changed."
-        )
+        #However this is very annoying suring cluster annotation, so we will just warn the user instead of clearing the results.
+        if not subclustering_deg_results.get().empty:
+            subclustering_deg_status.set(
+                "Subcluster annotations changed after marker analysis. "
+                "The current marker table still reflects the subcluster names "
+                "used when it was calculated. Rerun marker analysis to update it."
+            )
 
         subclustering_annotation_status.set(
             f"Renamed "
@@ -13552,7 +13776,6 @@ def server(input, output, session):
             ),
         )
 
-
     @output
     @render.ui
     def subclustering_pacmap_plot_ui():
@@ -13562,9 +13785,11 @@ def server(input, output, session):
         heightPx = 500
 
         try:
-            widthPx = int(input.subclustering_embedding_plot_width() or 1200)
+            widthPx = int(
+                input.subclustering_embedding_plot_width() or 1200
+            )
             widthPx = max(600, min(1800, widthPx))
-        except Exception:
+        except (TypeError, ValueError):
             widthPx = 1200
 
         if (
@@ -13587,6 +13812,7 @@ def server(input, output, session):
             ),
             style="max-width: 100%; overflow-x: auto;",
         )
+
 
     @output
     @render.plot
@@ -13706,26 +13932,14 @@ def server(input, output, session):
             key=lambda x: x.lower(),
         )
 
-        if 0 < len(subclusterNames) <= 30:
-            handles = [
-                Patch(
-                    facecolor=colorMap.get(name, "#808080"),
-                    edgecolor="none",
-                    label=name,
-                )
-                for name in subclusterNames
-            ]
 
-            ax.legend(
-                handles=handles,
-                loc="center left",
-                bbox_to_anchor=(1.02, 0.5),
-                frameon=False,
-                fontsize=8,
-                markerscale=3,
-            )
-
-        plt.tight_layout()
+        # Always display all subcluster labels.
+        _add_pacmap_cluster_legend(
+            ax,
+            subclusterNames,
+            colorMap,
+            fontsize=8,
+        )
 
         return fig
 
@@ -13738,18 +13952,32 @@ def server(input, output, session):
         fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
 
         if pcaDf is None or pcaDf.empty:
-            ax.text(0.5, 0.5, "Run sub-PCA to show plot", ha="center", va="center")
+            ax.text(
+                0.5, 0.5,
+                "Run sub-PCA to show plot",
+                ha="center",
+                va="center",
+            )
             ax.set_axis_off()
             return fig
 
         plotDf = pcaDf.copy()
 
         if labelsDf is not None and not labelsDf.empty:
-            plotDf = plotDf.merge(labelsDf, on=PINT_CELL_ID_COL, how="left")
+            plotDf = plotDf.merge(
+                labelsDf,
+                on=PINT_CELL_ID_COL,
+                how="left",
+            )
         else:
             plotDf["PINT_SubLeiden_cluster"] = "Unclustered"
 
-        clusters = plotDf["PINT_SubLeiden_cluster"].fillna("Unclustered").astype(str)
+        clusters = (
+            plotDf["PINT_SubLeiden_cluster"]
+            .fillna("Unclustered")
+            .astype(str)
+        )
+
         clusterCodes, _ = pd.factorize(clusters)
 
         ax.scatter(
@@ -13768,45 +13996,6 @@ def server(input, output, session):
 
         return fig
 
-
-    @output
-    @render.plot
-    def subclustering_pacmap_plot():
-        embDf = subclustering_pacmap_embedding.get()
-        labelsDf = subclustering_leiden_labels.get()
-
-        fig, ax = plt.subplots(figsize=(8, 5), dpi=100)
-
-        if embDf is None or embDf.empty:
-            ax.text(0.5, 0.5, "Run sub-PaCMAP to show embedding", ha="center", va="center")
-            ax.set_axis_off()
-            return fig
-
-        plotDf = embDf.copy()
-
-        if labelsDf is not None and not labelsDf.empty:
-            plotDf = plotDf.merge(labelsDf, on=PINT_CELL_ID_COL, how="left")
-        else:
-            plotDf["PINT_SubLeiden_cluster"] = "Unclustered"
-
-        clusters = plotDf["PINT_SubLeiden_cluster"].fillna("Unclustered").astype(str)
-        clusterCodes, _ = pd.factorize(clusters)
-
-        ax.scatter(
-            plotDf["SubPaCMAP_1"],
-            plotDf["SubPaCMAP_2"],
-            c=clusterCodes,
-            s=float(input.subclustering_plot_point_size() or 2),
-            alpha=float(input.subclustering_plot_alpha() or 0.7),
-            cmap=input.subclustering_scatter_palette() or "viridis",
-            linewidths=0,
-        )
-
-        ax.set_xlabel("Sub-PaCMAP 1")
-        ax.set_ylabel("Sub-PaCMAP 2")
-        ax.set_title("Subclustering PaCMAP")
-
-        return fig
 
     @reactive.Effect
     @reactive.event(input.export_subcluster_name_template)
@@ -14365,18 +14554,26 @@ def server(input, output, session):
                 filters=False,
             )
 
+        resultDf = _filter_marker_results(resultDf, "subclustering")
+
         displayCols = [
             "Cluster",
             "Feature",
-            "SourceFeature",
             "Mean_in",
             "Mean_out",
+            "Median_in",
+            "Median_out",
+            "Q75_in",
+            "Q75_out",
             "Mean_difference",
             "log2FC",
             "pct_in",
             "pct_out",
+            "Delta_pct",
             "p_value",
             "p_adj_BH",
+            "n_in",
+            "n_out",
         ]
 
         displayDf = resultDf[
@@ -14394,7 +14591,7 @@ def server(input, output, session):
         return render.DataGrid(
             displayDf,
             height="520px",
-            filters=True,
+            filters=False,
             summary=(
                 "Showing marker results "
                 "{start}–{end} of {total}"
@@ -14455,6 +14652,9 @@ def server(input, output, session):
             return
 
         try:
+            if bool(input.subclustering_deg_export_filtered()):
+                resultDf = _filter_marker_results(resultDf, "subclustering")
+
             exportDf = format_deg_table(
                 resultDf
             )
@@ -14649,17 +14849,23 @@ def server(input, output, session):
         clustering_metadata_key.set(None)
         clustering_metadata_applied_columns.set([])
         clustering_metadata_status.set("No metadata workspace initialized.")
-        #push into newMap
+        #Assign sensible default column roles
+        metadataCols = [column for column in ["ROIName", "ObjectNumber", "Location_Center_X", "Location_Center_Y", "Area",] if column in cellDf.columns]
+        featureCols = [column for column in cellDf.columns if column not in metadataCols and column not in RESERVED_CLUSTERING_COLUMNS]
+        excludedCols = [column for column in cellDf.columns if column in RESERVED_CLUSTERING_COLUMNS]
+
+        clustering_feature_columns.set(featureCols)
+        clustering_metadata_columns.set(metadataCols)
+        clustering_excluded_columns.set(excludedCols)
+
+        #Build the clustering column map
         newMap = _make_default_clustering_column_map(cellDf)
         ##Push NewMap into both the reactive object that are loaded into curernt Dataset and Columns tabs
-        # This changed after splitting the datahandling tab of the clustering into 2 seperate tabs
+        #This changed after splitting the datahandling tab of the clustering into 2 seperate tabs
+        newMap.loc[newMap["ChannelNamesForClustering"].isin(metadataCols), "IncludeForClustering",] = False
+
         clustering_column_map.set(newMap)
         clustering_column_map_editor_data.set(newMap.copy())
-
-        # Clear column-role guesses for now.
-        clustering_feature_columns.set([])
-        clustering_metadata_columns.set([])
-        clustering_excluded_columns.set([])
 
         sourcePath = segmentation_cell_table_path.get()
 
@@ -14668,8 +14874,7 @@ def server(input, output, session):
             f"{len(cellDf):,} cells, {len(cellDf.columns):,} columns."
         )
 
-        if sourcePath:
-            msg += f" Source table: {sourcePath}"
+        if sourcePath: msg += f" Source table: {sourcePath}"
 
         clustering_status.set(msg)
 
@@ -15053,15 +15258,12 @@ def server(input, output, session):
 
     @reactive.Effect
     @reactive.event(input.quantify_mesmer_masks)
-    def _quantify_mesmer_masks():
-        obj = quantification_input_data.get()
-        matchDf = quantification_match_table.get()
+    async def _quantify_mesmer_masks():
+        obj = (quantification_input_data.get())
+        matchDf = (quantification_match_table.get())
 
         if obj is None:
-            segmentation_quantification_status.set(
-                "No quantification images loaded."
-            )
-            print("⚠️ No quantification images loaded.")
+            segmentation_quantification_status.set("No quantification images loaded.")
             return
 
         if (
@@ -15070,281 +15272,477 @@ def server(input, output, session):
             or "Matched" not in matchDf.columns
         ):
             segmentation_quantification_status.set(
-                "Match images and masks before quantification."
+                "Match images and masks "
+                "before quantification."
             )
-            print("⚠️ Image/mask matching has not been performed.")
             return
 
         matchedDf = (
-            matchDf.loc[matchDf["Matched"]]
+            matchDf.loc[
+                matchDf["Matched"]
+            ]
             .copy()
-            .reset_index(drop=True)
+            .reset_index(
+                drop=True
+            )
         )
 
         if matchedDf.empty:
             segmentation_quantification_status.set(
-                "No matched image/mask pairs available."
-            )
-            print("⚠️ No matched image/mask pairs available.")
-            return
-
-        source = obj.get("source", "unknown")
-        quantMode = input.seg_quantification_mode() or "pint"
-
-        if source == "pint":
-            if quantMode == "pint":
-                quantModeLabel = "current PINT-processed images"
-            else:
-                quantModeLabel = "loaded/raw PINT images"
-
-        elif source == "folder":
-            # Folder images are quantified exactly as stored on disk.
-            # PINT processed folders are already preprocessed.
-            quantModeLabel = "loaded image values"
-
-        else:
-            segmentation_quantification_status.set(
-                f"Unsupported quantification source: {source}"
+                "No matched image/mask "
+                "pairs available."
             )
             return
+
+        source = obj.get(
+            "source",
+            "unknown",
+        )
+
+        quantMode = (
+            input.seg_quantification_mode()
+            or "pint"
+        )
 
         outputFolder = (
             quantification_mask_folder.get()
-            or obj.get("source_folder")
+            or obj.get(
+                "source_folder"
+            )
             or os.getcwd()
         )
 
-        outDir = Path(outputFolder)
+        outDir = Path(
+            outputFolder
+        )
+
         outDir.mkdir(
             parents=True,
             exist_ok=True,
         )
 
+        # --------------------------------------------------------
+        # Give each run its own temporary workspace.
+        # --------------------------------------------------------
+
+        runId = (
+            datetime.now()
+            .strftime(
+                "%Y%m%d_%H%M%S"
+            )
+        )
+
+        workDir = (
+            outDir
+            / ".pint_quantification_tmp"
+            / runId
+        )
+
+        workDir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        stagedDir = (
+            workDir
+            / "images"
+        )
+
+        stagedDir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
         cellTablePath = (
-            outDir / "mesmer_cell_table.csv"
+            outDir
+            / "mesmer_cell_table.csv"
         )
 
         maskTablePath = (
-            outDir / "mesmer_mask_table.csv"
+            outDir
+            / "mesmer_mask_table.csv"
         )
 
-        allCells = []
-        maskRows = []
-
-        total = len(matchedDf)
-
-        print(
-            f"▶️ Quantifying {total:,} matched image/mask pair(s)."
+        statusPath = (
+            workDir
+            / "status.json"
         )
-        print(
-            f"   Quantification mode: {quantModeLabel}"
+
+        jobPath = (
+            workDir
+            / "job.json"
         )
+
+        records = []
+
+        total = len(
+            matchedDf
+        )
+
+        # --------------------------------------------------------
+        # Prepare worker-readable image inputs.
+        # --------------------------------------------------------
+
+        segmentation_quantification_status.set(
+            "Preparing quantification job..."
+        )
+
         print(
-            f"   Output folder: {outDir}"
+            f"▶️ Preparing quantification "
+            f"worker job for "
+            f"{total:,} ROI(s).",
+            flush=True,
         )
 
         with ui.Progress(
             min=0,
-            max=max(total, 1),
+            max=max(
+                total,
+                1,
+            ),
             session=session,
         ) as p:
 
-            p.set(
-                value=0,
-                message="Starting mask quantification...",
-            )
-
-            for i, row in matchedDf.iterrows():
-
+            for i, row in (
+                matchedDf.iterrows()
+            ):
                 sampleName = str(
                     row["SampleName"]
                 )
 
                 maskPath = Path(
-                    str(row["MaskPath"])
+                    str(
+                        row["MaskPath"]
+                    )
                 )
 
                 p.set(
                     value=i,
                     message=(
-                        f"Quantifying {sampleName} "
+                        "Preparing "
+                        f"{sampleName} "
                         f"({i + 1}/{total})"
                     ),
                 )
 
-                print(
-                    f"Quantifying {sampleName} "
-                    f"({i + 1}/{total})",
-                    flush=True,
-                )
-
-                maskRow = {
-                    "SampleName": sampleName,
-                    "ROIName": sampleName,
-                    "CellMaskName": sampleName,
-                    "MaskFile": maskPath.name,
-                    "MaskPath": str(maskPath),
-                    "MaskExists": maskPath.exists(),
-                    "NCells": 0,
-                    "Status": "Not started",
-                    "Error": "",
-                }
-
-                if not maskPath.exists():
-                    maskRow["Status"] = "Mask missing"
-                    maskRow["Error"] = (
-                        f"Mask not found: {maskPath}"
-                    )
-
-                    maskRows.append(
-                        maskRow
-                    )
-
-                    continue
-
-                try:
-                    # --------------------------------------------
-                    # Current in-memory PINT image library
-                    # --------------------------------------------
-
-                    if source == "pint":
-
-                        if quantMode == "pint":
-                            (
-                                imageStack,
-                                channelNames,
-                            ) = (
-                                _build_pint_processed_stack_for_sample(
-                                    sampleName
-                                )
-                            )
-
-                        else:
-                            imageStack = obj[
-                                "images"
-                            ][sampleName]
-
-                            channelNames = obj[
-                                "channels"
-                            ][sampleName]
-
-                    # --------------------------------------------
-                    # External image folder
-                    # --------------------------------------------
-
-                    else:
-                        imagePathValue = row.get(
-                            "ImagePath"
-                        )
-
-                        if (
-                            imagePathValue is None
-                            or pd.isna(imagePathValue)
-                        ):
-                            raise ValueError(
-                                "Matched row has no ImagePath."
-                            )
-
-                        imagePath = Path(
-                            str(imagePathValue)
-                        )
-
-                        loadedImages, loadedChannels = (
-                            load_tiffs_raw(
-                                str(imagePath.parent),
-                                validate_consistent=False,
-                                standardize_channel_names=True,
-                                file_paths=[
-                                    imagePath
-                                ],
-                            )
-                        )
-
-                        if len(loadedImages) != 1:
-                            raise ValueError(
-                                f"Expected one image from "
-                                f"{imagePath.name}, but loaded "
-                                f"{len(loadedImages)}."
-                            )
-
-                        loadedName = next(
-                            iter(loadedImages)
-                        )
-
-                        imageStack = loadedImages[
-                            loadedName
-                        ]
-
-                        channelNames = loadedChannels[
-                            loadedName
-                        ]
-
-                    mask = imread(
-                        str(maskPath)
-                    )
-
-                    cellDf = quantify_mask_intensities(
-                        image_stack=imageStack,
-                        channel_names=channelNames,
-                        mask=mask,
-                        sample_name=sampleName,
-                        mask_name=sampleName,
-                    )
-
-                    maskRow["NCells"] = int(
-                        len(cellDf)
-                    )
-
-                    maskRow["Status"] = "OK"
-
-                    if not cellDf.empty:
-                        allCells.append(
-                            cellDf
-                        )
-
-                except Exception as e:
-                    maskRow["Status"] = "Failed"
-                    maskRow["Error"] = str(e)
-
-                    print(
-                        f"❌ {sampleName}: {e}",
-                        flush=True,
-                    )
-
-                maskRows.append(
-                    maskRow
-                )
-
-                # Drop per-ROI references before the next image.
-                try:
-                    del imageStack
-                    del mask
-                except Exception:
-                    pass
+                # --------------------------------------------
+                # Folder-based data already lives on disk.
+                # --------------------------------------------
 
                 if source == "folder":
+                    imagePath = Path(
+                        str(
+                            row[
+                                "ImagePath"
+                            ]
+                        )
+                    )
+
+                    record = {
+                        "SampleName":
+                            sampleName,
+                        "ImagePath":
+                            str(
+                                imagePath
+                            ),
+                        "ImageFormat":
+                            "tiff",
+                        "MaskPath":
+                            str(
+                                maskPath
+                            ),
+                    }
+
+                # --------------------------------------------
+                # Current PINT image library must be staged,
+                # because a child process cannot access
+                # Shiny's in-memory reactive objects.
+                # --------------------------------------------
+
+                elif source == "pint":
+
+                    if (
+                        quantMode
+                        == "pint"
+                    ):
+                        (
+                            imageStack,
+                            channelNames,
+                        ) = (
+                            _build_pint_processed_stack_for_sample(
+                                sampleName
+                            )
+                        )
+
+                    else:
+                        imageStack = (
+                            obj[
+                                "images"
+                            ][
+                                sampleName
+                            ]
+                        )
+
+                        channelNames = (
+                            obj[
+                                "channels"
+                            ][
+                                sampleName
+                            ]
+                        )
+
+                    stagePath = (
+                        stagedDir
+                        / (
+                            _safe_file_stem(
+                                sampleName
+                            )
+                            + ".npy"
+                        )
+                    )
+
+                    np.save(
+                        stagePath,
+                        np.asarray(
+                            imageStack
+                        ),
+                        allow_pickle=False,
+                    )
+
+                    record = {
+                        "SampleName":
+                            sampleName,
+                        "ImagePath":
+                            str(
+                                stagePath
+                            ),
+                        "ImageFormat":
+                            "npy",
+                        "Channels": [
+                            str(ch)
+                            for ch
+                            in channelNames
+                        ],
+                        "MaskPath":
+                            str(
+                                maskPath
+                            ),
+                    }
+
                     try:
-                        del loadedImages
-                        del loadedChannels
+                        del imageStack
                     except Exception:
                         pass
 
+                else:
+                    raise ValueError(
+                        "Unsupported quantification "
+                        f"source: {source}"
+                    )
+
+                records.append(
+                    record
+                )
+
             p.set(
                 value=total,
-                message="Finalizing cell table...",
+                message=(
+                    "Starting quantification "
+                    "worker..."
+                ),
             )
 
-        cellDf = (
-            pd.concat(
-                allCells,
-                ignore_index=True,
-            )
-            if allCells
-            else pd.DataFrame()
+        # --------------------------------------------------------
+        # Job description
+        # --------------------------------------------------------
+
+        job = {
+            "records": records,
+            "output_dir": (
+                str(outDir)
+            ),
+            "cell_table_path": (
+                str(cellTablePath)
+            ),
+            "mask_table_path": (
+                str(maskTablePath)
+            ),
+            "status_path": (
+                str(statusPath)
+            ),
+        }
+
+        jobPath.write_text(
+            json.dumps(
+                job,
+                indent=2,
+            ),
+            encoding="utf-8",
         )
 
-        maskDf = pd.DataFrame(
-            maskRows
+        # --------------------------------------------------------
+        # Start separate Python process.
+        # --------------------------------------------------------
+
+        process = (
+            await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                (
+                    "pint_app.core."
+                    "quantification_worker"
+                ),
+                str(jobPath),
+            )
+        )
+
+        quantification_worker_process.set(
+            process
+        )
+
+        print(
+            f"▶️ Quantification worker "
+            f"started with PID "
+            f"{process.pid}.",
+            flush=True,
+        )
+
+        # --------------------------------------------------------
+        # Poll worker status without blocking Shiny.
+        # --------------------------------------------------------
+
+        with ui.Progress(
+            min=0,
+            max=max(
+                total,
+                1,
+            ),
+            session=session,
+        ) as p:
+
+            while (
+                process.returncode
+                is None
+            ):
+                if statusPath.exists():
+                    try:
+                        status = json.loads(
+                            statusPath.read_text(
+                                encoding="utf-8"
+                            )
+                        )
+
+                        current = int(
+                            status.get(
+                                "current",
+                                0,
+                            )
+                        )
+
+                        message = str(
+                            status.get(
+                                "message",
+                                "Quantifying...",
+                            )
+                        )
+
+                        p.set(
+                            value=min(
+                                current,
+                                total,
+                            ),
+                            message=message,
+                        )
+
+                        segmentation_quantification_status.set(
+                            message
+                        )
+
+                    except Exception:
+                        # Status file may have just
+                        # been replaced; retry next poll.
+                        pass
+
+                await asyncio.sleep(
+                    0.5
+                )
+
+                if (
+                    process.returncode
+                    is None
+                ):
+                    # Refresh process state.
+                    try:
+                        await asyncio.wait_for(
+                            process.wait(),
+                            timeout=0.01,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+            returnCode = (
+                await process.wait()
+            )
+
+        quantification_worker_process.set(
+            None
+        )
+
+        # --------------------------------------------------------
+        # Worker failed
+        # --------------------------------------------------------
+
+        if returnCode != 0:
+            message = (
+                "Quantification worker "
+                f"failed with exit code "
+                f"{returnCode}."
+            )
+
+            if statusPath.exists():
+                try:
+                    status = json.loads(
+                        statusPath.read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                    message = status.get(
+                        "message",
+                        message,
+                    )
+                except Exception:
+                    pass
+
+            segmentation_quantification_status.set(
+                message
+            )
+
+            ui.notification_show(
+                message,
+                type="error",
+                duration=10,
+            )
+
+            print(
+                f"❌ {message}",
+                flush=True,
+            )
+
+            return
+
+        # --------------------------------------------------------
+        # Load completed results into PINT.
+        # --------------------------------------------------------
+
+        cellDf = pd.read_csv(
+            cellTablePath,
+            low_memory=False,
+        )
+
+        maskDf = pd.read_csv(
+            maskTablePath,
+            low_memory=False,
         )
 
         segmentation_cell_table.set(
@@ -15355,48 +15753,30 @@ def server(input, output, session):
             maskDf
         )
 
-        try:
-            cellDf.to_csv(
-                cellTablePath,
-                index=False,
-            )
+        segmentation_cell_table_path.set(
+            str(cellTablePath)
+        )
 
-            maskDf.to_csv(
-                maskTablePath,
-                index=False,
-            )
-
-            segmentation_cell_table_path.set(
-                str(cellTablePath)
-            )
-
-            segmentation_mask_table_path.set(
-                str(maskTablePath)
-            )
-
-        except Exception as e:
-            msg = (
-                "Quantification completed, "
-                f"but saving failed: {e}"
-            )
-
-            segmentation_quantification_status.set(
-                msg
-            )
-
-            print(
-                f"⚠️ {msg}",
-                flush=True,
-            )
-
-            return
+        segmentation_mask_table_path.set(
+            str(maskTablePath)
+        )
 
         successfulMasks = int(
-            (maskDf["Status"] == "OK").sum()
+            (
+                maskDf[
+                    "Status"
+                ]
+                == "OK"
+            ).sum()
         )
 
         failedMasks = int(
-            (maskDf["Status"] != "OK").sum()
+            (
+                maskDf[
+                    "Status"
+                ]
+                != "OK"
+            ).sum()
         )
 
         nCells = len(
@@ -15406,18 +15786,24 @@ def server(input, output, session):
         msg = (
             f"Quantification complete: "
             f"{nCells:,} cells from "
-            f"{successfulMasks:,}/{total:,} matched mask(s). "
-            f"Mode: {quantModeLabel}."
+            f"{successfulMasks:,}/{total:,} "
+            "matched mask(s)."
         )
 
         if failedMasks:
             msg += (
-                f" Failed masks: {failedMasks:,}. "
-                "See mesmer_mask_table.csv for details."
+                f" Failed masks: "
+                f"{failedMasks:,}."
             )
 
         segmentation_quantification_status.set(
             msg
+        )
+
+        ui.notification_show(
+            msg,
+            type="message",
+            duration=8,
         )
 
         print(

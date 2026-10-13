@@ -699,11 +699,17 @@ def format_deg_table(
     ordinaryCols = [
         "Mean_in",
         "Mean_out",
+        "Median_in",
+        "Median_out",
+        "Q75_in",
+        "Q75_out",
         "Mean_difference",
         "log2FC",
         "pct_in",
         "pct_out",
+        "Delta_pct",
     ]
+
 
     for col in ordinaryCols:
         if col in out.columns:

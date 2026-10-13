@@ -162,16 +162,8 @@ def quantify_mask_intensities(
     # --------------------------------------------------------
 
     result_columns = {
-        "SampleName": np.repeat(
-            sample_name,
-            n_objects,
-        ),
         "ROIName": np.repeat(
             sample_name,
-            n_objects,
-        ),
-        "CellMaskName": np.repeat(
-            mask_name or sample_name,
             n_objects,
         ),
         "ObjectNumber": labels.astype(

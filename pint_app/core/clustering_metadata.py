@@ -101,19 +101,23 @@ def merge_metadata_into_workspace(
     master_columns: list[str],
 ) -> pd.DataFrame:
     """
-    Add metadata columns from an imported table to the persistent workspace.
+    Add metadata columns from an imported table to the
+    persistent metadata workspace.
 
-    Rules:
-    - incoming first column is treated as the external matching key
-    - key values must exactly match the existing workspace
-    - no fuzzy/automatic correction is performed
-    - incoming metadata columns must be new
-    - existing workspace columns are never overwritten
-    - existing non-metadata master columns are never overwritten
+    The imported table must contain a column whose name matches
+    the selected PINT metadata key.
+
+    Matching is performed on conservatively normalized string
+    values:
+    - values are converted to strings
+    - leading/trailing whitespace is ignored
+    - matching remains case-sensitive
     """
-    _validate_incoming_metadata_columns(
-        incoming_df
-    )
+
+    if incoming_df is None or incoming_df.empty:
+        raise ValueError(
+            "The metadata table is empty."
+        )
 
     if workspace_df is None or workspace_df.empty:
         raise ValueError(
@@ -122,85 +126,222 @@ def merge_metadata_into_workspace(
 
     if key_col not in workspace_df.columns:
         raise ValueError(
-            f"Metadata workspace does not contain locked key "
-            f"{key_col!r}."
+            f"Metadata workspace does not contain "
+            f"the selected key {key_col!r}."
         )
 
     incoming = incoming_df.copy()
 
-    incoming_key_col = incoming.columns[0]
+    # --------------------------------------------------------
+    # Clean imported column names
+    # --------------------------------------------------------
 
-    # Rename only the incoming first-column HEADER.
-    # Key VALUES themselves are left untouched.
-    incoming = incoming.rename(
-        columns={
-            incoming_key_col: key_col
-        }
-    )
+    incoming.columns = [
+        str(column)
+        .replace("\ufeff", "")
+        .strip()
+        for column in incoming.columns
+    ]
 
-    if incoming[key_col].isna().any():
-        raise ValueError(
-            "The metadata matching-key column contains missing values."
+    if incoming.columns.duplicated().any():
+        duplicated = (
+            pd.Index(incoming.columns)[
+                pd.Index(incoming.columns).duplicated(
+                    keep=False
+                )
+            ]
+            .unique()
+            .tolist()
         )
 
-    if incoming[key_col].duplicated().any():
-        duplicated = (
+        raise ValueError(
+            "Metadata table contains duplicate column names: "
+            + ", ".join(
+                map(str, duplicated)
+            )
+        )
+
+    # --------------------------------------------------------
+    # Find the matching-key column BY NAME
+    # --------------------------------------------------------
+
+    if key_col not in incoming.columns:
+        detected = ", ".join(
+            map(str, incoming.columns)
+        )
+
+        raise ValueError(
+            f"The metadata table does not contain the "
+            f"selected matching column {key_col!r}. "
+            f"Detected columns: {detected}"
+        )
+
+    incoming_metadata_cols = [
+        column
+        for column in incoming.columns
+        if column != key_col
+    ]
+
+    if not incoming_metadata_cols:
+        raise ValueError(
+            "The metadata table contains the matching key "
+            "but no metadata columns."
+        )
+
+    # --------------------------------------------------------
+    # Normalize matching values conservatively
+    # --------------------------------------------------------
+
+    workspaceKeys = (
+        workspace_df[key_col]
+        .astype("string")
+        .str.strip()
+    )
+
+    incomingKeys = (
+        incoming[key_col]
+        .astype("string")
+        .str.strip()
+    )
+
+    badWorkspaceKeys = (
+        workspaceKeys.isna()
+        | workspaceKeys.eq("")
+    )
+
+    if badWorkspaceKeys.any():
+        raise ValueError(
+            f"The PINT matching column {key_col!r} "
+            "contains missing or empty values."
+        )
+
+    badIncomingKeys = (
+        incomingKeys.isna()
+        | incomingKeys.eq("")
+    )
+
+    if badIncomingKeys.any():
+        badRows = (
+            incoming.index[
+                badIncomingKeys
+            ]
+            .tolist()
+        )
+
+        raise ValueError(
+            "The metadata matching column contains "
+            "missing or empty values at row(s): "
+            + ", ".join(
+                str(i + 2)
+                for i in badRows[:20]
+            )
+        )
+
+    # Use normalized keys internally for matching.
+    workspace = workspace_df.copy()
+    workspace["_PINT_METADATA_KEY_"] = (
+        workspaceKeys
+    )
+
+    incoming["_PINT_METADATA_KEY_"] = (
+        incomingKeys
+    )
+
+    # --------------------------------------------------------
+    # Duplicate key check
+    # --------------------------------------------------------
+
+    duplicatedMask = (
+        incoming["_PINT_METADATA_KEY_"]
+        .duplicated(
+            keep=False
+        )
+    )
+
+    if duplicatedMask.any():
+        duplicatedValues = (
             incoming.loc[
-                incoming[key_col].duplicated(
-                    keep=False
-                ),
+                duplicatedMask,
                 key_col,
             ]
+            .astype(str)
             .drop_duplicates()
             .tolist()
         )
 
         raise ValueError(
-            "The metadata matching-key column contains duplicate values: "
-            + ", ".join(map(str, duplicated[:20]))
+            f"Metadata matching column {key_col!r} "
+            "contains duplicate values: "
+            + ", ".join(
+                duplicatedValues[:20]
+            )
         )
 
-    workspace_keys = workspace_df[key_col].tolist()
-    incoming_keys = incoming[key_col].tolist()
+    # --------------------------------------------------------
+    # Compare metadata keys with PINT keys
+    # --------------------------------------------------------
 
-    workspace_set = set(workspace_keys)
-    incoming_set = set(incoming_keys)
+    workspaceKeyList = (
+        workspace["_PINT_METADATA_KEY_"]
+        .tolist()
+    )
 
-    missing_from_metadata = [
+    incomingKeyList = (
+        incoming["_PINT_METADATA_KEY_"]
+        .tolist()
+    )
+
+    workspaceSet = set(
+        workspaceKeyList
+    )
+
+    incomingSet = set(
+        incomingKeyList
+    )
+
+    missingFromMetadata = [
         value
-        for value in workspace_keys
-        if value not in incoming_set
+        for value in workspaceKeyList
+        if value not in incomingSet
     ]
 
-    unknown_metadata_keys = [
+    unknownMetadataKeys = [
         value
-        for value in incoming_keys
-        if value not in workspace_set
+        for value in incomingKeyList
+        if value not in workspaceSet
     ]
 
-    if missing_from_metadata or unknown_metadata_keys:
+    if (
+        missingFromMetadata
+        or unknownMetadataKeys
+    ):
         parts = [
-            "Metadata sample matching failed."
+            f"Metadata matching failed for key "
+            f"{key_col!r}."
         ]
 
-        if missing_from_metadata:
+        if missingFromMetadata:
             parts.append(
-                "Missing from imported metadata: "
+                f"{len(missingFromMetadata):,} PINT "
+                "key value(s) were missing from the "
+                "metadata table. Examples: "
                 + ", ".join(
                     map(
                         str,
-                        missing_from_metadata[:20],
+                        missingFromMetadata[:10],
                     )
                 )
             )
 
-        if unknown_metadata_keys:
+        if unknownMetadataKeys:
             parts.append(
-                "Not present in current PINT dataset: "
+                f"{len(unknownMetadataKeys):,} metadata "
+                "key value(s) were not present in PINT. "
+                "Examples: "
                 + ", ".join(
                     map(
                         str,
-                        unknown_metadata_keys[:20],
+                        unknownMetadataKeys[:10],
                     )
                 )
             )
@@ -209,100 +350,126 @@ def merge_metadata_into_workspace(
             "\n".join(parts)
         )
 
-    incoming_metadata_cols = [
-        c
-        for c in incoming.columns
-        if c != key_col
-    ]
+    # --------------------------------------------------------
+    # Protect existing columns
+    # --------------------------------------------------------
 
-    existing_workspace_cols = set(
+    existingWorkspaceCols = set(
         workspace_df.columns
     )
 
-    workspace_collisions = [
-        c
-        for c in incoming_metadata_cols
-        if c in existing_workspace_cols
+    workspaceCollisions = [
+        column
+        for column in incoming_metadata_cols
+        if column in existingWorkspaceCols
     ]
 
-    if workspace_collisions:
+    if workspaceCollisions:
         raise ValueError(
-            "Metadata column(s) already exist in the metadata workspace: "
-            + ", ".join(workspace_collisions)
+            "Metadata column(s) already exist in the "
+            "metadata workspace: "
+            + ", ".join(
+                workspaceCollisions
+            )
         )
 
-    # Master columns that are already metadata workspace columns are fine,
-    # because previously committed metadata belongs to this workspace.
-    protected_master_cols = (
+    protectedMasterCols = (
         set(master_columns)
         - set(workspace_df.columns)
     )
 
-    master_collisions = [
-        c
-        for c in incoming_metadata_cols
-        if c in protected_master_cols
+    masterCollisions = [
+        column
+        for column in incoming_metadata_cols
+        if column in protectedMasterCols
     ]
 
-    if master_collisions:
+    if masterCollisions:
         raise ValueError(
-            "Metadata column(s) conflict with existing master-dataset "
-            "columns: "
-            + ", ".join(master_collisions)
+            "Metadata column(s) conflict with existing "
+            "PINT dataset columns: "
+            + ", ".join(
+                masterCollisions
+            )
         )
 
-    # Imported CSV metadata must already be complete.
-    incoming_values = incoming[
+    # --------------------------------------------------------
+    # Check metadata values
+    # --------------------------------------------------------
+
+    incomingValues = incoming[
         incoming_metadata_cols
     ]
 
-    missing_mask = incoming_values.isna()
-
-    string_empty_mask = (
-        incoming_values
+    badValueMask = (
+        incomingValues.isna()
+        |
+        incomingValues
         .astype("string")
         .apply(
             lambda col: (
-                col.str.len().eq(0)
-                | col.str.isspace()
+                col.str.strip().eq("")
             )
         )
     )
 
-    bad_mask = (
-        missing_mask
-        | string_empty_mask
-    )
+    if badValueMask.any().any():
+        badLocations = []
 
-    if bad_mask.any().any():
-        bad_locations = []
-
-        for col in incoming_metadata_cols:
-            bad_rows = incoming.loc[
-                bad_mask[col],
+        for column in incoming_metadata_cols:
+            badRows = incoming.loc[
+                badValueMask[column],
                 key_col,
             ].tolist()
 
-            if bad_rows:
-                bad_locations.append(
-                    f"{col}: "
+            if badRows:
+                badLocations.append(
+                    f"{column}: "
                     + ", ".join(
                         map(
                             str,
-                            bad_rows[:20],
+                            badRows[:20],
                         )
                     )
                 )
 
         raise ValueError(
             "Imported metadata contains empty values.\n"
-            + "\n".join(bad_locations)
+            + "\n".join(
+                badLocations
+            )
         )
 
-    # Preserve canonical PINT key ordering.
-    incoming = incoming.set_index(
-        key_col
-    ).loc[workspace_keys].reset_index()
+    # --------------------------------------------------------
+    # Reorder metadata to match PINT
+    # --------------------------------------------------------
+
+    incoming = (
+        incoming
+        .set_index(
+            "_PINT_METADATA_KEY_"
+        )
+        .loc[
+            workspaceKeyList
+        ]
+        .reset_index(
+            drop=True
+        )
+    )
+
+    incoming[key_col] = (
+        workspace_df[key_col]
+        .values
+    )
+
+    incoming = incoming[
+        [key_col]
+        + incoming_metadata_cols
+    ]
+
+    # --------------------------------------------------------
+    # Merge into workspace
+    # --------------------------------------------------------
 
     merged = workspace_df.merge(
         incoming,
@@ -313,7 +480,6 @@ def merge_metadata_into_workspace(
     )
 
     return merged
-
 
 def add_empty_metadata_column(
     workspace_df: pd.DataFrame,
