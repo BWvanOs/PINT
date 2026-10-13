@@ -10697,7 +10697,7 @@ def server(input, output, session):
             (df["pct_in"] >= detected)
             & (df["Mean_in"] >= threshold_mean)
             & (df["Median_in"] >= threshold_median)
-            & (df["p_adj_BH"] <= max_adj)
+            & ((df["p_adj_BH"] <= max_adj) | ((max_adj >= 1) & df["p_adj_BH"].isna()))
         ]
         if positive:
             df = df.loc[df["log2FC"] >= logfc]
