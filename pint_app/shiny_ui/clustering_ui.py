@@ -964,116 +964,67 @@ def cluster_annotation_controls_card():
 
 def cluster_deg_controls_card():
     return ui.card(
-        ui.card_header(
-            "Cluster marker analysis"
-        ),
-
+        ui.card_header("Cluster marker analysis"),
         ui.tags.p(
-            "Find features enriched in each annotated cluster compared "
-            "with all remaining cells.",
+            "Test every feature against the remaining cells. Biological thresholds "
+            "filter the results interactively without rerunning statistical tests.",
             class_="text-muted",
         ),
-
-        ui.tags.small(
-            "Clusters sharing the same annotation are treated as one population.",
-            class_="text-muted",
+        ui.input_numeric(
+            "clustering_deg_detection_threshold",
+            "Detection threshold for pct_in/pct_out",
+            value=0, step=0.1,
         ),
-
-        ui.hr(
-            class_="compact-hr"
+        ui.input_action_button(
+            "run_clustering_deg", "Find cluster markers",
+            class_="btn btn-primary compact-action-button mb-2",
         ),
-
+        ui.hr(class_="compact-hr"),
+        ui.tags.strong("Results filters (do not rerun analysis)"),
         ui.row(
-            ui.column(
-                6,
-                ui.input_numeric(
-                    "clustering_deg_min_pct",
-                    "Minimum detected fraction",
-                    value=0.10,
-                    min=0,
-                    max=1,
-                    step=0.05,
-                ),
-            ),
-
-            ui.column(
-                6,
-                ui.input_numeric(
-                    "clustering_deg_min_log2fc",
-                    "Minimum |log2FC|",
-                    value=0.25,
-                    min=0,
-                    step=0.05,
-                ),
-            ),
+            ui.column(6, ui.input_numeric(
+                "clustering_deg_min_pct", "Minimum pct_in",
+                value=0.10, min=0, max=1, step=0.05,
+            )),
+            ui.column(6, ui.input_numeric(
+                "clustering_deg_min_log2fc", "Minimum |log2FC|",
+                value=0.25, min=0, step=0.05,
+            )),
         ),
-
         ui.row(
-            ui.column(
-                6,
-                ui.input_numeric(
-                    "clustering_deg_detection_threshold",
-                    "Detection threshold",
-                    value=0,
-                    step=0.1,
-                ),
-            ),
+            ui.column(6, ui.input_numeric(
+                "clustering_deg_min_mean_in", "Minimum Mean_in",
+                value=0, min=0, step=0.05,
+            )),
+            ui.column(6, ui.input_numeric(
+                "clustering_deg_min_median_in", "Minimum Median_in",
+                value=0, min=0, step=0.05,
+            )),
         ),
-
-        ui.tags.small(
-            "Values above this threshold count as detected. "
-            "Zero is appropriate for count-like data; IMC may require "
-            "a higher biologically meaningful threshold.",
-            class_="text-muted",
+        ui.input_numeric(
+            "clustering_deg_max_p_adj", "Maximum BH-adjusted p-value",
+            value=1, min=0, max=1, step=0.05,
         ),
-
-        ui.hr(
-            class_="compact-hr"
-        ),
-
         ui.input_checkbox(
-            "clustering_deg_only_positive",
-            "Positive markers only",
+            "clustering_deg_only_positive", "Positive markers only",
             value=True,
         ),
-
+        ui.hr(class_="compact-hr"),
+        ui.input_checkbox(
+            "clustering_deg_export_filtered",
+            "Export only currently filtered results",
+            value=False,
+        ),
         ui.input_action_button(
-            "run_clustering_deg",
-            "Find cluster markers",
-            class_=(
-                "btn btn-primary "
-                "compact-action-button mb-2"
-            ),
+            "export_clustering_deg", "Export marker table",
+            class_="btn btn-secondary compact-action-button mb-2",
         ),
-
-        ui.input_action_button(
-            "export_clustering_deg",
-            "Export marker table",
-            class_=(
-                "btn btn-secondary "
-                "compact-action-button mb-2"
-            ),
+        ui.tags.small(
+            "SourceFeature is included in the CSV only. "
+            "The results grid supports column sorting, not lookup filters.",
+            class_="text-muted",
         ),
-
-        ui.tooltip(
-            ui.tags.span("ⓘ"),
-            (
-                "Cluster = group being tested against all other cells. "
-                "Feature = display name; SourceFeature = original column name. "
-                "Mean_in/out = mean signal inside/outside the cluster. "
-                "Mean_difference = Mean_in − Mean_out. "
-                "log2FC = log2 ratio of Mean_in to Mean_out. "
-                "pct_in/out = fraction of cells above the detection threshold "
-                "inside/outside the cluster. "
-                "p_value = raw Mann–Whitney p-value; "
-                "p_adj_BH = Benjamini–Hochberg adjusted p-value."
-            ),
-        ),
-
-        ui.output_ui(
-            "clustering_deg_summary"
-        ),
-
+        ui.output_ui("clustering_deg_summary"),
         class_="mb-2",
     )
 
@@ -1482,118 +1433,67 @@ def subcluster_annotation_controls_card():
 
 def subcluster_deg_controls_card():
     return ui.card(
-        ui.card_header(
-            "Subcluster marker analysis"
-        ),
-
+        ui.card_header("Subcluster marker analysis"),
         ui.tags.p(
-            "Find features enriched in each annotated subcluster "
-            "compared with all remaining cells in the current "
-            "subclustering population.",
+            "Test every feature against the remaining cells. Biological thresholds "
+            "filter the results interactively without rerunning statistical tests.",
             class_="text-muted",
         ),
-
-        ui.tags.small(
-            "Subclusters sharing the same annotation are treated "
-            "as one population.",
-            class_="text-muted",
+        ui.input_numeric(
+            "subclustering_deg_detection_threshold",
+            "Detection threshold for pct_in/pct_out",
+            value=0, step=0.1,
         ),
-
-        ui.hr(
-            class_="compact-hr"
+        ui.input_action_button(
+            "run_subclustering_deg", "Find subcluster markers",
+            class_="btn btn-primary compact-action-button mb-2",
         ),
-
+        ui.hr(class_="compact-hr"),
+        ui.tags.strong("Results filters (do not rerun analysis)"),
         ui.row(
-            ui.column(
-                6,
-                ui.input_numeric(
-                    "subclustering_deg_min_pct",
-                    "Minimum detected fraction",
-                    value=0.10,
-                    min=0,
-                    max=1,
-                    step=0.05,
-                ),
-            ),
-
-            ui.column(
-                6,
-                ui.input_numeric(
-                    "subclustering_deg_min_log2fc",
-                    "Minimum |log2FC|",
-                    value=0.25,
-                    min=0,
-                    step=0.05,
-                ),
-            ),
+            ui.column(6, ui.input_numeric(
+                "subclustering_deg_min_pct", "Minimum pct_in",
+                value=0.10, min=0, max=1, step=0.05,
+            )),
+            ui.column(6, ui.input_numeric(
+                "subclustering_deg_min_log2fc", "Minimum |log2FC|",
+                value=0.25, min=0, step=0.05,
+            )),
         ),
         ui.row(
-            ui.column(
-                6,
-                ui.input_numeric(
-                    "subclustering_deg_detection_threshold",
-                    "Detection threshold",
-                    value=0,
-                    step=0.1,
-                ),
-            ),
+            ui.column(6, ui.input_numeric(
+                "subclustering_deg_min_mean_in", "Minimum Mean_in",
+                value=0, min=0, step=0.05,
+            )),
+            ui.column(6, ui.input_numeric(
+                "subclustering_deg_min_median_in", "Minimum Median_in",
+                value=0, min=0, step=0.05,
+            )),
         ),
-
-        ui.tags.small(
-            "Values above this threshold count as detected. "
-            "Zero is appropriate for count-like data; IMC may require "
-            "a higher biologically meaningful threshold.",
-            class_="text-muted",
+        ui.input_numeric(
+            "subclustering_deg_max_p_adj", "Maximum BH-adjusted p-value",
+            value=1, min=0, max=1, step=0.05,
         ),
-
-        ui.hr(
-            class_="compact-hr"
-        ),
-
         ui.input_checkbox(
-            "subclustering_deg_only_positive",
-            "Positive markers only",
+            "subclustering_deg_only_positive", "Positive markers only",
             value=True,
         ),
-
+        ui.hr(class_="compact-hr"),
+        ui.input_checkbox(
+            "subclustering_deg_export_filtered",
+            "Export only currently filtered results",
+            value=False,
+        ),
         ui.input_action_button(
-            "run_subclustering_deg",
-            "Find subcluster markers",
-            class_=(
-                "btn btn-primary "
-                "compact-action-button mb-2"
-            ),
+            "export_subclustering_deg", "Export marker table",
+            class_="btn btn-secondary compact-action-button mb-2",
         ),
-
-        ui.input_action_button(
-            "export_subclustering_deg",
-            "Export marker table",
-            class_=(
-                "btn btn-secondary "
-                "compact-action-button mb-2"
-            ),
+        ui.tags.small(
+            "SourceFeature is included in the CSV only. "
+            "The results grid supports column sorting, not lookup filters.",
+            class_="text-muted",
         ),
-
-        ui.tooltip(
-            ui.tags.span("ⓘ"),
-            (
-                "Subcluster = group being tested against all other "
-                "cells in the selected parent population. "
-                "Feature = display name; SourceFeature = original column name. "
-                "Mean_in/out = mean signal inside/outside the subcluster. "
-                "Mean_difference = Mean_in − Mean_out. "
-                "log2FC = log2 ratio of Mean_in to Mean_out. "
-                "pct_in/out = fraction of cells above the detection threshold "
-                "inside/outside the subcluster. "
-                "p_value = raw Mann–Whitney p-value; "
-                "p_adj_BH = Benjamini–Hochberg adjusted p-value."
-            ),
-        ),
-
-        ui.output_ui(
-            "subclustering_deg_summary"
-        ),
-
+        ui.output_ui("subclustering_deg_summary"),
         class_="mb-2",
     )
 
