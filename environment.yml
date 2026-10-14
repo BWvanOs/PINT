@@ -19,7 +19,7 @@ dependencies:
   - pillow>=10
   - imageio>=2.34
   - zarr>=3
-  - pyarrow>=15,
+  - pyarrow>=15
   - pip:
       - -e .
       - shiny==1.4.0
