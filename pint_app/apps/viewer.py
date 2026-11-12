@@ -128,6 +128,7 @@ from pint_app.core.mask_neighbors_stats import (
     make_sample_interaction_matrix,
     permanova_one_factor,
     aggregate_interaction_matrix,
+    aggregate_interaction_matrix_weighted,
 )
 
 from pint_app.core.mesmer_backend import (
@@ -3913,42 +3914,52 @@ def server(input, output, session):
             )
         )
 
+    
+    
     def _drop_subclustering_columns_from_master():
         """
-        Remove subclustering columns that were pushed into clustering_data.
-
-        This is called when main PCA or main Leiden is rerun, because old
-        subclusters no longer belong to the new main clustering.
+        Remove columns tracked as having been pushed
+        by subclustering, without deleting protected
+        main clustering columns.
         """
         df = clustering_data.get()
-
-        if df is None or df.empty:
-            return
-
         pushedCols = subclustering_pushed_columns.get() or []
 
-        dropCols = [c for c in pushedCols if c in df.columns]
+        protected = {
+            PINT_CELL_ID_COL,
+            "PINT_Leiden_cluster",
+            "PINT_ClusterName",
+            "PaCMAP_1",
+            "PaCMAP_2",
+        }
 
-        if not dropCols:
-            return
+        if df is not None and not df.empty:
+            dropCols = [
+                col for col in pushedCols
+                if col in df.columns
+                and col not in protected
+            ]
 
-        clustering_data.set(df.drop(columns=dropCols))
+            if dropCols:
+                clustering_data.set(
+                    df.drop(columns=dropCols)
+                )
 
-        print(
-            "🧹 Removed subclustering columns from master dataset: "
-            + ", ".join(dropCols),
-            flush=True,
-        )
+        subclustering_pushed_columns.set([])
+
 
 
     def _clear_all_subclustering_state():
         """
-        Clear all temporary subclustering state.
-
-        This does not clear the main clustering results.
+        Reset temporary subclustering results without
+        modifying main clustering.
         """
-        subclustering_status.set("Subclustering cleared because main clustering was rerun.")
-        subclustering_annotation_status.set("No subcluster annotations available yet.")
+        subclustering_status.set(
+            "Subclustering cleared because main clustering was rerun."
+        )
+        subclustering_annotation_status.set(
+            "No subcluster annotations available yet."
+        )
 
         subclustering_parent_cluster.set("")
         subclustering_output_column.set("")
@@ -3966,12 +3977,17 @@ def server(input, output, session):
         subclustering_pacmap_embedding.set(pd.DataFrame())
 
         subclustering_cluster_name_map.set(
-            pd.DataFrame(columns=["OldClusterName", "NewClusterName"])
+            pd.DataFrame(
+                columns=["OldClusterName", "NewClusterName"]
+            )
         )
-
         subclustering_marker_summary.set(pd.DataFrame())
 
-        subclustering_pushed_columns.set([])
+        subclustering_deg_results.set(pd.DataFrame())
+        subclustering_deg_status.set(
+            "No subcluster marker analysis run yet."
+        )
+
 
     def _get_current_subcluster_names() -> list[str]:
         """
@@ -13121,72 +13137,6 @@ def server(input, output, session):
             subclustering_annotation_status.set(msg)
             print(f"❌ {msg}", flush=True)
 
-
-
-    def _clear_all_subclustering_state():
-        subclustering_status.set("Subclustering cleared because main clustering was rerun.")
-        subclustering_annotation_status.set("No subcluster annotations available yet.")
-
-        subclustering_parent_cluster.set("")
-        subclustering_output_column.set("")
-        subclustering_active_cell_ids.set(None)
-
-        subclustering_feature_matrix.set(None)
-        subclustering_feature_source_columns.set([])
-        subclustering_feature_display_columns.set([])
-
-        subclustering_pca_scores.set(pd.DataFrame())
-        subclustering_pca_loadings.set(pd.DataFrame())
-        subclustering_pca_variance.set(pd.DataFrame())
-
-        subclustering_leiden_labels.set(pd.DataFrame())
-        subclustering_pacmap_embedding.set(pd.DataFrame())
-
-        subclustering_cluster_name_map.set(pd.DataFrame(columns=["OldClusterName", "NewClusterName"]))
-        subclustering_marker_summary.set(pd.DataFrame())
-
-        subclustering_deg_results.set(pd.DataFrame())
-        subclustering_deg_status.set("No subcluster marker analysis run yet.")
-
-    def _drop_subclustering_columns_from_master():
-        df = clustering_data.get()
-
-        if df is None or df.empty:
-            return
-
-        protected = {
-            PINT_CELL_ID_COL,
-            "PINT_Leiden_cluster",
-            "PINT_ClusterName",
-            "PaCMAP_1",
-            "PaCMAP_2",
-        }
-
-        # Conservative: only drop columns created by known subcluster output column.
-        outputCol = subclustering_output_column.get()
-
-        if not outputCol:
-            return
-
-        outputCol = _clean_column_name(outputCol)
-
-        candidates = [
-            outputCol,
-            f"{outputCol}_ParentCluster",
-            f"{outputCol}_SubclusterID",
-            f"{outputCol}_PaCMAP_1",
-            f"{outputCol}_PaCMAP_2",
-        ]
-
-        dropCols = [c for c in candidates if c in df.columns and c not in protected]
-
-        if not dropCols:
-            return
-
-        clustering_data.set(df.drop(columns=dropCols))
-
-
-
     @reactive.Effect
     @reactive.event(input.push_subcluster_annotations_to_main)
     def _push_subcluster_annotations_to_main():
@@ -15864,9 +15814,30 @@ def server(input, output, session):
 
         outDir = _get_neighborhood_output_dir()
 
-        sampleCol = obj["column_map"].get("sample_col", None)
-        clusterCol = obj["column_map"].get("cluster_col", None)
-        conditionCol = obj["column_map"].get("condition_col", None)
+        
+        # A mask/ROI is the unit for graph construction,
+        # label permutations, and chance correction.
+        roiCol = obj["column_map"].get("mask_name_col")
+
+        # Biological sample identifier. Retained as metadata,
+        # but NOT used to identify permutation graphs.
+        biologicalSampleCol = obj["column_map"].get("sample_col")
+
+        clusterCol = obj["column_map"].get("cluster_col")
+        conditionCol = obj["column_map"].get("condition_col")
+
+        if not roiCol or not clusterCol or not conditionCol:
+            neighborhood_status_msg.set(
+                "ROI/mask, cluster, and condition columns "
+                "must be selected before running analysis."
+            )
+            return
+
+        # The existing downstream code uses sampleCol to
+        # identify the row unit. From this point onward,
+        # make that unit the ROI rather than the patient.
+        sampleCol = roiCol
+
 
         if not sampleCol or not clusterCol or not conditionCol:
             neighborhood_status_msg.set(
@@ -15994,42 +15965,119 @@ def server(input, output, session):
 
             prog.set(92, f"Aggregating results by analysis unit: {analysisUnitCol}...")
 
+            
             if analysisUnitCol == sampleCol:
+                # ROI-level analysis, without aggregation.
                 finalMatrixDf = sampleMatrixDf.copy()
-                finalMetaDf = matchedData[[sampleCol, conditionCol]].drop_duplicates().copy()
-                permanovaSampleCol = sampleCol
-            else:
-                metaDf = matchedData[[sampleCol, analysisUnitCol, conditionCol]].drop_duplicates().copy()
-                finalMatrixDf, finalMetaDf = aggregate_interaction_matrix(
-                    matrixDf=sampleMatrixDf,
-                    metadataDf=metaDf,
-                    sample_col=sampleCol,
-                    aggregate_col=analysisUnitCol,
-                    group_col=conditionCol,
+
+                finalMetaDf = (
+                    matchedData[[sampleCol, conditionCol]]
+                    .drop_duplicates()
+                    .copy()
                 )
+
+                permanovaSampleCol = sampleCol
+
+            else:
+                # Average ROIs into biological samples,
+                # weighted by source-cell counts.
+                metaDf = (
+                    matchedData[
+                        [sampleCol, analysisUnitCol, conditionCol]
+                    ]
+                    .drop_duplicates()
+                    .copy()
+                )
+
+                finalMatrixDf, finalMetaDf = (
+                    aggregate_interaction_matrix_weighted(
+                        resultsDf=resultsDf,
+                        metadataDf=metaDf,
+                        sample_col=sampleCol,
+                        aggregate_col=analysisUnitCol,
+                        group_col=conditionCol,
+                    )
+                )
+
                 permanovaSampleCol = analysisUnitCol
 
+            
+            # The full matrix keeps NaN values.
             neighborhood_sample_matrix.set(finalMatrixDf)
 
-            prog.set(95, "Running PERMANOVA on final interaction matrix...")
+            prog.set(
+                95,
+                "Preparing complete features for PERMANOVA..."
+            )
 
-            if conditionCol and conditionCol in finalMetaDf.columns and not finalMatrixDf.empty:
-                permanovaDf = permanova_one_factor(
-                    matrixDf=finalMatrixDf,
-                    metadataDf=finalMetaDf,
-                    sample_col=permanovaSampleCol,
-                    group_col=conditionCol,
-                    n_perm=999,
-                    random_seed=1,
+            permanovaInputDf = pd.DataFrame()
+            permanovaDf = pd.DataFrame()
+
+            if (
+                conditionCol in finalMetaDf.columns
+                and not finalMatrixDf.empty
+            ):
+                featureCols = [
+                    col for col in finalMatrixDf.columns
+                    if col != permanovaSampleCol
+                ]
+
+                # Keep only features measured in ALL
+                # biological samples entering the test.
+                completeFeatures = []
+
+                for col in featureCols:
+                    values = pd.to_numeric(
+                        finalMatrixDf[col],
+                        errors="coerce",
+                    ).to_numpy(dtype=float)
+
+                    if np.isfinite(values).all():
+                        completeFeatures.append(col)
+
+                nExcluded = (
+                    len(featureCols) - len(completeFeatures)
                 )
 
-                if not permanovaDf.empty:
-                    permanovaDf["AnalysisUnit"] = str(analysisUnitCol)
-                    permanovaDf["Status"] = "OK"
-            else:
-                permanovaDf = pd.DataFrame()
+                print(
+                    f"PERMANOVA: {len(completeFeatures)} "
+                    f"complete features retained; "
+                    f"{nExcluded} excluded due to missing values.",
+                    flush=True,
+                )
+
+                if completeFeatures:
+                    permanovaInputDf = finalMatrixDf[
+                        [permanovaSampleCol] + completeFeatures
+                    ].copy()
+
+                    permanovaDf = permanova_one_factor(
+                        matrixDf=permanovaInputDf,
+                        metadataDf=finalMetaDf,
+                        sample_col=permanovaSampleCol,
+                        group_col=conditionCol,
+                        n_perm=999,
+                        random_seed=1,
+                    )
+
+                    if not permanovaDf.empty:
+                        permanovaDf["AnalysisUnit"] = str(
+                            analysisUnitCol
+                        )
+                        permanovaDf["FeaturesUsed"] = len(
+                            completeFeatures
+                        )
+                        permanovaDf["FeaturesExcluded"] = nExcluded
+                        permanovaDf["Status"] = "OK"
+
+                else:
+                    prog.message(
+                        "PERMANOVA skipped: no interaction "
+                        "features are present in every sample."
+                    )
 
             neighborhood_permanova_results.set(permanovaDf)
+
 
             prog.set(97, "Saving neighborhood analysis output files...")
 
@@ -16043,6 +16091,8 @@ def server(input, output, session):
                     resultsDf.to_csv(outDir / "touching_interactions_with_empirical_pvalues.csv", index=False)
                 if not finalMatrixDf.empty:
                     finalMatrixDf.to_csv(outDir / "touching_interaction_final_matrix.csv", index=False)
+                if not permanovaInputDf.empty:
+                    permanovaInputDf.to_csv(outDir / "touching_interaction_permanova_input.csv", index=False) 
                 if not permanovaDf.empty:
                     permanovaDf.to_csv(outDir / "touching_interaction_permanova.csv", index=False)
                 if not finalMetaDf.empty:
@@ -18771,6 +18821,28 @@ def server(input, output, session):
         if pushedCellTable.empty:
             raise ValueError("No cell-table rows found for the matched masks.")
 
+        # Each ROI identifier must refer to exactly one mask file. External input data 
+        # may have duplicate ROI names, but those must be resolved 
+        # before pushing to neighborhood analysis tool.
+        pathsPerRoi = (
+            validMatchDf.groupby(maskNameCol)["MaskPath"]
+            .nunique(dropna=False)
+        )
+
+        conflictingRois = pathsPerRoi[
+            pathsPerRoi > 1
+        ]
+
+        if not conflictingRois.empty:
+            raise ValueError(
+                "Multiple mask files share the same ROI name: "
+                + ", ".join(
+                    map(str, conflictingRois.index[:10])
+                )
+            )
+
+        # Duplicate rows referring to the SAME ROI/mask
+        # are still safe to collapse.
         # Keep only the needed mask-match rows
         validMatchDf = validMatchDf.drop_duplicates(subset=[maskNameCol]).copy()
 

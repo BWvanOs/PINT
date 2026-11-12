@@ -275,7 +275,6 @@ def expected_touching_stats_permutation(
         })
 
         # keep rows that are relevant in either observed or expected space
-        statDf = statDf.loc[(statDf["observed"] > 0) | (statDf["expected"] > 0)].copy()
         statDf[sample_col] = sampleValue
         outFrames.append(statDf)
 
@@ -469,6 +468,8 @@ def chance_correct_touching_interactions(
     return out
     
 
+
+
 def make_sample_interaction_matrix(
     resultsDf: pd.DataFrame,
     *,
@@ -476,31 +477,41 @@ def make_sample_interaction_matrix(
     value_col: str = "ChanceCorrectedInteraction",
 ) -> pd.DataFrame:
     """
-    Build a wide sample-by-interaction matrix from long interaction results.
-    If multiple rows map to the same sample and interaction pair, average them.
+    Build a wide ROI-by-interaction matrix.
+
+    A measured neutral interaction is stored as 0.
+    An undefined interaction is stored as NaN.
+
+    Duplicate rows for the same ROI/interaction pair
+    are rejected rather than silently averaged.
     """
     if resultsDf is None or resultsDf.empty:
         return pd.DataFrame(columns=[sample_col])
 
     temp = resultsDf.copy()
+
     temp["InteractionPair"] = (
-        temp["cell_cluster"].astype(str) + "__" + temp["neighbor_cluster"].astype(str)
+        temp["cell_cluster"].astype(str)
+        + "__"
+        + temp["neighbor_cluster"].astype(str)
     )
 
-    mat = (
-        temp.pivot_table(
-            index=sample_col,
-            columns="InteractionPair",
-            values=value_col,
-            aggfunc="mean",
-            fill_value=0.0,
+    if temp.duplicated(
+        subset=[sample_col, "InteractionPair"]
+    ).any():
+        raise ValueError(
+            "Duplicate ROI/interaction combinations found."
         )
-        .reset_index()
-    )
+
+    mat = temp.pivot(
+        index=sample_col,
+        columns="InteractionPair",
+        values=value_col,
+    ).reset_index()
 
     mat.columns.name = None
-    return mat
 
+    return mat
 
 def aggregate_interaction_matrix(
     matrixDf: pd.DataFrame,
@@ -538,6 +549,52 @@ def aggregate_interaction_matrix(
         .drop_duplicates()
         .copy()
     )
+
+    # ---------------------------------------------------------
+    # A single ROI must belong to exactly one analysis unit
+    # and one condition. This was not the case in some of the original PINT datasets, 
+    # so we check for it here. It doesn't change the underlying logic, but it does make the PERMANOVA 
+    # step more robust and easier to interpret.
+    # ---------------------------------------------------------
+    if meta[[sample_col, aggregate_col, group_col]].isna().any().any():
+        raise ValueError(
+            "Missing ROI, analysis-unit, or condition metadata."
+        )
+
+    unitsPerRoi = (
+        meta.groupby(sample_col)[aggregate_col]
+        .nunique(dropna=False)
+    )
+
+    if (unitsPerRoi != 1).any():
+        raise ValueError(
+            "Some ROIs are associated with multiple "
+            "analysis units. Check the sample metadata."
+        )
+
+    conditionsPerRoi = (
+        meta.groupby(sample_col)[group_col]
+        .nunique(dropna=False)
+    )
+
+    if (conditionsPerRoi != 1).any():
+        raise ValueError(
+            "Some ROIs have multiple condition assignments."
+        )
+
+    # The current PERMANOVA implementation expects each
+    # analysis unit to belong to one condition.
+    conditionsPerUnit = (
+        meta.groupby(aggregate_col)[group_col]
+        .nunique(dropna=False)
+    )
+
+    if (conditionsPerUnit != 1).any():
+        raise ValueError(
+            "An analysis unit belongs to multiple conditions. "
+            "Choose a different analysis unit or use a model "
+            "that accounts for repeated measures."
+        )
 
     df = matrixDf.merge(
         meta,
@@ -594,6 +651,157 @@ def aggregate_interaction_matrix(
         )
 
     return aggregatedMatrixDf, aggregatedMetaDf
+
+
+def aggregate_interaction_matrix_weighted(
+    resultsDf: pd.DataFrame,
+    metadataDf: pd.DataFrame,
+    *,
+    sample_col: str,
+    aggregate_col: str,
+    group_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Aggregate ROI-level interactions into biological samples.
+
+    Each interaction is weighted by the number of source
+    cells in the ROI.
+
+    Missing pairs are excluded from their own weighted
+    average; they are never treated as zero.
+    """
+    if resultsDf is None or resultsDf.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    if metadataDf is None or metadataDf.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Keep unique column names (important if columns
+    # were selected more than once).
+    metaCols = list(dict.fromkeys([
+        sample_col, aggregate_col, group_col
+    ]))
+
+    meta = metadataDf[metaCols].drop_duplicates().copy()
+
+    if meta[metaCols].isna().any().any():
+        raise ValueError(
+            "Missing ROI, analysis-unit, or condition metadata."
+        )
+
+    # Every ROI must belong to one analysis unit
+    # and one condition.
+    if meta.duplicated(subset=[sample_col]).any():
+        raise ValueError(
+            "An ROI has conflicting analysis-unit "
+            "or condition metadata."
+        )
+
+    # Each analysis unit must belong to one condition.
+    if aggregate_col != group_col:
+        nConditions = (
+            meta.groupby(aggregate_col)[group_col]
+            .nunique(dropna=False)
+        )
+
+        if (nConditions > 1).any():
+            raise ValueError(
+                "An analysis unit belongs to multiple conditions."
+            )
+
+    df = resultsDf.merge(
+        meta,
+        on=sample_col,
+        how="left",
+        validate="many_to_one",
+    )
+
+    if df[aggregate_col].isna().any():
+        raise ValueError(
+            "Some ROI results have no corresponding metadata."
+        )
+
+    df["n_cells"] = pd.to_numeric(
+        df["n_cells"], errors="coerce"
+    )
+
+    if (
+        df["n_cells"].isna()
+        | (df["n_cells"] <= 0)
+    ).any():
+        raise ValueError(
+            "Invalid source-cell counts in interaction results."
+        )
+
+    df["InteractionPair"] = (
+        df["cell_cluster"].astype(str)
+        + "__"
+        + df["neighbor_cluster"].astype(str)
+    )
+
+    if df.duplicated(
+        subset=[sample_col, "InteractionPair"]
+    ).any():
+        raise ValueError(
+            "Duplicate ROI/interaction combinations."
+        )
+
+    # Use the original counts rather than rounded scores.
+    df["ExcessInteractions"] = (
+        df["observed"] - df["expected"]
+    )
+
+    # Sum excess interactions and source-cell counts
+    # separately for each biological sample/pair.
+    grouped = (
+        df.groupby(
+            [aggregate_col, "InteractionPair"],
+            sort=False,
+        )
+        .agg(
+            excess_sum=("ExcessInteractions", "sum"),
+            source_cells=("n_cells", "sum"),
+            n_rois=("n_cells", "size"),
+        )
+        .reset_index()
+    )
+
+    grouped["ChanceCorrectedInteraction"] = (
+        grouped["excess_sum"] / grouped["source_cells"]
+    )
+
+    # pivot() retains missing combinations as NaN.
+    matrixDf = grouped.pivot(
+        index=aggregate_col,
+        columns="InteractionPair",
+        values="ChanceCorrectedInteraction",
+    ).reset_index()
+
+    matrixDf.columns.name = None
+
+    # Restore all biological samples from the metadata,
+    # including those without any valid interaction results.
+    allUnits = (
+        meta[[aggregate_col]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    matrixDf = allUnits.merge(
+        matrixDf,
+        on=aggregate_col,
+        how="left",
+        validate="one_to_one",
+    )
+
+
+    finalMetaDf = (
+        meta[[aggregate_col, group_col]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    return matrixDf, finalMetaDf
 
 
 def permanova_one_factor(
