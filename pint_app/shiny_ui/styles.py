@@ -427,6 +427,53 @@ def app_styles():
                 align-content: flex-start;
             }
                       
+            /* InstanSeg preview layout */
+            .instanseg-viewer {
+                min-width: 0;
+                width: 100%;
+                height: calc(100vh - 160px);
+                display: flex;
+                flex-direction: column;
+            }
+
+            .instanseg-viewer .card {
+                flex: 1 1 auto;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .instanseg-viewer .card-body {
+                flex: 1 1 auto;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .instanseg-viewer .tab-content,
+            .instanseg-viewer .tab-pane {
+                flex: 1 1 auto;
+                min-height: 0;
+                height: 100%;
+            }
+
+            .instanseg-viewer .shiny-plot-output {
+                width: 100%;
+                height: 100% !important;
+                min-height: 0;
+            }
+
+            /* InstanSeg channel selector: approximately 8–10 visible channels */
+            .instanseg-channel-select .selectize-input {
+                min-height: 220px !important;
+                max-height: 260px !important;
+                overflow-y: auto !important;
+                align-content: flex-start;
+            }
+
+            .instanseg-channel-select .selectize-control {
+                margin-bottom: 0.4rem !important;
+            }
 
             /* ============================================================
             Clustering workspace

@@ -78,6 +78,8 @@ open issues/to do
     -Reworked part of the neigborhood calculation to include some more safeguards against duplicated ROI names
         -Included a small test for this module
 
+0.6.11
+    -Since Mermer is now much more closed off from external users i added InstanSeg. Wired the same way
 
 --------------------OLD VERSIONS----------------------
 

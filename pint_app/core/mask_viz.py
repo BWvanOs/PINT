@@ -84,6 +84,26 @@ def match_mask_centroids_to_cells(
         nearestMatchIdx.append(bestIdx)
         matchDistance.append(float(np.sqrt(d2[bestIdx])))
 
+
+    #Each cell-table row may be matched to only one segmentation-mask object. Prevent doube assignments
+    duplicateMatches = pd.Index(nearestMatchIdx).duplicated(
+        keep=False
+    )
+
+    if duplicateMatches.any():
+        nDuplicated = int(duplicateMatches.sum())
+        nUnique = len(set(nearestMatchIdx))
+
+        raise ValueError(
+            f"Mask-to-cell matching is not one-to-one: "
+            f"{nDuplicated} mask objects share a cell-table "
+            f"match. Only {nUnique} unique cells were matched "
+            f"to {len(nearestMatchIdx)} mask objects. "
+            "Check mask alignment, centroid coordinates, "
+            "and segmentation consistency."
+        )
+
+
     matchedData = pd.concat(
         [
             maskCentroids.reset_index(drop=True),

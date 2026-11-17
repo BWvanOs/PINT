@@ -232,8 +232,7 @@ def build_touching_edges_for_pushed_dataset(
                 conditionCol=conditionCol,
             )
         except Exception as e:
-            _emit(progress, f"[{i+1}/{len(maskTable)}] Failed {maskName}: {e}")
-            continue
+            raise ValueError(f"Failed to process mask {maskName!r}: {e}") from e
 
         matchedFrames.append(matchedData)
         edgeFrames.append(annotatedEdges)

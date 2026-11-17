@@ -76,6 +76,14 @@ from pint_app.core.dialogs import (
     pick_open_xenium_dialog,
 )
 
+
+from pint_app.core.instanseg_backend import (
+    DEFAULT_INSTANSEG_ENV_NAME,
+    check_instanseg_backend,
+    install_instanseg_backend,
+    run_instanseg_backend,
+)
+
 from pint_app.core.formatting import fmt1
 
 from pint_app.core.selection import cycle_list, order_by_canonical
@@ -272,10 +280,24 @@ def server(input, output, session):
     ) 
 
     segmentation_input_data = reactive.Value(None) 
+
+    ##Reactive effects for mesmer
     segmentation_mesmer_mask = reactive.Value(None)
     segmentation_mesmer_result = reactive.Value(None)
     segmentation_mesmer_mask_path = reactive.Value("")
     segmentation_mesmer_batch_results = reactive.Value(pd.DataFrame())
+    ##Reactive effects for instanseg
+    instanseg_status = reactive.Value(None)
+    instanseg_detail = reactive.Value("")
+    instanseg_last_result = reactive.Value(None)
+    ##Holds the last successfully segmented ROI and its masks.
+    instanseg_preview_data = reactive.Value(None)
+    ##Stores the results of the most recent batch run.
+    instanseg_batch_results = reactive.Value(pd.DataFrame())
+
+    ##Shared reactive effect for both Mesmewr and Instanseg to keep track of which masks are current and which are not
+    latest_segmentation_masks = reactive.Value([])
+
     segmentation_cell_table = reactive.Value(pd.DataFrame())
     segmentation_mask_table = reactive.Value(pd.DataFrame())
     segmentation_cell_table_path = reactive.Value("")
@@ -1361,6 +1383,7 @@ def server(input, output, session):
             )
             ax.set_axis_off()
             plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
             return fig
 
         if img is None:
@@ -1380,7 +1403,6 @@ def server(input, output, session):
             ax.imshow(img, interpolation="nearest")
         else:
             ax.imshow(img, cmap=cmap, interpolation="nearest")
-
         ax.set_axis_off()
 
         # Small overlay label instead of matplotlib title, to avoid extra whitespace.
@@ -1420,9 +1442,9 @@ def server(input, output, session):
             folder = obj.get("folder", None)
 
         if folder and os.path.isdir(folder):
-            outDir = Path(folder) / "segmentation alpha"
+            outDir = Path(folder) / "Segmentation_masks"
         else:
-            outDir = Path.cwd() / "segmentation alpha"
+            outDir = Path(folder) / "Segmentation_masks"
 
         outDir.mkdir(parents=True, exist_ok=True)
         return outDir
@@ -1508,6 +1530,890 @@ def server(input, output, session):
 
         return nuclearPath, boundaryPath, maskPath, jsonPath, meta    
 
+    ##Helpers for the instanseg segmentation pipeline
+
+    def _instanseg_env():
+        """
+        Return the Conda environment selected in the
+        InstanSeg advanced settings.
+        """
+        return (
+            (input.instanseg_env_name() or "").strip()
+            or DEFAULT_INSTANSEG_ENV_NAME
+        )
+    
+    def _instanseg_default_channels(channels):
+        hints = (
+            "dna", "dapi", "hoechst", "histone",
+            "cd45", "panck", "cytokeratin",
+            "vimentin", "cd31", "ecad", "cadherin",
+            "cd68", "actin", 
+        )
+
+        selected = [
+            ch for ch in channels
+            if any(h in ch.lower() for h in hints)
+        ]
+
+        return selected[:8] or channels[:1]
+
+
+    def _sync_instanseg_choices(sample_name=None):
+        obj = segmentation_input_data.get()
+
+        if obj is None or not obj.get("images"):
+            ui.update_select(
+                "instanseg_sample", choices=[], session=session
+            )
+            ui.update_select(
+                "instanseg_channels", choices=[], session=session
+            )
+            return
+
+        samples = list(obj["images"])
+        if sample_name not in samples:
+            sample_name = samples[0]
+
+        channels = list(obj["channels"].get(sample_name, []))
+        defaults = _instanseg_default_channels(channels)
+
+        ui.update_select(
+            "instanseg_sample",
+            choices=samples,
+            selected=sample_name,
+            session=session,
+        )
+
+        ui.update_select(
+            "instanseg_channels",
+            choices=channels,
+            selected=defaults,
+            session=session,
+        )
+
+    @reactive.Effect
+    @reactive.event(input.instanseg_sample)
+    def _instanseg_sample_changed():
+        _sync_instanseg_choices(input.instanseg_sample())
+
+
+    @reactive.Effect
+    def _instanseg_sync_pushed_images():
+        obj = segmentation_input_data.get()
+        if obj is not None:
+            _sync_instanseg_choices(input.instanseg_sample())
+
+    def _prepare_instanseg_input(sample_name):
+        obj = segmentation_input_data.get()
+
+        if obj is None:
+            raise ValueError("No images pushed to Segmentation.")
+
+        images = obj["images"]
+        channel_names = obj["channels"][sample_name]
+
+        selected = list(dict.fromkeys(
+            input.instanseg_channels() or []
+        ))
+
+        if not selected:
+            raise ValueError("Select at least one channel.")
+
+        indices = []
+        for name in selected:
+            if name not in channel_names:
+                raise ValueError(
+                    f"Channel {name!r} is missing in {sample_name}."
+                )
+            indices.append(channel_names.index(name))
+
+        image = np.asarray(images[sample_name])[indices]
+        image = image.astype(np.float32, copy=True)
+
+        use_threshold = bool(input.instanseg_use_threshold())
+        threshold = float(input.instanseg_abs_threshold() or 0)
+
+        use_winsor = bool(input.instanseg_use_winsor())
+        upper_percentile = float(
+            input.instanseg_winsor_high() or 99.5
+        )
+
+        processed = np.zeros_like(image, dtype=np.float32)
+
+        for i in range(image.shape[0]):
+            channel = np.nan_to_num(
+                image[i],
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            # Absolute threshold in original intensity units.
+            if use_threshold:
+                channel = np.where(
+                    channel >= threshold,
+                    channel,
+                    0.0,
+                )
+
+            channel = np.maximum(channel, 0.0)
+
+            # Upper winsorization of positive signal pixels.
+            positive = channel[channel > 0]
+
+            if positive.size == 0:
+                continue
+
+            if use_winsor:
+                upper = float(np.percentile(
+                    positive, upper_percentile
+                ))
+            else:
+                upper = float(positive.max())
+
+            if upper <= 0 or not np.isfinite(upper):
+                continue
+
+            # Clip and normalize each channel independently.
+            channel = np.clip(channel, 0, upper)
+            processed[i] = channel / upper
+
+        return processed, selected
+
+
+    def _save_instanseg_input(sample_name):
+        image, channels = _prepare_instanseg_input(sample_name)
+
+        out_dir = _get_segmentation_output_dir()
+        stem = _safe_file_stem(sample_name)
+
+        input_path = out_dir / f"{stem}_instanseg_input.tiff"
+
+        imwrite(
+            input_path,
+            image,
+            photometric="minisblack",
+            metadata={"axes": "CYX"},
+        )
+
+        return (
+            input_path,
+            out_dir / f"{stem}_instanseg_nuclei_uint32.tiff",
+            out_dir / f"{stem}_instanseg_cells_uint32.tiff",
+            out_dir / f"{stem}_instanseg_summary.json",
+            channels,
+        )
+
+
+    @reactive.Effect
+    @reactive.event(input.instanseg_check)
+    def _check_instanseg():
+        env_name = _instanseg_env()
+
+        print(f"🔎 Checking InstanSeg environment: {env_name}", flush=True)
+
+        try:
+            status = check_instanseg_backend(env_name)
+
+            instanseg_status.set(status)
+            instanseg_detail.set(status.detail)
+
+            print(
+                f"{'✅' if status.ok else '❌'} "
+                f"InstanSeg: {status.status}",
+                flush=True,
+            )
+            print(status.detail, flush=True)
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+
+            instanseg_detail.set(str(exc))
+            ui.notification_show(
+                f"InstanSeg check failed: {exc}",
+                type="error",
+                duration=10,
+            )
+
+
+    @reactive.Effect
+    @reactive.event(input.instanseg_install)
+    def _install_instanseg():
+        env_name = _instanseg_env()
+
+        print(f"▶️ Installing InstanSeg into {env_name}", flush=True)
+
+        try:
+            with ui.Progress(
+                min=0, max=2, session=session
+            ) as progress:
+
+                progress.set(
+                    value=0,
+                    message="Installing InstanSeg backend...",
+                )
+
+                status = install_instanseg_backend(env_name)
+
+                progress.set(
+                    value=1,
+                    message="Checking installation...",
+                )
+
+                instanseg_status.set(status)
+                instanseg_detail.set(status.detail)
+
+                progress.set(
+                    value=2,
+                    message="Installation check complete",
+                )
+
+            print(
+                f"{'✅' if status.ok else '❌'} "
+                f"InstanSeg: {status.status}",
+                flush=True,
+            )
+            print(status.detail, flush=True)
+
+            ui.notification_show(
+                status.status,
+                type="message" if status.ok else "error",
+                duration=8,
+            )
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+
+            instanseg_detail.set(str(exc))
+            ui.notification_show(
+                f"Installation failed: {exc}",
+                type="error",
+                duration=10,
+            )
+
+    @output
+    @render.ui
+    def instanseg_install_feedback():
+        detail = instanseg_detail.get()
+
+        if not detail:
+            return None
+
+        return ui.tags.details(
+            ui.tags.summary("Installation details"),
+            ui.tags.pre(
+                detail,
+                style=(
+                    "white-space:pre-wrap;"
+                    "overflow-wrap:anywhere;"
+                    "font-size:0.8em;"
+                    "max-height:300px;"
+                    "overflow-y:auto;"
+                ),
+            ),
+            class_="mt-2",
+        )
+
+    @output
+    @render.ui
+    def instanseg_backend_status():
+        status = instanseg_status.get()
+
+        if status is None:
+            return ui.tags.small(
+                "Installation status not checked.",
+                class_="text-muted",
+            )
+
+        return ui.tags.div(
+            status.status,
+            class_="seg-status-ok" if status.ok
+            else "seg-status-bad",
+        )
+
+    @output
+    @render.ui
+    def instanseg_backend_details():
+        return ui.tags.pre(
+            instanseg_detail.get(),
+            style="white-space:pre-wrap;font-size:0.8em;",
+        )
+
+
+    @output
+    @render.ui
+    def instanseg_input_summary():
+        obj = segmentation_input_data.get()
+        n = len(obj.get("images", {})) if obj else 0
+
+        return ui.tags.small(
+            f"{n} ROI(s) available",
+            class_="text-muted",
+        )
+
+
+    def _save_rainbow_mask(mask, output_path):
+        """
+        Export a colored visualization of a segmentation mask.
+
+        The original integer-labeled TIFF is preserved for
+        quantification. This PNG is for visual inspection.
+        """
+        mask = np.asarray(mask)
+
+        if mask.ndim != 2:
+            raise ValueError("Expected a 2D segmentation mask.")
+
+        output_path = Path(output_path)
+
+        plt.imsave(
+            str(output_path),
+            mask,
+            cmap="nipy_spectral",
+            vmin=0,
+            vmax=max(1, int(mask.max())),
+        )
+
+    async def _run_instanseg_sample(sample_name):
+        input_path, nuclei_path, cells_path, json_path, channels = (
+            _save_instanseg_input(sample_name)
+        )
+
+        # Read Shiny inputs before starting the background thread.
+        pixel_size = float(input.instanseg_pixel_size())
+        device = input.instanseg_device() or "auto"
+        tile_size = int(input.instanseg_tile_size() or 512)
+        batch_size = int(input.instanseg_batch_size() or 1)
+        env_name = _instanseg_env()
+
+        # Run the computationally intensive backend without
+        # blocking the Shiny event loop.
+        status = await asyncio.to_thread(
+            run_instanseg_backend,
+            input_path=input_path,
+            out_nuclei_path=nuclei_path,
+            out_cells_path=cells_path,
+            out_json_path=json_path,
+            pixel_size=pixel_size,
+            device=device,
+            tile_size=tile_size,
+            batch_size=batch_size,
+            env_name=env_name,
+        )
+
+        instanseg_last_result.set(status)
+        instanseg_detail.set(status.detail)
+
+        if not status.ok:
+            raise RuntimeError(status.detail or status.status)
+
+        nuclei = imread(str(nuclei_path))
+        cells = imread(str(cells_path))
+
+        _save_rainbow_mask(
+            nuclei,
+            nuclei_path.with_name(
+                nuclei_path.stem + "_rainbow.png"
+            ),
+        )
+
+        _save_rainbow_mask(
+            cells,
+            cells_path.with_name(
+                cells_path.stem + "_rainbow.png"
+            ),
+        )
+
+        instanseg_preview_data.set({
+            "sample": sample_name,
+            "nuclei": nuclei,
+            "cells": cells,
+            "channels": channels,
+            "nuclei_path": str(nuclei_path),
+            "cells_path": str(cells_path),
+        })
+
+        return {
+            "SampleName": sample_name,
+            "NucleiMask": str(nuclei_path),
+            "CellsMask": str(cells_path),
+            "N_Nuclei": int(np.count_nonzero(np.unique(nuclei))),
+            "N_Cells": int(np.count_nonzero(np.unique(cells))),
+            "Status": status.status,
+        }
+
+
+    @reactive.Effect
+    @reactive.event(input.instanseg_run_current)
+    async def _instanseg_run_current():
+        sample_name = input.instanseg_sample()
+        if not sample_name:
+            ui.notification_show(
+                "Select an ROI first.", type="error"
+            )
+            return
+
+        _start_segmentation_run()
+        status = check_instanseg_backend(_instanseg_env())
+        instanseg_status.set(status)
+
+        if not status.ok:
+            ui.notification_show(
+                "InstanSeg is not installed.",
+                type="error",
+            )
+            return
+
+
+        start_time = time.perf_counter()
+
+        print(
+            f"▶️ InstanSeg started: {sample_name}",
+            flush=True,
+        )
+
+        notification_id = ui.notification_show(
+            f"InstanSeg is segmenting {sample_name}. "
+            "This may take several minutes.",
+            type="message",
+            duration=None,
+        )
+
+        try:
+            with ui.Progress(min=0, max=1, session=session) as p:
+                p.set(
+                    value=0,
+                    message="InstanSeg running",
+                    detail=f"Segmenting {sample_name}...",
+                )
+
+                result = await _run_instanseg_sample(sample_name)
+
+                _register_segmentation_mask(
+                    sample_name,
+                    result["CellsMask"],
+                    "InstanSeg",
+                )
+
+                p.set(
+                    value=1,
+                    message="Segmentation complete",
+                )
+
+            elapsed = time.perf_counter() - start_time
+
+            print(
+                f"✅ InstanSeg completed: {sample_name} "
+                f"in {elapsed:.1f} seconds",
+                flush=True,
+            )
+
+            ui.notification_show(
+                f"Segmentation complete: {sample_name} "
+                f"({elapsed:.1f} seconds)",
+                type="message",
+                duration=8,
+            )
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+
+            print(
+                f"❌ InstanSeg failed: {sample_name}: {exc}",
+                flush=True,
+            )
+
+            ui.notification_show(
+                f"InstanSeg failed: {exc}",
+                type="error",
+                duration=10,
+            )
+
+        finally:
+            ui.notification_remove(notification_id)
+
+
+    @reactive.Effect
+    @reactive.event(input.instanseg_run_all)
+    async def _instanseg_run_all():
+        obj = segmentation_input_data.get()
+        if obj is None or not obj.get("images"):
+            ui.notification_show("No images available.", type="error")
+            return
+
+        status = check_instanseg_backend(_instanseg_env())
+        instanseg_status.set(status)
+        if not status.ok:
+            ui.notification_show("InstanSeg is not installed.", type="error")
+            return
+
+        # The external environment's Python executable: avoid activating
+        # Conda for each ROI. Assumes environments share one Conda installation.
+        env_name = _instanseg_env()
+        conda_prefix = os.environ.get("CONDA_PREFIX")
+        if not conda_prefix:
+            ui.notification_show(
+                "CONDA_PREFIX is unavailable. Start PINT from its Conda environment.",
+                type="error", duration=10,
+            )
+            return
+        envs_dir = Path(conda_prefix).parent
+        env_python = (
+            envs_dir / env_name /
+            ("python.exe" if os.name == "nt" else "bin/python")
+        )
+        if not env_python.is_file():
+            ui.notification_show(
+                f"InstanSeg Python executable not found: {env_python}",
+                type="error", duration=10,
+            )
+            return
+
+        # Resolve the worker file using the viewer.py location.
+        worker_path = Path(__file__).resolve().parents[1] / "core" / "run_instanseg_backend.py"
+        if not worker_path.is_file():
+            ui.notification_show(
+                f"InstanSeg worker not found: {worker_path}",
+                type="error", duration=10,
+            )
+            return
+
+        samples = list(obj["images"])
+        out_dir = _get_segmentation_output_dir()
+        manifest_path = out_dir / "instanseg_batch_jobs.json"
+        summary_path = out_dir / "instanseg_batch_summary.csv"
+        jobs = []
+
+        try:
+            # Save all preprocessed input TIFFs once. Model initialization follows.
+            for sample_name in samples:
+                input_path, nuclei_path, cells_path, json_path, _ = (
+                    _save_instanseg_input(sample_name)
+                )
+                jobs.append({
+                    "sample": sample_name,
+                    "input": str(input_path),
+                    "out_nuclei": str(nuclei_path),
+                    "out_cells": str(cells_path),
+                    "out_json": str(json_path),
+                })
+        except Exception as exc:
+            ui.notification_show(
+                f"Could not prepare InstanSeg inputs: {exc}",
+                type="error", duration=10,
+            )
+            return
+
+        # Capture settings before the subprocess starts.
+        pixel_size = float(input.instanseg_pixel_size())
+        device = input.instanseg_device() or "auto"
+        tile_size = int(input.instanseg_tile_size() or 512)
+        batch_size = int(input.instanseg_batch_size() or 1)
+
+        manifest_path.write_text(
+            json.dumps({"jobs": jobs}, indent=2), encoding="utf-8"
+        )
+
+        # Only now invalidate the prior run; validation/preparation succeeded.
+        _start_segmentation_run()
+        instanseg_preview_data.set(None)
+        instanseg_batch_results.set(pd.DataFrame())
+
+        command = [
+            str(env_python), str(worker_path),
+            "--manifest", str(manifest_path),
+            "--pixel-size", str(pixel_size),
+            "--device", str(device),
+            "--tile-size", str(tile_size),
+            "--batch-size", str(batch_size),
+        ]
+        rows = []
+        process = None
+        run_start = time.perf_counter()
+
+        print(
+            f"▶️ Starting persistent InstanSeg worker for {len(jobs)} ROI(s)",
+            flush=True,
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                limit=1024 * 1024,
+            )
+
+            with ui.Progress(min=0, max=len(jobs), session=session) as p:
+                p.set(value=0, message="Loading InstanSeg model...", detail="Initializing worker")
+                completed = 0
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    text = line.decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+
+                    event_prefix = "PINT_EVENT:"
+
+                    if event_prefix not in text:
+                        if text and not (
+                            "%" in text and "it/s" in text
+                        ):
+                            print(text, flush=True)
+                        continue
+
+                    try:
+                        event_text = text.split(
+                            event_prefix, 1
+                        )[1]
+
+                        # Decode the first JSON object, ignoring
+                        # any trailing console/progress text.
+                        event, _ = json.JSONDecoder().raw_decode(
+                            event_text
+                        )
+
+                    except (json.JSONDecodeError, ValueError):
+                        print(
+                            "⚠️ Could not decode InstanSeg "
+                            "progress event.",
+                            flush=True,
+                        )
+                        continue
+                    kind = event.get("event")
+                    sample = event.get("sample", "")
+                    if kind == "model_loading":
+                        print("▶️ InstanSeg: loading model once for batch", flush=True)
+                    elif kind == "model_ready":
+                        print(f"✅ InstanSeg model ready on {event.get('device')}", flush=True)
+                    elif kind == "roi_started":
+                        p.set(
+                            value=completed,
+                            message=f"Segmenting {sample}",
+                            detail=f"{event['index']}/{len(jobs)}",
+                        )
+                        print(f"▶️ InstanSeg {event['index']}/{len(jobs)}: {sample}", flush=True)
+                    elif kind == "roi_completed":
+                        completed += 1
+                        row = {
+                            "SampleName": sample,
+                            "NucleiMask": event["nuclei_mask"],
+                            "CellsMask": event["cells_mask"],
+                            "N_Nuclei": int(event["n_nuclei"]),
+                            "N_Cells": int(event["n_cells"]),
+                            "Status": "ok", "Ok": True, "Error": "",
+                        }
+                        rows.append(row)
+                        _register_segmentation_mask(sample, row["CellsMask"], "InstanSeg")
+                        # Rainbow PNGs are visualization files, not quantification masks.
+                        for path_string in (row["NucleiMask"], row["CellsMask"]):
+                            path = Path(path_string)
+                            try:
+                                _save_rainbow_mask(
+                                    imread(str(path)),
+                                    path.with_name(path.stem + "_rainbow.png"),
+                                )
+                            except Exception as exc:
+                                print(f"⚠️ Could not export rainbow PNG for {sample}: {exc}", flush=True)
+                        print(f"✅ Completed {sample}: {row['N_Cells']:,} cells", flush=True)
+                        p.set(value=completed, detail=f"{completed}/{len(jobs)} completed")
+                    elif kind == "roi_failed":
+                        completed += 1
+                        rows.append({
+                            "SampleName": sample, "Ok": False,
+                            "Status": "Failed", "Error": event.get("error", "Unknown error"),
+                        })
+                        print(f"❌ Failed {sample}: {event.get('error')}", flush=True)
+                        p.set(value=completed, detail=f"{completed}/{len(jobs)} processed")
+
+            returncode = await process.wait()
+            succeeded = sum(
+                row.get("Ok", False) for row in rows
+            )
+
+            print(
+                f"{'✅' if returncode == 0 else '⚠️'} "
+                f"InstanSeg finished: "
+                f"{succeeded}/{len(jobs)} ROIs "
+                f"in {time.perf_counter() - run_start:.1f} seconds",
+                flush=True,
+            )
+            if returncode != 0:
+                ui.notification_show(
+                    "InstanSeg batch had one or more failures. Check the console.",
+                    type="warning", duration=10,
+                )
+            else:
+                ui.notification_show(
+                    f"InstanSeg completed {len(rows)} ROI(s) with one model load.",
+                    type="message", duration=8,
+                )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            ui.notification_show(f"Persistent InstanSeg worker failed: {exc}", type="error", duration=10)
+        finally:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                await process.wait()
+            result_df = pd.DataFrame(rows)
+            instanseg_batch_results.set(result_df)
+            if not result_df.empty:
+                result_df.to_csv(summary_path, index=False)
+
+
+    @output
+    @render.plot
+    def instanseg_input_preview():
+        try:
+            sample_name = input.instanseg_sample()
+            image, channels = _prepare_instanseg_input(sample_name)
+
+            # Maximum intensity projection for a simple preview.
+            preview = np.max(image, axis=0)
+
+            return _make_single_image_preview_figure(
+                preview,
+                title=f"InstanSeg input: {len(channels)} channels",
+                cmap="gray",
+            )
+        except Exception as exc:
+            return _make_single_image_preview_figure(
+                None, title="Input preview",
+                errorMessage=str(exc),
+            )
+
+
+
+    def _instanseg_mask_preview(kind):
+        sample_name = input.instanseg_sample()
+
+        if not sample_name:
+            return _make_single_image_preview_figure(
+                None,
+                title=f"{kind.capitalize()} mask",
+                errorMessage="Select an ROI first.",
+            )
+
+        # Find this ROI among the masks generated in
+        # the latest segmentation run.
+        records = latest_segmentation_masks.get()
+
+        record = next(
+            (
+                row for row in records
+                if row["SampleName"] == sample_name
+                and row["Method"] == "InstanSeg"
+            ),
+            None,
+        )
+
+        if record is None:
+            return _make_single_image_preview_figure(
+                None,
+                title=f"{kind.capitalize()} mask",
+                errorMessage=(
+                    "No InstanSeg mask available for this ROI "
+                    "in the latest run."
+                ),
+            )
+
+        # The registry stores whole-cell masks.
+        cells_path = Path(record["MaskPath"])
+
+        if kind == "cells":
+            mask_path = cells_path
+
+        elif kind == "nuclei":
+            mask_path = cells_path.with_name(
+                cells_path.name.replace(
+                    "_instanseg_cells_uint32.tiff",
+                    "_instanseg_nuclei_uint32.tiff",
+                )
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown InstanSeg mask type: {kind}"
+            )
+
+        if not mask_path.is_file():
+            return _make_single_image_preview_figure(
+                None,
+                title=f"{kind.capitalize()} mask",
+                errorMessage=f"Mask file not found:\n{mask_path}",
+            )
+
+        try:
+            mask = imread(str(mask_path))
+
+            print(
+                f"🌈 Displaying {kind} mask: {sample_name}",
+                flush=True,
+            )
+
+            return _make_single_image_preview_figure(
+                mask,
+                title=f"{sample_name} — {kind}",
+                cmap="nipy_spectral",
+            )
+
+        except Exception as exc:
+            return _make_single_image_preview_figure(
+                None,
+                title=f"{kind.capitalize()} mask",
+                errorMessage=f"Could not load mask:\n{exc}",
+            )
+
+
+    @output
+    @render.plot
+    def instanseg_cell_preview():
+        return _instanseg_mask_preview("cells")
+
+
+    @output
+    @render.plot
+    def instanseg_nuclear_preview():
+        return _instanseg_mask_preview("nuclei")
+
+
+    @output
+    @render.ui
+    def instanseg_result_summary():
+        data = instanseg_preview_data.get()
+        batch = instanseg_batch_results.get()
+
+        parts = []
+
+        if data is not None:
+            parts.append(
+                ui.tags.div(
+                    f"Last completed ROI: {data['sample']}",
+                    class_="seg-status-ok",
+                )
+            )
+
+        if batch is not None and not batch.empty:
+            n_ok = int(batch["Ok"].sum())
+            parts.append(
+                ui.tags.small(
+                    f"Batch completed: {n_ok}/{len(batch)} ROIs"
+                )
+            )
+
+        return ui.tags.div(*parts)
+
+
+
+
+
+
+    ##Quantification helpers
     @reactive.Effect
     @reactive.event(input.quant_use_pint_images)
     def _quant_use_pint_images():
@@ -1877,66 +2783,106 @@ def server(input, output, session):
             )
 
     @reactive.Effect
-    @reactive.event(
-        input.quant_use_mesmer_masks
-    )
+    @reactive.event(input.quant_use_mesmer_masks)
     def _quant_use_mesmer_masks():
-        outDir = (
-            _get_segmentation_output_dir()
-        )
+        records = latest_segmentation_masks.get()
 
-        maskPaths = sorted(
-            outDir.glob(
-                "*_mesmer_mask_uint32.tiff"
-            )
-        )
-
-        if not maskPaths:
+        if not records:
             ui.notification_show(
-                "No Mesmer masks are available yet.",
+                "No masks were generated during the last "
+                "segmentation run.",
                 type="warning",
                 duration=6,
             )
+            quantification_mask_files.set(pd.DataFrame())
+            quantification_match_table.set(pd.DataFrame())
+            quantification_mask_folder.set("")
             return
 
-        maskDf = pd.DataFrame(
-            {
-                "MaskName": [
-                    path.stem
-                    for path in maskPaths
-                ],
-                "MaskFile": [
-                    path.name
-                    for path in maskPaths
-                ],
-                "MaskPath": [
-                    str(path)
-                    for path in maskPaths
-                ],
-            }
-        )
+        mask_df = pd.DataFrame(records)
 
+        # Check that the registered files still exist.
+        mask_df = mask_df.loc[
+            mask_df["MaskPath"].map(
+                lambda path: Path(path).is_file()
+            )
+        ].copy()
+
+        if mask_df.empty:
+            ui.notification_show(
+                "The masks from the last run no longer exist.",
+                type="error",
+                duration=8,
+            )
+            quantification_mask_files.set(pd.DataFrame())
+            quantification_match_table.set(pd.DataFrame())
+            quantification_mask_folder.set("")
+            return
+
+        quantification_mask_files.set(mask_df)
+        quantification_match_table.set(pd.DataFrame())
+
+        # Both backends normally save to the segmentation
+        # output directory.
         quantification_mask_folder.set(
-            str(outDir)
+            str(Path(mask_df.iloc[0]["MaskPath"]).parent)
         )
 
-        quantification_mask_files.set(
-            maskDf
+        methods = ", ".join(
+            sorted(mask_df["Method"].unique())
         )
 
         msg = (
-            f"Using {len(maskDf):,} Mesmer "
-            "mask(s) from the current PINT session."
+            f"Using {len(mask_df):,} mask(s) from "
+            f"the latest {methods} segmentation run."
         )
 
+        quantification_status.set(msg)
+
+        ui.notification_show(
+            msg,
+            type="message",
+            duration=6,
+        )
+
+        print(f"✅ {msg}", flush=True)
+
+
+
+    def _start_segmentation_run():
+        """Discard masks from the previous run."""
+        latest_segmentation_masks.set([])
+
+        # Invalidate any previously selected current-run masks
+        # in Quantification.
+        quantification_mask_files.set(pd.DataFrame())
+        quantification_match_table.set(pd.DataFrame())
         quantification_status.set(
-            msg
+            "New segmentation run started. "
+            "Select current masks again after completion."
         )
 
-        print(
-            f"✅ {msg}",
-            flush=True,
-        )
+    def _register_segmentation_mask(sample_name, mask_path, method):
+        """Register one successfully generated segmentation mask."""
+        path = Path(mask_path)
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Segmentation mask does not exist: {path}"
+            )
+
+        records = list(latest_segmentation_masks.get())
+
+        records.append({
+            "SampleName": str(sample_name),
+            "Method": str(method),
+            "MaskName": path.stem,
+            "MaskFile": path.name,
+            "MaskPath": str(path.resolve()),
+        })
+
+        latest_segmentation_masks.set(records)
+
 
     def _clean_quantification_name(
         value: str,
@@ -1957,6 +2903,10 @@ def server(input, output, session):
             "_cellmask",
             "_masks",
             "_mask",
+
+            ##instanseg masks names
+            "_instanseg_cells_uint32",
+            "_instanseg_nuclei_uint32",
         ]
 
         changed = True
@@ -2068,6 +3018,12 @@ def server(input, output, session):
         # --------------------------------------------------------
 
         masks = maskDf.copy()
+
+        # The image table owns SampleName. Current-run segmentation masks also contain SampleName,
+        # which would otherwise create SampleName_image and
+        # SampleName_mask during the merge. Mask matching is performed using MatchKey, so we do
+        # not need the duplicate column from the mask table.
+        masks = masks.drop(columns=["SampleName"], errors="ignore")
 
         if (
             "MaskName"
@@ -7708,7 +8664,11 @@ def server(input, output, session):
                         try:
                             mask = imread(str(maskPath))
                             row["NLabels"] = int(np.nanmax(mask)) if mask.size > 0 else 0
-
+                            _register_segmentation_mask(
+                                sampleName,
+                                maskPath,
+                                "Mesmer",
+                            )
                             # Keep last successful mask in preview.
                             segmentation_mesmer_mask.set(mask)
                             segmentation_mesmer_mask_path.set(str(maskPath))
@@ -7842,6 +8802,7 @@ def server(input, output, session):
     @reactive.Effect
     @reactive.event(input.run_mesmer_current)
     def _run_mesmer_current():
+        _start_segmentation_run()
         status = check_mesmer_backend(env_name=_get_mesmer_env_name())
 
         if not status.ok:
@@ -7899,6 +8860,11 @@ def server(input, output, session):
                 mask = imread(str(maskPath))
                 segmentation_mesmer_mask.set(mask)
                 segmentation_mesmer_mask_path.set(str(maskPath))
+                _register_segmentation_mask(
+                    sampleName,
+                    maskPath,
+                    "Mesmer",
+                )
             else:
                 segmentation_mesmer_mask.set(None)
                 segmentation_mesmer_mask_path.set("")
@@ -14735,11 +15701,35 @@ def server(input, output, session):
             session=session,
         )
 
-        # Build direct match table. This avoids asking the user to run manual mask matching.
+        # Resolve the original ROI name. Quantification may
+        # suffix SampleName columns after merging image and
+        # mask metadata.
         finalMaskDf = validMasks.copy()
 
+        # Determine the ROI name from the quantification mask table.
         if "CellMaskName" not in finalMaskDf.columns:
-            finalMaskDf["CellMaskName"] = finalMaskDf["SampleName"]
+            if "ROIName" in finalMaskDf.columns:
+                finalMaskDf["CellMaskName"] = finalMaskDf["ROIName"]
+
+            elif "SampleName" in finalMaskDf.columns:
+                finalMaskDf["CellMaskName"] = finalMaskDf["SampleName"]
+
+            elif "SampleName_image" in finalMaskDf.columns:
+                finalMaskDf["CellMaskName"] = finalMaskDf["SampleName_image"]
+
+            elif "MaskName" in finalMaskDf.columns:
+                finalMaskDf["CellMaskName"] = (
+                    finalMaskDf["MaskName"]
+                    .astype(str)
+                    .map(_clean_quantification_name)
+                )
+
+            else:
+                raise ValueError(
+                    "Cannot determine ROI names from the "
+                    "quantification mask table. Available columns: "
+                    f"{list(finalMaskDf.columns)}"
+                )
 
         finalMaskDf["ManualMatch"] = False
 
@@ -14800,7 +15790,7 @@ def server(input, output, session):
         clustering_metadata_applied_columns.set([])
         clustering_metadata_status.set("No metadata workspace initialized.")
         #Assign sensible default column roles
-        metadataCols = [column for column in ["ROIName", "ObjectNumber", "Location_Center_X", "Location_Center_Y", "Area",] if column in cellDf.columns]
+        metadataCols = [column for column in ["SampleName","ROIName", "ObjectNumber", "Location_Center_X", "Location_Center_Y", "Area",] if column in cellDf.columns]
         featureCols = [column for column in cellDf.columns if column not in metadataCols and column not in RESERVED_CLUSTERING_COLUMNS]
         excludedCols = [column for column in cellDf.columns if column in RESERVED_CLUSTERING_COLUMNS]
 
@@ -15305,12 +16295,12 @@ def server(input, output, session):
 
         cellTablePath = (
             outDir
-            / "mesmer_cell_table.csv"
+            / "quantified_cell_table.csv"
         )
 
         maskTablePath = (
             outDir
-            / "mesmer_mask_table.csv"
+            / "mask_table.csv"
         )
 
         statusPath = (
@@ -16582,6 +17572,58 @@ def server(input, output, session):
                 axImg.text(0.5, 0.5, "No cell rows found for selected mask", ha="center", va="center")
                 axImg.set_axis_off()
                 axLeg.set_axis_off()
+                return fig
+
+            
+            ##void treating thousands of individual cell IDs
+            # #s biological clusters. This was blocking Shiny from keeping itself alive when a large number of unique cell IDs were present.
+            n_groups = matchingData[clusterCol].nunique(dropna=True)
+
+            identifier_columns = {
+                "ObjectNumber",
+                "Cell_ID",
+                "PINT_Cell_ID",
+                "Identifier",
+            }
+
+            if clusterCol in identifier_columns or n_groups > 250:
+                print(
+                    f"⚠️ Mask visualization: '{clusterCol}' "
+                    f"contains {n_groups:,} unique values. "
+                    "Showing rainbow mask without cluster legend.",
+                    flush=True,
+                )
+
+                cellMask = read_mask_tiff(str(maskPath))
+
+                axImg.imshow(
+                    cellMask,
+                    cmap="nipy_spectral",
+                    interpolation="nearest",
+                )
+
+                axImg.set_axis_off()
+                axLeg.set_axis_off()
+
+                axLeg.text(
+                    0.05,
+                    0.95,
+                    "Unclustered cells\n"
+                    "Rainbow mask preview\n"
+                    f"{n_groups:,} unique values\n\n"
+                    "Select a cluster annotation\n"
+                    "for biological coloring.",
+                    transform=axLeg.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=10,
+                )
+
+                fig.suptitle(
+                    f"{maskName} | Rainbow preview",
+                    fontsize=10,
+                )
+
                 return fig
 
             clusterColorMap = active_mask_cluster_color_map()
